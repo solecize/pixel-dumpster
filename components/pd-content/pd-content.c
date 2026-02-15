@@ -277,6 +277,9 @@ static esp_err_t content_setup_playback(const char *path, const char *full)
 
 esp_err_t pd_content_play(const char *path)
 {
+    /* stop current playback immediately so tick() won't block us */
+    content_playing = false;
+
     char full[PD_CONTENT_MAX_PATH];
     snprintf(full, sizeof(full), "%s/%s", content_base, path);
 
@@ -311,6 +314,9 @@ esp_err_t pd_content_play_with_transition(const char *path, const char *transiti
     if (!content_transition || !content_fb) {
         return pd_content_play(path);
     }
+
+    /* stop current playback immediately so tick() won't block us */
+    content_playing = false;
 
     char full[PD_CONTENT_MAX_PATH];
     snprintf(full, sizeof(full), "%s/%s", content_base, path);
