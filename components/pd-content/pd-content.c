@@ -405,6 +405,11 @@ void pd_content_tick(void)
     unsigned w, h;
     uint8_t *rgb = decode_png_file(frame_path, &w, &h);
     if (rgb) {
+        /* re-check after decode — play handler may have interrupted us */
+        if (!content_playing) {
+            free(rgb);
+            return;
+        }
         if (content_fb) {
             pd_framebuf_blit_rgb(content_fb, rgb, (int)w, (int)h);
             pd_display_render_framebuf(content_fb->data);
