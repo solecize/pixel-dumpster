@@ -8,7 +8,7 @@
 
 #### Related Documentation:
 
-[readme.md](../readme.md) | [development.md](development.md) | [api.md](api.md) | [kebab-style-naming.md](kebab-style-naming.md)
+[readme.md](../readme.md) | [development.md](development.md) | [api.md](api.md) | [kebab-style-naming.md](kebab-style-naming.md) | [wizard-protocol.md](wizard-protocol.md)
 
 # 1. Project Overview
 

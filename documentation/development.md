@@ -84,6 +84,8 @@ idf.py fullclean
 main/
 ├── app-main.c               # ESP-IDF application entry point
 
+partitions.csv               # Custom partition table (LittleFS)
+
 data/
 └── pd/                      # Default artifact structure
     ├── now.json

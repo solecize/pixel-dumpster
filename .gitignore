@@ -1,5 +1,23 @@
+# macOS
 .DS_Store
+
+# ESP-IDF build
 build/
-.sdkconfig
 sdkconfig
 sdkconfig.old
+
+# ESP-IDF framework (submodule or local clone)
+esp-idf/
+
+# Managed components (fetched by idf.py)
+managed_components/
+
+# Dependencies lock (auto-generated)
+dependencies.lock
+
+# Compiled tool binaries
+tools/wizard-cli
+tools/content-cli
+
+# Logs
+logs/

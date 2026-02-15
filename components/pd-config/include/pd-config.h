@@ -1,6 +1,8 @@
 #ifndef PD_CONFIG_H
 #define PD_CONFIG_H
 
+#include <stdbool.h>
+
 #include "esp_err.h"
 
 #ifdef __cplusplus
@@ -11,10 +13,19 @@ typedef struct {
     int matrix_width;
     int matrix_height;
     int orientation_deg;
+    int scan_wiring;
     char wifi_ssid[33];
     char wifi_password[65];
     char device_name[33];
+    char hostname[64];
+    char timezone[64];
+    char static_ip[16];
+    char static_gateway[16];
+    char static_netmask[16];
     bool setup_complete;
+    bool reztest_mode;
+    bool reztest_done;
+    int reztest_index;
     int config_version;
 } pd_config_t;
 

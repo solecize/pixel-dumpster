@@ -1,5 +1,5 @@
 idf_component_register(
     SRCS "pd-network.c"
     INCLUDE_DIRS "include"
-    REQUIRES esp_netif esp_http_server lwip
+    REQUIRES esp_netif esp_http_server esp_wifi esp_event nvs_flash lwip cjson pd-storage pd-config
 )
