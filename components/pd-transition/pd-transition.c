@@ -691,46 +691,57 @@ static void zoom_blit(uint8_t *dst, const uint8_t *src, int w, int h, float scal
 
 /* ---- zoom ---- */
 
+/* zoom threshold: when scale exceeds this, the image has "passed the camera"
+ * and is no longer visible (edges are all off-screen) */
+#define ZOOM_VANISH 3.0f
+/* the crossover point: fraction of transition where A disappears and B appears */
+#define ZOOM_CROSS 0.45f
+
 static void render_zoom_in(pd_transition_t *t, float p)
 {
-    /* B zooms in from 200% to 100% (with bounce overshoot)
-     * A shrinks from 100% to 0% in lockstep
-     * Both are composited: A behind, B in front */
+    /* Phase 1 (0..CROSS): A zooms from 100% past the camera to VANISH (flies past)
+     * Phase 2 (CROSS..1): B appears small and grows to 100% with bounce */
     int w = t->out->width;
     int h = t->out->height;
-    float ep = ease_bounce_out(p);
-
-    float scale_a = 1.0f - ep;        /* A: 1.0 -> ~-0.1 -> 0.0 */
-    float scale_b = 2.0f - ep;        /* B: 2.0 -> ~0.9 -> 1.0 */
-    if (scale_a < 0.0f) scale_a = 0.0f;
 
     pd_framebuf_clear(t->out);
-    /* draw A behind (shrinking) */
-    if (scale_a > 0.01f)
+
+    if (p < ZOOM_CROSS) {
+        /* A: 100% -> VANISH (zooming in, edges fly past camera) */
+        float t1 = p / ZOOM_CROSS;  /* 0..1 within phase 1 */
+        float scale_a = 1.0f + t1 * (ZOOM_VANISH - 1.0f);
         zoom_blit(t->out->data, t->from->data, w, h, scale_a);
-    /* draw B in front (approaching from 200% to 100%) */
-    zoom_blit(t->out->data, t->to->data, w, h, scale_b);
+    } else {
+        /* B: starts small, grows to 100% with bounce */
+        float t2 = (p - ZOOM_CROSS) / (1.0f - ZOOM_CROSS);  /* 0..1 within phase 2 */
+        float ep = ease_bounce_out(t2);
+        float scale_b = 0.15f + ep * 0.85f;  /* 15% -> ~110% -> 100% */
+        zoom_blit(t->out->data, t->to->data, w, h, scale_b);
+    }
 }
 
 static void render_zoom_out(pd_transition_t *t, float p)
 {
-    /* A shrinks from 100% to 0% (with bounce: goes to ~-10% then 0%)
-     * B grows from 0% to 100% behind A in lockstep */
+    /* Phase 1 (0..CROSS): A shrinks from 100% down to tiny and vanishes
+     * Phase 2 (CROSS..1): B appears huge (past camera) and shrinks to 100% with bounce */
     int w = t->out->width;
     int h = t->out->height;
-    float ep = ease_bounce_out(p);
-
-    float scale_a = 1.0f - ep;        /* A: 1.0 -> ~-0.1 -> 0.0 */
-    float scale_b = ep;               /* B: 0.0 -> ~1.1 -> 1.0 */
-    if (scale_a < 0.0f) scale_a = 0.0f;
-    if (scale_b > 2.0f) scale_b = 2.0f;
 
     pd_framebuf_clear(t->out);
-    /* draw B behind (growing) */
-    zoom_blit(t->out->data, t->to->data, w, h, scale_b);
-    /* draw A in front (shrinking away) */
-    if (scale_a > 0.01f)
+
+    if (p < ZOOM_CROSS) {
+        /* A: 100% -> tiny (shrinking away) */
+        float t1 = p / ZOOM_CROSS;  /* 0..1 within phase 1 */
+        float scale_a = 1.0f - t1 * 0.85f;  /* 100% -> 15% */
+        if (scale_a < 0.01f) scale_a = 0.01f;
         zoom_blit(t->out->data, t->from->data, w, h, scale_a);
+    } else {
+        /* B: starts huge, shrinks to 100% with bounce */
+        float t2 = (p - ZOOM_CROSS) / (1.0f - ZOOM_CROSS);  /* 0..1 within phase 2 */
+        float ep = ease_bounce_out(t2);
+        float scale_b = ZOOM_VANISH - ep * (ZOOM_VANISH - 1.0f);  /* 300% -> ~90% -> 100% */
+        zoom_blit(t->out->data, t->to->data, w, h, scale_b);
+    }
 }
 
 /* ---- flip ---- */
