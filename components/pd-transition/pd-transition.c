@@ -111,6 +111,15 @@ static const char *transition_names[PD_TRANS_COUNT] = {
     [PD_TRANS_FADE]        = "fade",
     [PD_TRANS_BLOCK_BUILD] = "block-build",
     [PD_TRANS_PIXEL_BUILD] = "pixel-build",
+    [PD_TRANS_WIPE_DIAG_TL] = "wipe-diag-tl",
+    [PD_TRANS_WIPE_DIAG_TR] = "wipe-diag-tr",
+    [PD_TRANS_WIPE_DIAG_BL] = "wipe-diag-bl",
+    [PD_TRANS_WIPE_DIAG_BR] = "wipe-diag-br",
+    [PD_TRANS_SPLIT_DIAG]   = "split-diag",
+    [PD_TRANS_ZOOM_IN]      = "zoom-in",
+    [PD_TRANS_ZOOM_OUT]     = "zoom-out",
+    [PD_TRANS_FLIP_H]       = "flip-h",
+    [PD_TRANS_FLIP_V]       = "flip-v",
 };
 
 const char *pd_transition_type_name(pd_transition_type_t type)
@@ -497,6 +506,302 @@ static void render_pixel_build(pd_transition_t *t, float p)
     }
 }
 
+/* ---- diagonal wipes ---- */
+
+static void render_wipe_diag_tl(pd_transition_t *t, float p)
+{
+    /* diagonal wipe from top-left corner: pixels where (x/w + y/h) < 2*p are "to" */
+    int w = t->out->width;
+    int h = t->out->height;
+    float threshold = 2.0f * p;
+    for (int y = 0; y < h; y++) {
+        float fy = (float)y / (float)h;
+        for (int x = 0; x < w; x++) {
+            float fx = (float)x / (float)w;
+            int idx = (y * w + x) * 3;
+            if (fx + fy < threshold) {
+                t->out->data[idx]     = t->to->data[idx];
+                t->out->data[idx + 1] = t->to->data[idx + 1];
+                t->out->data[idx + 2] = t->to->data[idx + 2];
+            } else {
+                t->out->data[idx]     = t->from->data[idx];
+                t->out->data[idx + 1] = t->from->data[idx + 1];
+                t->out->data[idx + 2] = t->from->data[idx + 2];
+            }
+        }
+    }
+}
+
+static void render_wipe_diag_tr(pd_transition_t *t, float p)
+{
+    int w = t->out->width;
+    int h = t->out->height;
+    float threshold = 2.0f * p;
+    for (int y = 0; y < h; y++) {
+        float fy = (float)y / (float)h;
+        for (int x = 0; x < w; x++) {
+            float fx = (float)(w - 1 - x) / (float)w;
+            int idx = (y * w + x) * 3;
+            if (fx + fy < threshold) {
+                t->out->data[idx]     = t->to->data[idx];
+                t->out->data[idx + 1] = t->to->data[idx + 1];
+                t->out->data[idx + 2] = t->to->data[idx + 2];
+            } else {
+                t->out->data[idx]     = t->from->data[idx];
+                t->out->data[idx + 1] = t->from->data[idx + 1];
+                t->out->data[idx + 2] = t->from->data[idx + 2];
+            }
+        }
+    }
+}
+
+static void render_wipe_diag_bl(pd_transition_t *t, float p)
+{
+    int w = t->out->width;
+    int h = t->out->height;
+    float threshold = 2.0f * p;
+    for (int y = 0; y < h; y++) {
+        float fy = (float)(h - 1 - y) / (float)h;
+        for (int x = 0; x < w; x++) {
+            float fx = (float)x / (float)w;
+            int idx = (y * w + x) * 3;
+            if (fx + fy < threshold) {
+                t->out->data[idx]     = t->to->data[idx];
+                t->out->data[idx + 1] = t->to->data[idx + 1];
+                t->out->data[idx + 2] = t->to->data[idx + 2];
+            } else {
+                t->out->data[idx]     = t->from->data[idx];
+                t->out->data[idx + 1] = t->from->data[idx + 1];
+                t->out->data[idx + 2] = t->from->data[idx + 2];
+            }
+        }
+    }
+}
+
+static void render_wipe_diag_br(pd_transition_t *t, float p)
+{
+    int w = t->out->width;
+    int h = t->out->height;
+    float threshold = 2.0f * p;
+    for (int y = 0; y < h; y++) {
+        float fy = (float)(h - 1 - y) / (float)h;
+        for (int x = 0; x < w; x++) {
+            float fx = (float)(w - 1 - x) / (float)w;
+            int idx = (y * w + x) * 3;
+            if (fx + fy < threshold) {
+                t->out->data[idx]     = t->to->data[idx];
+                t->out->data[idx + 1] = t->to->data[idx + 1];
+                t->out->data[idx + 2] = t->to->data[idx + 2];
+            } else {
+                t->out->data[idx]     = t->from->data[idx];
+                t->out->data[idx + 1] = t->from->data[idx + 1];
+                t->out->data[idx + 2] = t->from->data[idx + 2];
+            }
+        }
+    }
+}
+
+/* ---- diagonal split ---- */
+
+static void render_split_diag(pd_transition_t *t, float p)
+{
+    /* top-left triangle slides toward TL, bottom-right toward BR, revealing "to" */
+    int w = t->out->width;
+    int h = t->out->height;
+    float shift = p;  /* 0..1 */
+
+    pd_framebuf_copy(t->out, t->to);
+
+    for (int y = 0; y < h; y++) {
+        float fy = (float)y / (float)h;
+        for (int x = 0; x < w; x++) {
+            float fx = (float)x / (float)w;
+            int idx = (y * w + x) * 3;
+            if (fx + fy < 1.0f) {
+                /* top-left triangle: sample from shifted position */
+                int sx = x - (int)(shift * w * 0.5f);
+                int sy = y - (int)(shift * h * 0.5f);
+                if (sx >= 0 && sy >= 0 && sx < w && sy < h) {
+                    int si = (sy * w + sx) * 3;
+                    t->out->data[idx]     = t->from->data[si];
+                    t->out->data[idx + 1] = t->from->data[si + 1];
+                    t->out->data[idx + 2] = t->from->data[si + 2];
+                }
+            } else {
+                /* bottom-right triangle: sample from shifted position */
+                int sx = x + (int)(shift * w * 0.5f);
+                int sy = y + (int)(shift * h * 0.5f);
+                if (sx >= 0 && sy >= 0 && sx < w && sy < h) {
+                    int si = (sy * w + sx) * 3;
+                    t->out->data[idx]     = t->from->data[si];
+                    t->out->data[idx + 1] = t->from->data[si + 1];
+                    t->out->data[idx + 2] = t->from->data[si + 2];
+                }
+            }
+        }
+    }
+}
+
+/* ---- zoom ---- */
+
+static void render_zoom_in(pd_transition_t *t, float p)
+{
+    /* new content zooms in from center (starts tiny, grows to full) */
+    int w = t->out->width;
+    int h = t->out->height;
+    float scale = p;  /* 0..1 */
+    if (scale < 0.01f) scale = 0.01f;
+
+    int zw = (int)(w * scale);
+    int zh = (int)(h * scale);
+    int ox = (w - zw) / 2;
+    int oy = (h - zh) / 2;
+
+    pd_framebuf_copy(t->out, t->from);
+
+    for (int y = 0; y < zh; y++) {
+        int dy = oy + y;
+        if (dy < 0 || dy >= h) continue;
+        /* source row in "to" image: scale y back to full size */
+        int sy = y * h / zh;
+        if (sy >= h) sy = h - 1;
+        for (int x = 0; x < zw; x++) {
+            int dx = ox + x;
+            if (dx < 0 || dx >= w) continue;
+            int sx = x * w / zw;
+            if (sx >= w) sx = w - 1;
+            int di = (dy * w + dx) * 3;
+            int si = (sy * w + sx) * 3;
+            t->out->data[di]     = t->to->data[si];
+            t->out->data[di + 1] = t->to->data[si + 1];
+            t->out->data[di + 2] = t->to->data[si + 2];
+        }
+    }
+}
+
+static void render_zoom_out(pd_transition_t *t, float p)
+{
+    /* old content shrinks to center, revealing new content behind */
+    int w = t->out->width;
+    int h = t->out->height;
+    float scale = 1.0f - p;  /* 1..0 */
+    if (scale < 0.01f) scale = 0.01f;
+
+    int zw = (int)(w * scale);
+    int zh = (int)(h * scale);
+    int ox = (w - zw) / 2;
+    int oy = (h - zh) / 2;
+
+    pd_framebuf_copy(t->out, t->to);
+
+    for (int y = 0; y < zh; y++) {
+        int dy = oy + y;
+        if (dy < 0 || dy >= h) continue;
+        int sy = y * h / zh;
+        if (sy >= h) sy = h - 1;
+        for (int x = 0; x < zw; x++) {
+            int dx = ox + x;
+            if (dx < 0 || dx >= w) continue;
+            int sx = x * w / zw;
+            if (sx >= w) sx = w - 1;
+            int di = (dy * w + dx) * 3;
+            int si = (sy * w + sx) * 3;
+            t->out->data[di]     = t->from->data[si];
+            t->out->data[di + 1] = t->from->data[si + 1];
+            t->out->data[di + 2] = t->from->data[si + 2];
+        }
+    }
+}
+
+/* ---- flip ---- */
+
+static void render_flip_h(pd_transition_t *t, float p)
+{
+    /* horizontal flip: first half squeezes old content horizontally,
+       second half expands new content */
+    int w = t->out->width;
+    int h = t->out->height;
+
+    if (p < 0.5f) {
+        /* squeeze old content: scale = 1.0 -> 0.0 */
+        float scale = 1.0f - 2.0f * p;
+        if (scale < 0.02f) scale = 0.02f;
+        int sw = (int)(w * scale);
+        int ox = (w - sw) / 2;
+
+        pd_framebuf_clear(t->out);
+        for (int y = 0; y < h; y++) {
+            for (int x = 0; x < sw; x++) {
+                int dx = ox + x;
+                int sx = x * w / sw;
+                if (sx >= w) sx = w - 1;
+                int di = (y * w + dx) * 3;
+                int si = (y * w + sx) * 3;
+                t->out->data[di]     = t->from->data[si];
+                t->out->data[di + 1] = t->from->data[si + 1];
+                t->out->data[di + 2] = t->from->data[si + 2];
+            }
+        }
+    } else {
+        /* expand new content: scale = 0.0 -> 1.0 */
+        float scale = 2.0f * (p - 0.5f);
+        if (scale < 0.02f) scale = 0.02f;
+        int sw = (int)(w * scale);
+        int ox = (w - sw) / 2;
+
+        pd_framebuf_clear(t->out);
+        for (int y = 0; y < h; y++) {
+            for (int x = 0; x < sw; x++) {
+                int dx = ox + x;
+                int sx = x * w / sw;
+                if (sx >= w) sx = w - 1;
+                int di = (y * w + dx) * 3;
+                int si = (y * w + sx) * 3;
+                t->out->data[di]     = t->to->data[si];
+                t->out->data[di + 1] = t->to->data[si + 1];
+                t->out->data[di + 2] = t->to->data[si + 2];
+            }
+        }
+    }
+}
+
+static void render_flip_v(pd_transition_t *t, float p)
+{
+    /* vertical flip: first half squeezes old content vertically,
+       second half expands new content */
+    int w = t->out->width;
+    int h = t->out->height;
+    int row_bytes = w * 3;
+
+    if (p < 0.5f) {
+        float scale = 1.0f - 2.0f * p;
+        if (scale < 0.02f) scale = 0.02f;
+        int sh = (int)(h * scale);
+        int oy = (h - sh) / 2;
+
+        pd_framebuf_clear(t->out);
+        for (int y = 0; y < sh; y++) {
+            int dy = oy + y;
+            int sy = y * h / sh;
+            if (sy >= h) sy = h - 1;
+            memcpy(t->out->data + dy * row_bytes, t->from->data + sy * row_bytes, row_bytes);
+        }
+    } else {
+        float scale = 2.0f * (p - 0.5f);
+        if (scale < 0.02f) scale = 0.02f;
+        int sh = (int)(h * scale);
+        int oy = (h - sh) / 2;
+
+        pd_framebuf_clear(t->out);
+        for (int y = 0; y < sh; y++) {
+            int dy = oy + y;
+            int sy = y * h / sh;
+            if (sy >= h) sy = h - 1;
+            memcpy(t->out->data + dy * row_bytes, t->to->data + sy * row_bytes, row_bytes);
+        }
+    }
+}
+
 /* ---- dispatch ---- */
 
 typedef void (*transition_render_fn)(pd_transition_t *t, float p);
@@ -516,8 +821,17 @@ static const transition_render_fn render_fns[PD_TRANS_COUNT] = {
     [PD_TRANS_SPLIT_H]     = render_split_h,
     [PD_TRANS_SPLIT_V]     = render_split_v,
     [PD_TRANS_FADE]        = render_fade,
-    [PD_TRANS_BLOCK_BUILD] = render_block_build,
-    [PD_TRANS_PIXEL_BUILD] = render_pixel_build,
+    [PD_TRANS_BLOCK_BUILD]  = render_block_build,
+    [PD_TRANS_PIXEL_BUILD]  = render_pixel_build,
+    [PD_TRANS_WIPE_DIAG_TL] = render_wipe_diag_tl,
+    [PD_TRANS_WIPE_DIAG_TR] = render_wipe_diag_tr,
+    [PD_TRANS_WIPE_DIAG_BL] = render_wipe_diag_bl,
+    [PD_TRANS_WIPE_DIAG_BR] = render_wipe_diag_br,
+    [PD_TRANS_SPLIT_DIAG]   = render_split_diag,
+    [PD_TRANS_ZOOM_IN]      = render_zoom_in,
+    [PD_TRANS_ZOOM_OUT]     = render_zoom_out,
+    [PD_TRANS_FLIP_H]       = render_flip_h,
+    [PD_TRANS_FLIP_V]       = render_flip_v,
 };
 
 bool pd_transition_tick(pd_transition_t *t)
