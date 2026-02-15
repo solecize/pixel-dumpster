@@ -372,6 +372,20 @@ extern "C" void pd_display_render_rgb(const uint8_t *rgb, int img_w, int img_h)
     }
 }
 
+extern "C" void pd_display_render_framebuf(const uint8_t *rgb)
+{
+    if (!pd_display_driver || !rgb) return;
+    int dw = pd_display_current_width;
+    int dh = pd_display_current_height;
+    for (int y = 0; y < dh; y++) {
+        for (int x = 0; x < dw; x++) {
+            int idx = (y * dw + x) * 3;
+            pd_display_driver->set_pixel(x, y,
+                                         rgb[idx + 2], rgb[idx], rgb[idx + 1]);
+        }
+    }
+}
+
 extern "C" void pd_display_draw_rect(uint16_t x, uint16_t y, uint16_t w, uint16_t h, pd_display_color_t color)
 {
     if (!pd_display_driver || w == 0 || h == 0) return;

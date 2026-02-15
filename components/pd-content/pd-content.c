@@ -14,6 +14,7 @@
 #include "freertos/task.h"
 #include "lodepng.h"
 #include "pd-display.h"
+#include "pd-transition.h"
 
 static const char *TAG = "pd-content";
 
@@ -26,6 +27,10 @@ static int  content_total_frames = 0;
 static int  content_fps = 12;
 static bool content_loop = true;
 static int64_t content_last_frame_us = 0;
+
+/* ---- transition state ---- */
+static pd_transition_t *content_transition = NULL;
+static pd_framebuf_t   *content_fb = NULL;  /* current display framebuffer */
 
 /* ---- helpers ---- */
 
@@ -145,6 +150,16 @@ esp_err_t pd_content_init(const char *base_path)
     snprintf(path, sizeof(path), "%s/images", content_base);
     ensure_dir(path);
 
+    int dw = pd_display_get_width();
+    int dh = pd_display_get_height();
+    if (dw > 0 && dh > 0) {
+        content_transition = pd_transition_create(dw, dh);
+        content_fb = pd_framebuf_create(dw, dh);
+        if (!content_transition || !content_fb) {
+            ESP_LOGW(TAG, "failed to allocate transition engine");
+        }
+    }
+
     ESP_LOGI(TAG, "content initialized at %s", content_base);
     return ESP_OK;
 }
@@ -190,13 +205,33 @@ int pd_content_list_images(pd_content_entry_t *entries, int max_entries)
     return count;
 }
 
-esp_err_t pd_content_play(const char *path)
+/* helper: decode first frame of content into a framebuffer */
+static bool content_decode_first_frame(const char *full_path, pd_framebuf_t *fb)
 {
-    char full[PD_CONTENT_MAX_PATH];
-    snprintf(full, sizeof(full), "%s/%s", content_base, path);
+    if (path_is_dir(full_path)) {
+        char frame_path[PD_CONTENT_MAX_PATH];
+        snprintf(frame_path, sizeof(frame_path), "%s/%04d.png", full_path, 1);
+        unsigned w, h;
+        uint8_t *rgb = decode_png_file(frame_path, &w, &h);
+        if (!rgb) return false;
+        pd_framebuf_blit_rgb(fb, rgb, (int)w, (int)h);
+        free(rgb);
+        return true;
+    } else if (path_exists(full_path) && is_png(full_path)) {
+        unsigned w, h;
+        uint8_t *rgb = decode_png_file(full_path, &w, &h);
+        if (!rgb) return false;
+        pd_framebuf_blit_rgb(fb, rgb, (int)w, (int)h);
+        free(rgb);
+        return true;
+    }
+    return false;
+}
 
+/* helper: set up playback state for a content path */
+static esp_err_t content_setup_playback(const char *path, const char *full)
+{
     if (path_is_dir(full)) {
-        /* sequence */
         int fps = 12;
         bool loop = true;
         int frames = 0;
@@ -212,44 +247,83 @@ esp_err_t pd_content_play(const char *path)
         content_fps = fps > 0 ? fps : 12;
         content_loop = loop;
         content_total_frames = frames;
-        content_frame = 0;
+        content_frame = 1;
         content_playing = true;
         content_last_frame_us = 0;
 
         ESP_LOGI(TAG, "playing sequence: %s (%d frames @ %d fps)", path, frames, fps);
-
-        /* show first frame immediately */
-        char frame_path[PD_CONTENT_MAX_PATH];
-        snprintf(frame_path, sizeof(frame_path), "%s/%04d.png", full, 1);
-        unsigned w, h;
-        uint8_t *rgb = decode_png_file(frame_path, &w, &h);
-        if (rgb) {
-            pd_display_render_rgb(rgb, (int)w, (int)h);
-            free(rgb);
-        }
-        content_frame = 1;
     } else if (path_exists(full) && is_png(full)) {
-        /* static image */
-        unsigned w, h;
-        uint8_t *rgb = decode_png_file(full, &w, &h);
-        if (!rgb) return ESP_ERR_NO_MEM;
-
-        pd_display_render_rgb(rgb, (int)w, (int)h);
-        free(rgb);
-
         strlcpy(content_current, full, sizeof(content_current));
         content_is_seq = false;
         content_playing = true;
         content_frame = 0;
         content_total_frames = 1;
 
-        ESP_LOGI(TAG, "displaying static: %s (%ux%u)", path, w, h);
+        ESP_LOGI(TAG, "displaying static: %s", path);
     } else {
         ESP_LOGW(TAG, "content not found: %s", full);
         return ESP_ERR_NOT_FOUND;
     }
-
     return ESP_OK;
+}
+
+esp_err_t pd_content_play(const char *path)
+{
+    char full[PD_CONTENT_MAX_PATH];
+    snprintf(full, sizeof(full), "%s/%s", content_base, path);
+
+    /* decode first frame into content_fb and display it */
+    if (content_fb) {
+        if (!content_decode_first_frame(full, content_fb)) {
+            return ESP_ERR_NOT_FOUND;
+        }
+        pd_display_render_framebuf(content_fb->data);
+    } else {
+        /* fallback: no framebuffer, render directly */
+        unsigned w, h;
+        uint8_t *rgb = NULL;
+        if (path_is_dir(full)) {
+            char fp[PD_CONTENT_MAX_PATH];
+            snprintf(fp, sizeof(fp), "%s/%04d.png", full, 1);
+            rgb = decode_png_file(fp, &w, &h);
+        } else {
+            rgb = decode_png_file(full, &w, &h);
+        }
+        if (!rgb) return ESP_ERR_NOT_FOUND;
+        pd_display_render_rgb(rgb, (int)w, (int)h);
+        free(rgb);
+    }
+
+    return content_setup_playback(path, full);
+}
+
+esp_err_t pd_content_play_with_transition(const char *path, const char *transition,
+                                          int duration_ms)
+{
+    if (!content_transition || !content_fb) {
+        return pd_content_play(path);
+    }
+
+    char full[PD_CONTENT_MAX_PATH];
+    snprintf(full, sizeof(full), "%s/%s", content_base, path);
+
+    pd_transition_type_t type = pd_transition_type_from_name(transition);
+    if (type == PD_TRANS_NONE) {
+        return pd_content_play(path);
+    }
+
+    /* capture current display as "from" */
+    pd_framebuf_copy(content_transition->from, content_fb);
+
+    /* decode new content into "to" */
+    if (!content_decode_first_frame(full, content_transition->to)) {
+        return ESP_ERR_NOT_FOUND;
+    }
+
+    /* start the transition */
+    pd_transition_start(content_transition, type, duration_ms);
+
+    return content_setup_playback(path, full);
 }
 
 esp_err_t pd_content_stop(void)
@@ -277,6 +351,17 @@ pd_content_status_t pd_content_get_status(void)
 
 void pd_content_tick(void)
 {
+    /* drive active transition */
+    if (content_transition && pd_transition_is_active(content_transition)) {
+        bool still_going = pd_transition_tick(content_transition);
+        pd_display_render_framebuf(content_transition->out->data);
+        if (!still_going) {
+            /* transition finished — update content_fb to final state */
+            pd_framebuf_copy(content_fb, content_transition->to);
+        }
+        return;  /* don't advance sequence frames during transition */
+    }
+
     if (!content_playing || !content_is_seq) return;
 
     int64_t now = esp_timer_get_time();
@@ -306,7 +391,12 @@ void pd_content_tick(void)
     unsigned w, h;
     uint8_t *rgb = decode_png_file(frame_path, &w, &h);
     if (rgb) {
-        pd_display_render_rgb(rgb, (int)w, (int)h);
+        if (content_fb) {
+            pd_framebuf_blit_rgb(content_fb, rgb, (int)w, (int)h);
+            pd_display_render_framebuf(content_fb->data);
+        } else {
+            pd_display_render_rgb(rgb, (int)w, (int)h);
+        }
         free(rgb);
         content_frame = next;
     }
@@ -413,7 +503,17 @@ static esp_err_t http_content_play(httpd_req_t *req)
         return ESP_FAIL;
     }
 
-    esp_err_t err = pd_content_play(path->valuestring);
+    cJSON *j_trans = cJSON_GetObjectItem(root, "transition");
+    cJSON *j_dur   = cJSON_GetObjectItem(root, "duration_ms");
+
+    esp_err_t err;
+    if (cJSON_IsString(j_trans)) {
+        int dur = cJSON_IsNumber(j_dur) ? j_dur->valueint : 500;
+        err = pd_content_play_with_transition(path->valuestring,
+                                              j_trans->valuestring, dur);
+    } else {
+        err = pd_content_play(path->valuestring);
+    }
     cJSON_Delete(root);
 
     if (err != ESP_OK) {

@@ -37,6 +37,8 @@ esp_err_t pd_content_init(const char *base_path);
 int pd_content_list_images(pd_content_entry_t *entries, int max_entries);
 
 esp_err_t pd_content_play(const char *path);
+esp_err_t pd_content_play_with_transition(const char *path, const char *transition,
+                                          int duration_ms);
 esp_err_t pd_content_stop(void);
 pd_content_status_t pd_content_get_status(void);
 

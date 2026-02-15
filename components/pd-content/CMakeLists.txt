@@ -1,7 +1,7 @@
 idf_component_register(
     SRCS "pd-content.c"
     INCLUDE_DIRS "include"
-    REQUIRES pd-display pd-storage
+    REQUIRES pd-display pd-storage pd-transition
     PRIV_REQUIRES esp_timer esp_http_server cjson lodepng
 )
 
