@@ -98,9 +98,17 @@ static bool load_sequence_meta(const char *dir_path, int *fps, bool *loop_out, i
     cJSON *j_fps = cJSON_GetObjectItem(root, "fps");
     cJSON *j_loop = cJSON_GetObjectItem(root, "loop");
 
+    cJSON *j_frames = cJSON_GetObjectItem(root, "frames");
+
     if (fps && cJSON_IsNumber(j_fps)) *fps = j_fps->valueint;
     if (loop_out) *loop_out = cJSON_IsBool(j_loop) ? cJSON_IsTrue(j_loop) : true;
-    if (frame_count) *frame_count = count_sequence_frames(dir_path);
+    if (frame_count) {
+        if (cJSON_IsNumber(j_frames) && j_frames->valueint > 0) {
+            *frame_count = j_frames->valueint;
+        } else {
+            *frame_count = count_sequence_frames(dir_path);
+        }
+    }
 
     cJSON_Delete(root);
     return true;

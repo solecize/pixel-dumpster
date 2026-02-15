@@ -2,6 +2,7 @@
   "name": "Pac-Ghost",
   "fps": 24,
   "loop": true,
+  "frames": 115,
   "width": 64,
   "height": 64
 }
