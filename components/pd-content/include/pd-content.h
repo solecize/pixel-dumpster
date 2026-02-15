@@ -32,6 +32,35 @@ typedef struct {
     int  fps;
 } pd_content_status_t;
 
+/* transition mode */
+typedef enum {
+    PD_TRANS_MODE_RANDOM,
+    PD_TRANS_MODE_BASELINE,
+    PD_TRANS_MODE_PER_ITEM,
+} pd_trans_mode_t;
+
+/* global content configuration */
+typedef struct {
+    /* transition settings */
+    pd_trans_mode_t trans_mode;
+    char trans_baseline[32];
+    int  trans_duration_ms;
+
+    /* display settings */
+    int  hold_ms;
+    bool loop_sequences;
+
+    /* attract mode */
+    bool attract_enabled;
+    char attract_path[PD_CONTENT_MAX_PATH];
+    bool attract_shuffle;
+    int  attract_idle_timeout_ms;
+} pd_content_config_t;
+
+const pd_content_config_t *pd_content_get_config(void);
+esp_err_t pd_content_set_config(const pd_content_config_t *cfg);
+esp_err_t pd_content_save_config(void);
+
 esp_err_t pd_content_init(const char *base_path);
 
 int pd_content_list_images(pd_content_entry_t *entries, int max_entries);

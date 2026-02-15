@@ -85,6 +85,7 @@ float pd_transition_progress(const pd_transition_t *t);
 
 const char *pd_transition_type_name(pd_transition_type_t type);
 pd_transition_type_t pd_transition_type_from_name(const char *name);
+pd_transition_type_t pd_transition_random(void);
 
 #ifdef __cplusplus
 }

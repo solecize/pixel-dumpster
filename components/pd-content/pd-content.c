@@ -32,6 +32,19 @@ static int64_t content_last_frame_us = 0;
 static pd_transition_t *content_transition = NULL;
 static pd_framebuf_t   *content_fb = NULL;  /* current display framebuffer */
 
+/* ---- global config ---- */
+static pd_content_config_t content_config = {
+    .trans_mode = PD_TRANS_MODE_BASELINE,
+    .trans_baseline = "fade",
+    .trans_duration_ms = 800,
+    .hold_ms = 5000,
+    .loop_sequences = true,
+    .attract_enabled = false,
+    .attract_path = "images/",
+    .attract_shuffle = true,
+    .attract_idle_timeout_ms = 0,
+};
+
 /* ---- helpers ---- */
 
 static bool is_png(const char *name)
@@ -114,6 +127,161 @@ static bool load_sequence_meta(const char *dir_path, int *fps, bool *loop_out, i
     return true;
 }
 
+/* ---- config load/save ---- */
+
+static void load_config(void)
+{
+    char path[PD_CONTENT_MAX_PATH];
+    snprintf(path, sizeof(path), "%s/config.json", content_base);
+
+    FILE *f = fopen(path, "r");
+    if (!f) {
+        ESP_LOGI(TAG, "no config.json, using defaults");
+        return;
+    }
+
+    fseek(f, 0, SEEK_END);
+    long sz = ftell(f);
+    rewind(f);
+    if (sz <= 0 || sz > 4096) { fclose(f); return; }
+
+    char *buf = calloc(1, sz + 1);
+    if (!buf) { fclose(f); return; }
+    fread(buf, 1, sz, f);
+    fclose(f);
+
+    cJSON *root = cJSON_Parse(buf);
+    free(buf);
+    if (!root) {
+        ESP_LOGW(TAG, "config.json parse failed");
+        return;
+    }
+
+    /* transition section */
+    cJSON *trans = cJSON_GetObjectItem(root, "transition");
+    if (trans) {
+        cJSON *mode = cJSON_GetObjectItem(trans, "mode");
+        if (cJSON_IsString(mode)) {
+            if (strcmp(mode->valuestring, "random") == 0)
+                content_config.trans_mode = PD_TRANS_MODE_RANDOM;
+            else if (strcmp(mode->valuestring, "baseline") == 0)
+                content_config.trans_mode = PD_TRANS_MODE_BASELINE;
+            else if (strcmp(mode->valuestring, "per-item") == 0)
+                content_config.trans_mode = PD_TRANS_MODE_PER_ITEM;
+        }
+        cJSON *baseline = cJSON_GetObjectItem(trans, "baseline");
+        if (cJSON_IsString(baseline))
+            strlcpy(content_config.trans_baseline, baseline->valuestring,
+                    sizeof(content_config.trans_baseline));
+        cJSON *dur = cJSON_GetObjectItem(trans, "duration_ms");
+        if (cJSON_IsNumber(dur))
+            content_config.trans_duration_ms = dur->valueint;
+    }
+
+    /* display section */
+    cJSON *disp = cJSON_GetObjectItem(root, "display");
+    if (disp) {
+        cJSON *hold = cJSON_GetObjectItem(disp, "hold_ms");
+        if (cJSON_IsNumber(hold))
+            content_config.hold_ms = hold->valueint;
+        cJSON *loop_seq = cJSON_GetObjectItem(disp, "loop_sequences");
+        if (cJSON_IsBool(loop_seq))
+            content_config.loop_sequences = cJSON_IsTrue(loop_seq);
+    }
+
+    /* attract section */
+    cJSON *attr = cJSON_GetObjectItem(root, "attract");
+    if (attr) {
+        cJSON *enabled = cJSON_GetObjectItem(attr, "enabled");
+        if (cJSON_IsBool(enabled))
+            content_config.attract_enabled = cJSON_IsTrue(enabled);
+        cJSON *apath = cJSON_GetObjectItem(attr, "path");
+        if (cJSON_IsString(apath))
+            strlcpy(content_config.attract_path, apath->valuestring,
+                    sizeof(content_config.attract_path));
+        cJSON *shuffle = cJSON_GetObjectItem(attr, "shuffle");
+        if (cJSON_IsBool(shuffle))
+            content_config.attract_shuffle = cJSON_IsTrue(shuffle);
+        cJSON *idle = cJSON_GetObjectItem(attr, "idle_timeout_ms");
+        if (cJSON_IsNumber(idle))
+            content_config.attract_idle_timeout_ms = idle->valueint;
+    }
+
+    cJSON_Delete(root);
+    ESP_LOGI(TAG, "config loaded: mode=%d baseline=%s dur=%d",
+             content_config.trans_mode, content_config.trans_baseline,
+             content_config.trans_duration_ms);
+}
+
+const pd_content_config_t *pd_content_get_config(void)
+{
+    return &content_config;
+}
+
+esp_err_t pd_content_set_config(const pd_content_config_t *cfg)
+{
+    if (!cfg) return ESP_ERR_INVALID_ARG;
+    memcpy(&content_config, cfg, sizeof(content_config));
+    return ESP_OK;
+}
+
+/* select transition based on config mode */
+static const char *select_transition_name(void)
+{
+    switch (content_config.trans_mode) {
+    case PD_TRANS_MODE_RANDOM:
+        return pd_transition_type_name(pd_transition_random());
+    case PD_TRANS_MODE_BASELINE:
+    default:
+        return content_config.trans_baseline;
+    case PD_TRANS_MODE_PER_ITEM:
+        /* per-item would check item meta, but for now fall back to baseline */
+        return content_config.trans_baseline;
+    }
+}
+
+esp_err_t pd_content_save_config(void)
+{
+    char path[PD_CONTENT_MAX_PATH];
+    snprintf(path, sizeof(path), "%s/config.json", content_base);
+
+    const char *mode_str = "baseline";
+    if (content_config.trans_mode == PD_TRANS_MODE_RANDOM) mode_str = "random";
+    else if (content_config.trans_mode == PD_TRANS_MODE_PER_ITEM) mode_str = "per-item";
+
+    cJSON *root = cJSON_CreateObject();
+    cJSON *trans = cJSON_AddObjectToObject(root, "transition");
+    cJSON_AddStringToObject(trans, "mode", mode_str);
+    cJSON_AddStringToObject(trans, "baseline", content_config.trans_baseline);
+    cJSON_AddNumberToObject(trans, "duration_ms", content_config.trans_duration_ms);
+
+    cJSON *disp = cJSON_AddObjectToObject(root, "display");
+    cJSON_AddNumberToObject(disp, "hold_ms", content_config.hold_ms);
+    cJSON_AddBoolToObject(disp, "loop_sequences", content_config.loop_sequences);
+
+    cJSON *attr = cJSON_AddObjectToObject(root, "attract");
+    cJSON_AddBoolToObject(attr, "enabled", content_config.attract_enabled);
+    cJSON_AddStringToObject(attr, "path", content_config.attract_path);
+    cJSON_AddBoolToObject(attr, "shuffle", content_config.attract_shuffle);
+    cJSON_AddNumberToObject(attr, "idle_timeout_ms", content_config.attract_idle_timeout_ms);
+
+    char *json = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
+    if (!json) return ESP_ERR_NO_MEM;
+
+    FILE *f = fopen(path, "w");
+    if (!f) {
+        free(json);
+        return ESP_FAIL;
+    }
+    fputs(json, f);
+    fclose(f);
+    free(json);
+
+    ESP_LOGI(TAG, "config saved");
+    return ESP_OK;
+}
+
 /* ---- PNG decode ---- */
 
 static uint8_t *decode_png_file(const char *path, unsigned *w, unsigned *h)
@@ -167,6 +335,8 @@ esp_err_t pd_content_init(const char *base_path)
             ESP_LOGW(TAG, "failed to allocate transition engine");
         }
     }
+
+    load_config();
 
     ESP_LOGI(TAG, "content initialized at %s", content_base);
     return ESP_OK;
@@ -526,12 +696,26 @@ static esp_err_t http_content_play(httpd_req_t *req)
     cJSON *j_dur   = cJSON_GetObjectItem(root, "duration_ms");
 
     esp_err_t err;
+    const char *trans_name = NULL;
+    int dur = content_config.trans_duration_ms;
+
     if (cJSON_IsString(j_trans)) {
-        int dur = cJSON_IsNumber(j_dur) ? j_dur->valueint : 500;
-        err = pd_content_play_with_transition(path->valuestring,
-                                              j_trans->valuestring, dur);
+        /* explicit transition from request */
+        trans_name = j_trans->valuestring;
     } else {
+        /* use config mode to select transition */
+        trans_name = select_transition_name();
+    }
+
+    if (cJSON_IsNumber(j_dur)) {
+        dur = j_dur->valueint;
+    }
+
+    pd_transition_type_t type = pd_transition_type_from_name(trans_name);
+    if (type == PD_TRANS_NONE) {
         err = pd_content_play(path->valuestring);
+    } else {
+        err = pd_content_play_with_transition(path->valuestring, trans_name, dur);
     }
     cJSON_Delete(root);
 
@@ -570,6 +754,114 @@ static esp_err_t http_content_status(httpd_req_t *req)
     httpd_resp_set_type(req, "application/json");
     httpd_resp_send(req, json, HTTPD_RESP_USE_STRLEN);
     free(json);
+    return ESP_OK;
+}
+
+static esp_err_t http_config_get(httpd_req_t *req)
+{
+    const char *mode_str = "baseline";
+    if (content_config.trans_mode == PD_TRANS_MODE_RANDOM) mode_str = "random";
+    else if (content_config.trans_mode == PD_TRANS_MODE_PER_ITEM) mode_str = "per-item";
+
+    cJSON *root = cJSON_CreateObject();
+    cJSON *trans = cJSON_AddObjectToObject(root, "transition");
+    cJSON_AddStringToObject(trans, "mode", mode_str);
+    cJSON_AddStringToObject(trans, "baseline", content_config.trans_baseline);
+    cJSON_AddNumberToObject(trans, "duration_ms", content_config.trans_duration_ms);
+
+    cJSON *disp = cJSON_AddObjectToObject(root, "display");
+    cJSON_AddNumberToObject(disp, "hold_ms", content_config.hold_ms);
+    cJSON_AddBoolToObject(disp, "loop_sequences", content_config.loop_sequences);
+
+    cJSON *attr = cJSON_AddObjectToObject(root, "attract");
+    cJSON_AddBoolToObject(attr, "enabled", content_config.attract_enabled);
+    cJSON_AddStringToObject(attr, "path", content_config.attract_path);
+    cJSON_AddBoolToObject(attr, "shuffle", content_config.attract_shuffle);
+    cJSON_AddNumberToObject(attr, "idle_timeout_ms", content_config.attract_idle_timeout_ms);
+
+    char *json = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, json, HTTPD_RESP_USE_STRLEN);
+    free(json);
+    return ESP_OK;
+}
+
+static esp_err_t http_config_set(httpd_req_t *req)
+{
+    char buf[512];
+    int len = httpd_req_recv(req, buf, sizeof(buf) - 1);
+    if (len <= 0) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "missing body");
+        return ESP_FAIL;
+    }
+    buf[len] = '\0';
+
+    cJSON *root = cJSON_Parse(buf);
+    if (!root) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "invalid JSON");
+        return ESP_FAIL;
+    }
+
+    /* merge partial updates */
+    cJSON *trans = cJSON_GetObjectItem(root, "transition");
+    if (trans) {
+        cJSON *mode = cJSON_GetObjectItem(trans, "mode");
+        if (cJSON_IsString(mode)) {
+            if (strcmp(mode->valuestring, "random") == 0)
+                content_config.trans_mode = PD_TRANS_MODE_RANDOM;
+            else if (strcmp(mode->valuestring, "baseline") == 0)
+                content_config.trans_mode = PD_TRANS_MODE_BASELINE;
+            else if (strcmp(mode->valuestring, "per-item") == 0)
+                content_config.trans_mode = PD_TRANS_MODE_PER_ITEM;
+        }
+        cJSON *baseline = cJSON_GetObjectItem(trans, "baseline");
+        if (cJSON_IsString(baseline))
+            strlcpy(content_config.trans_baseline, baseline->valuestring,
+                    sizeof(content_config.trans_baseline));
+        cJSON *dur = cJSON_GetObjectItem(trans, "duration_ms");
+        if (cJSON_IsNumber(dur))
+            content_config.trans_duration_ms = dur->valueint;
+    }
+
+    cJSON *disp = cJSON_GetObjectItem(root, "display");
+    if (disp) {
+        cJSON *hold = cJSON_GetObjectItem(disp, "hold_ms");
+        if (cJSON_IsNumber(hold))
+            content_config.hold_ms = hold->valueint;
+        cJSON *loop_seq = cJSON_GetObjectItem(disp, "loop_sequences");
+        if (cJSON_IsBool(loop_seq))
+            content_config.loop_sequences = cJSON_IsTrue(loop_seq);
+    }
+
+    cJSON *attr = cJSON_GetObjectItem(root, "attract");
+    if (attr) {
+        cJSON *enabled = cJSON_GetObjectItem(attr, "enabled");
+        if (cJSON_IsBool(enabled))
+            content_config.attract_enabled = cJSON_IsTrue(enabled);
+        cJSON *apath = cJSON_GetObjectItem(attr, "path");
+        if (cJSON_IsString(apath))
+            strlcpy(content_config.attract_path, apath->valuestring,
+                    sizeof(content_config.attract_path));
+        cJSON *shuffle = cJSON_GetObjectItem(attr, "shuffle");
+        if (cJSON_IsBool(shuffle))
+            content_config.attract_shuffle = cJSON_IsTrue(shuffle);
+        cJSON *idle = cJSON_GetObjectItem(attr, "idle_timeout_ms");
+        if (cJSON_IsNumber(idle))
+            content_config.attract_idle_timeout_ms = idle->valueint;
+    }
+
+    /* optionally save to disk */
+    cJSON *save = cJSON_GetObjectItem(root, "save");
+    bool do_save = cJSON_IsTrue(save);
+    cJSON_Delete(root);
+
+    if (do_save) {
+        pd_content_save_config();
+    }
+
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, "{\"ok\":true}", HTTPD_RESP_USE_STRLEN);
     return ESP_OK;
 }
 
@@ -651,12 +943,24 @@ esp_err_t pd_content_register_http(httpd_handle_t server)
         .method = HTTP_POST,
         .handler = http_content_upload
     };
+    httpd_uri_t config_get_uri = {
+        .uri = "/api/config",
+        .method = HTTP_GET,
+        .handler = http_config_get
+    };
+    httpd_uri_t config_set_uri = {
+        .uri = "/api/config",
+        .method = HTTP_POST,
+        .handler = http_config_set
+    };
 
     httpd_register_uri_handler(server, &list_uri);
     httpd_register_uri_handler(server, &play_uri);
     httpd_register_uri_handler(server, &stop_uri);
     httpd_register_uri_handler(server, &status_uri);
     httpd_register_uri_handler(server, &upload_uri);
+    httpd_register_uri_handler(server, &config_get_uri);
+    httpd_register_uri_handler(server, &config_set_uri);
 
     ESP_LOGI(TAG, "HTTP endpoints registered");
     return ESP_OK;

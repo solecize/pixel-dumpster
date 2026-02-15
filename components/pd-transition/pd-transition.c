@@ -137,6 +137,13 @@ pd_transition_type_t pd_transition_type_from_name(const char *name)
     return PD_TRANS_NONE;
 }
 
+pd_transition_type_t pd_transition_random(void)
+{
+    /* pick a random transition, excluding NONE */
+    int idx = 1 + (esp_random() % (PD_TRANS_COUNT - 1));
+    return (pd_transition_type_t)idx;
+}
+
 /* ================================================================
  * Shuffle generation (for pixel-build and block-build)
  * ================================================================ */
