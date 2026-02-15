@@ -18,6 +18,7 @@ dependencies.lock
 # Compiled tool binaries
 tools/wizard-cli
 tools/content-cli
+tools/playlist-cli
 
 # Logs
 logs/
