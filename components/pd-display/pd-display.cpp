@@ -360,9 +360,7 @@ extern "C" void pd_display_render_rgb(const uint8_t *rgb, int img_w, int img_h)
     /* center the image if smaller than display */
     int ox = (img_w < dw) ? (dw - img_w) / 2 : 0;
     int oy = (img_h < dh) ? (dh - img_h) / 2 : 0;
-    /* clear display first */
-    pd_display_driver->clear();
-    /* blit image pixels */
+    /* blit image pixels (no clear — overwrite in place to avoid flicker) */
     int blit_w = (img_w < dw) ? img_w : dw;
     int blit_h = (img_h < dh) ? img_h : dh;
     for (int y = 0; y < blit_h; y++) {
