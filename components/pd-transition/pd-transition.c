@@ -642,27 +642,37 @@ static void render_split_diag(pd_transition_t *t, float p)
     }
 }
 
-/* ---- zoom ---- */
+/* ---- zoom helpers ---- */
 
-static void render_zoom_in(pd_transition_t *t, float p)
+/* bounce easing: overshoots then settles back
+ * p=0..1 maps to 0..~1.1..1.0 (overshoot by ~10%) */
+static float ease_bounce_out(float p)
 {
-    /* new content zooms in from center (starts tiny, grows to full) */
-    int w = t->out->width;
-    int h = t->out->height;
-    float scale = p;  /* 0..1 */
-    if (scale < 0.01f) scale = 0.01f;
+    if (p < 0.8f) {
+        /* main motion: 0..0.8 maps to 0..1.1 (overshoot) */
+        float t = p / 0.8f;
+        return t * 1.1f;
+    } else {
+        /* settle: 0.8..1.0 maps to 1.1..1.0 */
+        float t = (p - 0.8f) / 0.2f;
+        return 1.1f - 0.1f * t;
+    }
+}
 
+/* blit a scaled version of src into dst at center */
+static void zoom_blit(uint8_t *dst, const uint8_t *src, int w, int h, float scale)
+{
+    if (scale < 0.01f) return;
     int zw = (int)(w * scale);
     int zh = (int)(h * scale);
+    if (zw < 1) zw = 1;
+    if (zh < 1) zh = 1;
     int ox = (w - zw) / 2;
     int oy = (h - zh) / 2;
-
-    pd_framebuf_copy(t->out, t->from);
 
     for (int y = 0; y < zh; y++) {
         int dy = oy + y;
         if (dy < 0 || dy >= h) continue;
-        /* source row in "to" image: scale y back to full size */
         int sy = y * h / zh;
         if (sy >= h) sy = h - 1;
         for (int x = 0; x < zw; x++) {
@@ -672,45 +682,55 @@ static void render_zoom_in(pd_transition_t *t, float p)
             if (sx >= w) sx = w - 1;
             int di = (dy * w + dx) * 3;
             int si = (sy * w + sx) * 3;
-            t->out->data[di]     = t->to->data[si];
-            t->out->data[di + 1] = t->to->data[si + 1];
-            t->out->data[di + 2] = t->to->data[si + 2];
+            dst[di]     = src[si];
+            dst[di + 1] = src[si + 1];
+            dst[di + 2] = src[si + 2];
         }
     }
 }
 
-static void render_zoom_out(pd_transition_t *t, float p)
+/* ---- zoom ---- */
+
+static void render_zoom_in(pd_transition_t *t, float p)
 {
-    /* old content shrinks to center, revealing new content behind */
+    /* B zooms in from 200% to 100% (with bounce overshoot)
+     * A shrinks from 100% to 0% in lockstep
+     * Both are composited: A behind, B in front */
     int w = t->out->width;
     int h = t->out->height;
-    float scale = 1.0f - p;  /* 1..0 */
-    if (scale < 0.01f) scale = 0.01f;
+    float ep = ease_bounce_out(p);
 
-    int zw = (int)(w * scale);
-    int zh = (int)(h * scale);
-    int ox = (w - zw) / 2;
-    int oy = (h - zh) / 2;
+    float scale_a = 1.0f - ep;        /* A: 1.0 -> ~-0.1 -> 0.0 */
+    float scale_b = 2.0f - ep;        /* B: 2.0 -> ~0.9 -> 1.0 */
+    if (scale_a < 0.0f) scale_a = 0.0f;
 
-    pd_framebuf_copy(t->out, t->to);
+    pd_framebuf_clear(t->out);
+    /* draw A behind (shrinking) */
+    if (scale_a > 0.01f)
+        zoom_blit(t->out->data, t->from->data, w, h, scale_a);
+    /* draw B in front (approaching from 200% to 100%) */
+    zoom_blit(t->out->data, t->to->data, w, h, scale_b);
+}
 
-    for (int y = 0; y < zh; y++) {
-        int dy = oy + y;
-        if (dy < 0 || dy >= h) continue;
-        int sy = y * h / zh;
-        if (sy >= h) sy = h - 1;
-        for (int x = 0; x < zw; x++) {
-            int dx = ox + x;
-            if (dx < 0 || dx >= w) continue;
-            int sx = x * w / zw;
-            if (sx >= w) sx = w - 1;
-            int di = (dy * w + dx) * 3;
-            int si = (sy * w + sx) * 3;
-            t->out->data[di]     = t->from->data[si];
-            t->out->data[di + 1] = t->from->data[si + 1];
-            t->out->data[di + 2] = t->from->data[si + 2];
-        }
-    }
+static void render_zoom_out(pd_transition_t *t, float p)
+{
+    /* A shrinks from 100% to 0% (with bounce: goes to ~-10% then 0%)
+     * B grows from 0% to 100% behind A in lockstep */
+    int w = t->out->width;
+    int h = t->out->height;
+    float ep = ease_bounce_out(p);
+
+    float scale_a = 1.0f - ep;        /* A: 1.0 -> ~-0.1 -> 0.0 */
+    float scale_b = ep;               /* B: 0.0 -> ~1.1 -> 1.0 */
+    if (scale_a < 0.0f) scale_a = 0.0f;
+    if (scale_b > 2.0f) scale_b = 2.0f;
+
+    pd_framebuf_clear(t->out);
+    /* draw B behind (growing) */
+    zoom_blit(t->out->data, t->to->data, w, h, scale_b);
+    /* draw A in front (shrinking away) */
+    if (scale_a > 0.01f)
+        zoom_blit(t->out->data, t->from->data, w, h, scale_a);
 }
 
 /* ---- flip ---- */
