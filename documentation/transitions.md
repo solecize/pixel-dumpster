@@ -162,6 +162,76 @@ Lives inside a content directory (e.g., `images/pac-ghost/meta.json`).
 | `enter.duration_ms` | int | Transition duration in milliseconds (default: 500) |
 | `enter.params` | object | Optional parameter overrides for the transition |
 
+---
+
+## Global Configuration: `config.json`
+
+Lives at `/content/config.json`. Controls default behavior for transitions, display, and attract mode.
+
+```json
+{
+  "transition": {
+    "mode": "random",
+    "baseline": "fade",
+    "duration_ms": 800,
+    "params": {}
+  },
+  "display": {
+    "hold_ms": 5000,
+    "loop_sequences": true
+  },
+  "attract": {
+    "enabled": false,
+    "path": "images/",
+    "shuffle": true,
+    "idle_timeout_ms": 0
+  }
+}
+```
+
+### `transition` — How content switches
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `mode` | string | `random`, `baseline`, or `per-item` |
+| `baseline` | string | Transition name used as default/fallback |
+| `duration_ms` | int | Default transition duration (ms) |
+| `params` | object | Default parameter overrides (zoom_vanish, bounce, block_size, etc.) |
+
+**Modes:**
+- `random` — pick a random transition from the catalog each time
+- `baseline` — always use `transition.baseline`
+- `per-item` — use item's `meta.json` `enter` transition if present, otherwise fall back to `baseline`
+
+### `display` — How content is shown
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `hold_ms` | int | Default hold time for static images in attract mode (0 = hold forever) |
+| `loop_sequences` | bool | Whether sequences loop by default (can be overridden per-item) |
+
+### `attract` — Auto-cycle / screensaver mode
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `enabled` | bool | Start attract mode on boot |
+| `path` | string | Directory to cycle through (e.g., `images/`) |
+| `shuffle` | bool | Randomize order vs. alphabetical |
+| `idle_timeout_ms` | int | Resume attract mode after this much idle time (0 = never auto-resume) |
+
+Attract mode is interrupted by any `/api/play` command. If `idle_timeout_ms > 0`, it resumes after that duration of no commands.
+
+### Priority Chain
+
+When determining which transition to use (highest wins):
+
+1. **HTTP request** explicit `transition` field
+2. **Per-item** `meta.json` `enter` (if mode is `per-item`)
+3. **Mode logic** (`random` picks one, `baseline` uses baseline)
+4. **`baseline`** — always the final fallback
+
+---
+
 ### Playlist `playlist.json`
 
 ```json
@@ -219,31 +289,6 @@ Lives inside a content directory (e.g., `images/pac-ghost/meta.json`).
 
 ---
 
-## HTTP API
-
-### Play with transition
-
-```
-POST /api/play
-Content-Type: application/json
-
-{
-  "path": "images/zaxxon.png",
-  "transition": "zoom-in",
-  "duration_ms": 1500,
-  "params": {
-    "zoom_vanish": 4.0
-  }
-}
-```
-
-- `path` (required): content path relative to `/content/`
-- `transition` (optional): transition type name. Omit for instant switch
-- `duration_ms` (optional): transition duration, default 500
-- `params` (optional): transition parameter overrides
-
----
-
 ## Architecture
 
 ### Framebuffer System
@@ -271,11 +316,58 @@ PNG file → lodepng decode → RGB888 buffer → framebuf_blit → display_rend
 
 ---
 
+## HTTP API
+
+### Play with transition
+
+```
+POST /api/play
+Content-Type: application/json
+
+{
+  "path": "images/zaxxon.png",
+  "transition": "zoom-in",
+  "duration_ms": 1500,
+  "params": {
+    "zoom_vanish": 4.0
+  }
+}
+```
+
+- `path` (required): content path relative to `/content/`
+- `transition` (optional): transition type name. Omit to use config mode logic
+- `duration_ms` (optional): transition duration, default from config
+- `params` (optional): transition parameter overrides
+
+### Attract Mode Control
+
+```
+POST /api/attract/start
+POST /api/attract/stop
+GET /api/attract/status
+```
+
+### Configuration
+
+```
+GET /api/config
+POST /api/config
+Content-Type: application/json
+
+{
+  "transition": {
+    "mode": "random"
+  }
+}
+```
+
+Partial updates are merged with existing config.
+
+---
+
 ## Future Work
 
 - **Text content**: bitmap font rendering with scroll/zoom animations
 - **Fonts/glyphs**: `/fonts/` and `/glyphs/` directories for user-uploadable assets
-- **Configurable params**: wire up `params` object parsing from metadata/HTTP
-- **Playlist engine**: auto-advance with hold timers and transition sequencing
 - **Image effects**: color-build (dark→light reveal), pulse, blink
 - **USB storage**: content on thumb drive instead of LittleFS
