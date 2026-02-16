@@ -41,11 +41,21 @@ static pd_content_config_t content_config = {
     .trans_duration_ms = 800,
     .hold_ms = 5000,
     .loop_sequences = true,
+    .background = "#000000",
+    .overlay = "",
     .attract_enabled = false,
     .attract_path = "images/",
     .attract_shuffle = true,
     .attract_idle_timeout_ms = 0,
 };
+
+/* ---- compositing state ---- */
+static uint8_t *cached_background_rgb = NULL;  /* cached background image (RGB) */
+static uint8_t *cached_overlay_rgba = NULL;    /* cached overlay image (RGBA) */
+static char cached_bg_path[PD_CONTENT_MAX_PATH] = "";
+static char cached_overlay_path[PD_CONTENT_MAX_PATH] = "";
+static int cached_width = 0;
+static int cached_height = 0;
 
 /* ---- helpers ---- */
 
@@ -197,6 +207,14 @@ static void load_config(void)
         cJSON *loop_seq = cJSON_GetObjectItem(disp, "loop_sequences");
         if (cJSON_IsBool(loop_seq))
             content_config.loop_sequences = cJSON_IsTrue(loop_seq);
+        cJSON *bg = cJSON_GetObjectItem(disp, "background");
+        if (cJSON_IsString(bg))
+            strlcpy(content_config.background, bg->valuestring,
+                    sizeof(content_config.background));
+        cJSON *ov = cJSON_GetObjectItem(disp, "overlay");
+        if (cJSON_IsString(ov))
+            strlcpy(content_config.overlay, ov->valuestring,
+                    sizeof(content_config.overlay));
     }
 
     /* attract section */
@@ -268,6 +286,8 @@ esp_err_t pd_content_save_config(void)
     cJSON *disp = cJSON_AddObjectToObject(root, "display");
     cJSON_AddNumberToObject(disp, "hold_ms", content_config.hold_ms);
     cJSON_AddBoolToObject(disp, "loop_sequences", content_config.loop_sequences);
+    cJSON_AddStringToObject(disp, "background", content_config.background);
+    cJSON_AddStringToObject(disp, "overlay", content_config.overlay);
 
     cJSON *attr = cJSON_AddObjectToObject(root, "attract");
     cJSON_AddBoolToObject(attr, "enabled", content_config.attract_enabled);
@@ -294,7 +314,7 @@ esp_err_t pd_content_save_config(void)
 
 /* ---- PNG decode ---- */
 
-static uint8_t *decode_png_file(const char *path, unsigned *w, unsigned *h)
+static uint8_t *decode_png_rgba(const char *path, unsigned *w, unsigned *h)
 {
     FILE *f = fopen(path, "rb");
     if (!f) {
@@ -321,25 +341,140 @@ static uint8_t *decode_png_file(const char *path, unsigned *w, unsigned *h)
         ESP_LOGE(TAG, "lodepng error %u: %s", error, lodepng_error_text(error));
         return NULL;
     }
+    return rgba;
+}
 
-    /* convert RGBA to RGB, compositing alpha against black background */
-    size_t pixels = (*w) * (*h);
-    unsigned char *rgb = malloc(pixels * 3);
-    if (!rgb) {
-        free(rgba);
-        return NULL;
+static bool parse_hex_color(const char *str, uint8_t *r, uint8_t *g, uint8_t *b)
+{
+    if (!str || str[0] != '#' || strlen(str) != 7) return false;
+    unsigned int val;
+    if (sscanf(str + 1, "%06x", &val) != 1) return false;
+    *r = (val >> 16) & 0xFF;
+    *g = (val >> 8) & 0xFF;
+    *b = val & 0xFF;
+    return true;
+}
+
+static void update_compositing_cache(int width, int height)
+{
+    /* update background cache if changed */
+    const char *bg = content_config.background;
+    if (strcmp(bg, cached_bg_path) != 0) {
+        free(cached_background_rgb);
+        cached_background_rgb = NULL;
+        strlcpy(cached_bg_path, bg, sizeof(cached_bg_path));
+
+        if (bg[0] == '#') {
+            /* solid color */
+            uint8_t r, g, b;
+            if (parse_hex_color(bg, &r, &g, &b)) {
+                cached_background_rgb = malloc(width * height * 3);
+                if (cached_background_rgb) {
+                    for (int i = 0; i < width * height; i++) {
+                        cached_background_rgb[i * 3 + 0] = r;
+                        cached_background_rgb[i * 3 + 1] = g;
+                        cached_background_rgb[i * 3 + 2] = b;
+                    }
+                }
+            }
+        } else if (bg[0] != '\0') {
+            /* image path */
+            char full[PD_CONTENT_MAX_PATH];
+            snprintf(full, sizeof(full), "%s/%s", content_base, bg);
+            unsigned w, h;
+            uint8_t *rgba = decode_png_rgba(full, &w, &h);
+            if (rgba && (int)w == width && (int)h == height) {
+                cached_background_rgb = malloc(width * height * 3);
+                if (cached_background_rgb) {
+                    for (int i = 0; i < width * height; i++) {
+                        cached_background_rgb[i * 3 + 0] = rgba[i * 4 + 0];
+                        cached_background_rgb[i * 3 + 1] = rgba[i * 4 + 1];
+                        cached_background_rgb[i * 3 + 2] = rgba[i * 4 + 2];
+                    }
+                }
+            }
+            free(rgba);
+        }
     }
 
+    /* update overlay cache if changed */
+    const char *ov = content_config.overlay;
+    if (strcmp(ov, cached_overlay_path) != 0) {
+        free(cached_overlay_rgba);
+        cached_overlay_rgba = NULL;
+        strlcpy(cached_overlay_path, ov, sizeof(cached_overlay_path));
+
+        if (ov[0] != '\0') {
+            char full[PD_CONTENT_MAX_PATH];
+            snprintf(full, sizeof(full), "%s/%s", content_base, ov);
+            unsigned w, h;
+            cached_overlay_rgba = decode_png_rgba(full, &w, &h);
+            if (cached_overlay_rgba && ((int)w != width || (int)h != height)) {
+                free(cached_overlay_rgba);
+                cached_overlay_rgba = NULL;
+                ESP_LOGW(TAG, "overlay size mismatch");
+            }
+        }
+    }
+
+    cached_width = width;
+    cached_height = height;
+}
+
+static uint8_t *composite_frame(uint8_t *content_rgba, int width, int height)
+{
+    update_compositing_cache(width, height);
+
+    size_t pixels = width * height;
+    uint8_t *rgb = malloc(pixels * 3);
+    if (!rgb) return NULL;
+
+    /* layer 1: background (or black if none) */
+    if (cached_background_rgb) {
+        memcpy(rgb, cached_background_rgb, pixels * 3);
+    } else {
+        memset(rgb, 0, pixels * 3);
+    }
+
+    /* layer 2: content with alpha blending */
     for (size_t i = 0; i < pixels; i++) {
-        uint8_t r = rgba[i * 4 + 0];
-        uint8_t g = rgba[i * 4 + 1];
-        uint8_t b = rgba[i * 4 + 2];
-        uint8_t a = rgba[i * 4 + 3];
-        /* alpha blend against black (0,0,0) */
-        rgb[i * 3 + 0] = (r * a) / 255;
-        rgb[i * 3 + 1] = (g * a) / 255;
-        rgb[i * 3 + 2] = (b * a) / 255;
+        uint8_t cr = content_rgba[i * 4 + 0];
+        uint8_t cg = content_rgba[i * 4 + 1];
+        uint8_t cb = content_rgba[i * 4 + 2];
+        uint8_t ca = content_rgba[i * 4 + 3];
+        uint8_t br = rgb[i * 3 + 0];
+        uint8_t bg = rgb[i * 3 + 1];
+        uint8_t bb = rgb[i * 3 + 2];
+        rgb[i * 3 + 0] = (cr * ca + br * (255 - ca)) / 255;
+        rgb[i * 3 + 1] = (cg * ca + bg * (255 - ca)) / 255;
+        rgb[i * 3 + 2] = (cb * ca + bb * (255 - ca)) / 255;
     }
+
+    /* layer 3: overlay with alpha blending */
+    if (cached_overlay_rgba) {
+        for (size_t i = 0; i < pixels; i++) {
+            uint8_t or_ = cached_overlay_rgba[i * 4 + 0];
+            uint8_t og = cached_overlay_rgba[i * 4 + 1];
+            uint8_t ob = cached_overlay_rgba[i * 4 + 2];
+            uint8_t oa = cached_overlay_rgba[i * 4 + 3];
+            uint8_t br = rgb[i * 3 + 0];
+            uint8_t bg = rgb[i * 3 + 1];
+            uint8_t bb = rgb[i * 3 + 2];
+            rgb[i * 3 + 0] = (or_ * oa + br * (255 - oa)) / 255;
+            rgb[i * 3 + 1] = (og * oa + bg * (255 - oa)) / 255;
+            rgb[i * 3 + 2] = (ob * oa + bb * (255 - oa)) / 255;
+        }
+    }
+
+    return rgb;
+}
+
+static uint8_t *decode_png_file(const char *path, unsigned *w, unsigned *h)
+{
+    uint8_t *rgba = decode_png_rgba(path, w, h);
+    if (!rgba) return NULL;
+
+    uint8_t *rgb = composite_frame(rgba, (int)*w, (int)*h);
     free(rgba);
     return rgb;
 }
@@ -822,6 +957,8 @@ static esp_err_t http_config_get(httpd_req_t *req)
     cJSON *disp = cJSON_AddObjectToObject(root, "display");
     cJSON_AddNumberToObject(disp, "hold_ms", content_config.hold_ms);
     cJSON_AddBoolToObject(disp, "loop_sequences", content_config.loop_sequences);
+    cJSON_AddStringToObject(disp, "background", content_config.background);
+    cJSON_AddStringToObject(disp, "overlay", content_config.overlay);
 
     cJSON *attr = cJSON_AddObjectToObject(root, "attract");
     cJSON_AddBoolToObject(attr, "enabled", content_config.attract_enabled);
@@ -882,6 +1019,14 @@ static esp_err_t http_config_set(httpd_req_t *req)
         cJSON *loop_seq = cJSON_GetObjectItem(disp, "loop_sequences");
         if (cJSON_IsBool(loop_seq))
             content_config.loop_sequences = cJSON_IsTrue(loop_seq);
+        cJSON *bg = cJSON_GetObjectItem(disp, "background");
+        if (cJSON_IsString(bg))
+            strlcpy(content_config.background, bg->valuestring,
+                    sizeof(content_config.background));
+        cJSON *ov = cJSON_GetObjectItem(disp, "overlay");
+        if (cJSON_IsString(ov))
+            strlcpy(content_config.overlay, ov->valuestring,
+                    sizeof(content_config.overlay));
     }
 
     cJSON *attr = cJSON_GetObjectItem(root, "attract");

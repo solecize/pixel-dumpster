@@ -49,6 +49,8 @@ typedef struct {
     /* display settings */
     int  hold_ms;
     bool loop_sequences;
+    char background[PD_CONTENT_MAX_PATH];  /* hex color "#RRGGBB" or image path */
+    char overlay[PD_CONTENT_MAX_PATH];     /* overlay image path (with alpha) */
 
     /* attract mode */
     bool attract_enabled;
