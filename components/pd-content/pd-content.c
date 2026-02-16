@@ -654,6 +654,9 @@ static bool content_decode_first_frame(const char *full_path, pd_framebuf_t *fb)
 /* helper: set up playback state for a content path */
 static esp_err_t content_setup_playback(const char *path, const char *full)
 {
+    /* reset overlay animation state */
+    overlay_last_frame_us = 0;
+
     /* restore global defaults before applying per-item settings */
     if (strcmp(content_config.background, saved_background) != 0) {
         strlcpy(content_config.background, saved_background, sizeof(content_config.background));
@@ -662,6 +665,10 @@ static esp_err_t content_setup_playback(const char *path, const char *full)
     if (strcmp(content_config.overlay, saved_overlay) != 0) {
         strlcpy(content_config.overlay, saved_overlay, sizeof(content_config.overlay));
         cached_overlay_path[0] = '\0';  /* force cache refresh */
+        /* reset overlay sequence state when overlay changes */
+        overlay_is_seq = false;
+        overlay_total_frames = 0;
+        overlay_frame = 0;
     }
 
     if (path_is_dir(full)) {
@@ -688,6 +695,10 @@ static esp_err_t content_setup_playback(const char *path, const char *full)
         if (item_ov[0] != '\0') {
             strlcpy(content_config.overlay, item_ov, sizeof(content_config.overlay));
             cached_overlay_path[0] = '\0';  /* force cache refresh */
+            /* reset overlay sequence state when overlay changes */
+            overlay_is_seq = false;
+            overlay_total_frames = 0;
+            overlay_frame = 0;
         }
 
         strlcpy(content_current, full, sizeof(content_current));
