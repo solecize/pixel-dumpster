@@ -27,6 +27,8 @@ static int  content_total_frames = 0;
 static int  content_fps = 12;
 static bool content_loop = true;
 static int64_t content_last_frame_us = 0;
+static char content_frame_pattern[64] = "%04d.png";  /* frame filename pattern */
+static int  content_frame_start = 1;                  /* first frame index (0 or 1) */
 
 /* ---- transition state ---- */
 static pd_transition_t *content_transition = NULL;
@@ -86,7 +88,8 @@ static int count_sequence_frames(const char *dir_path)
     return count;
 }
 
-static bool load_sequence_meta(const char *dir_path, int *fps, bool *loop_out, int *frame_count)
+static bool load_sequence_meta(const char *dir_path, int *fps, bool *loop_out, int *frame_count,
+                               char *pattern_out, size_t pattern_size, int *start_out)
 {
     char path[PD_CONTENT_MAX_PATH];
     snprintf(path, sizeof(path), "%s/meta.json", dir_path);
@@ -110,8 +113,9 @@ static bool load_sequence_meta(const char *dir_path, int *fps, bool *loop_out, i
 
     cJSON *j_fps = cJSON_GetObjectItem(root, "fps");
     cJSON *j_loop = cJSON_GetObjectItem(root, "loop");
-
     cJSON *j_frames = cJSON_GetObjectItem(root, "frames");
+    cJSON *j_pattern = cJSON_GetObjectItem(root, "pattern");
+    cJSON *j_start = cJSON_GetObjectItem(root, "start");
 
     if (fps && cJSON_IsNumber(j_fps)) *fps = j_fps->valueint;
     if (loop_out) *loop_out = cJSON_IsBool(j_loop) ? cJSON_IsTrue(j_loop) : true;
@@ -121,6 +125,12 @@ static bool load_sequence_meta(const char *dir_path, int *fps, bool *loop_out, i
         } else {
             *frame_count = count_sequence_frames(dir_path);
         }
+    }
+    if (pattern_out && cJSON_IsString(j_pattern)) {
+        strlcpy(pattern_out, j_pattern->valuestring, pattern_size);
+    }
+    if (start_out) {
+        *start_out = cJSON_IsNumber(j_start) ? j_start->valueint : 1;
     }
 
     cJSON_Delete(root);
@@ -369,7 +379,7 @@ int pd_content_list_images(pd_content_entry_t *entries, int max_entries)
             e->is_sequence = true;
             e->fps = 12;
             e->frame_count = 0;
-            load_sequence_meta(full, &e->fps, NULL, &e->frame_count);
+            load_sequence_meta(full, &e->fps, NULL, &e->frame_count, NULL, 0, NULL);
         } else if (is_png(ent->d_name)) {
             e->is_sequence = false;
             e->fps = 0;
@@ -387,8 +397,15 @@ int pd_content_list_images(pd_content_entry_t *entries, int max_entries)
 static bool content_decode_first_frame(const char *full_path, pd_framebuf_t *fb)
 {
     if (path_is_dir(full_path)) {
+        char pattern[64] = "%04d.png";
+        int start = 1;
+        load_sequence_meta(full_path, NULL, NULL, NULL, pattern, sizeof(pattern), &start);
+
         char frame_path[PD_CONTENT_MAX_PATH];
-        snprintf(frame_path, sizeof(frame_path), "%s/%04d.png", full_path, 1);
+        snprintf(frame_path, sizeof(frame_path), "%s/", full_path);
+        size_t base_len = strlen(frame_path);
+        snprintf(frame_path + base_len, sizeof(frame_path) - base_len, pattern, start);
+
         unsigned w, h;
         uint8_t *rgb = decode_png_file(frame_path, &w, &h);
         if (!rgb) return false;
@@ -413,7 +430,9 @@ static esp_err_t content_setup_playback(const char *path, const char *full)
         int fps = 12;
         bool loop = true;
         int frames = 0;
-        load_sequence_meta(full, &fps, &loop, &frames);
+        char pattern[64] = "%04d.png";
+        int start = 1;
+        load_sequence_meta(full, &fps, &loop, &frames, pattern, sizeof(pattern), &start);
 
         if (frames == 0) {
             ESP_LOGW(TAG, "no frames in %s", full);
@@ -421,15 +440,18 @@ static esp_err_t content_setup_playback(const char *path, const char *full)
         }
 
         strlcpy(content_current, full, sizeof(content_current));
+        strlcpy(content_frame_pattern, pattern, sizeof(content_frame_pattern));
+        content_frame_start = start;
         content_is_seq = true;
         content_fps = fps > 0 ? fps : 12;
         content_loop = loop;
         content_total_frames = frames;
-        content_frame = 1;
+        content_frame = start;
         content_playing = true;
         content_last_frame_us = 0;
 
-        ESP_LOGI(TAG, "playing sequence: %s (%d frames @ %d fps)", path, frames, fps);
+        ESP_LOGI(TAG, "playing sequence: %s (%d frames @ %d fps, pattern=%s, start=%d)",
+                 path, frames, fps, pattern, start);
     } else if (path_exists(full) && is_png(full)) {
         strlcpy(content_current, full, sizeof(content_current));
         content_is_seq = false;
@@ -464,8 +486,14 @@ esp_err_t pd_content_play(const char *path)
         unsigned w, h;
         uint8_t *rgb = NULL;
         if (path_is_dir(full)) {
+            char pattern[64] = "%04d.png";
+            int start = 1;
+            load_sequence_meta(full, NULL, NULL, NULL, pattern, sizeof(pattern), &start);
+
             char fp[PD_CONTENT_MAX_PATH];
-            snprintf(fp, sizeof(fp), "%s/%04d.png", full, 1);
+            snprintf(fp, sizeof(fp), "%s/", full);
+            size_t base_len = strlen(fp);
+            snprintf(fp + base_len, sizeof(fp) - base_len, pattern, start);
             rgb = decode_png_file(fp, &w, &h);
         } else {
             rgb = decode_png_file(full, &w, &h);
@@ -561,16 +589,19 @@ void pd_content_tick(void)
     content_last_frame_us = now;
     int next = content_frame + 1;
 
-    if (next > content_total_frames) {
+    int last_frame = content_frame_start + content_total_frames - 1;
+    if (next > last_frame) {
         if (content_loop) {
-            next = 1;
+            next = content_frame_start;
         } else {
             return;
         }
     }
 
     char frame_path[PD_CONTENT_MAX_PATH];
-    snprintf(frame_path, sizeof(frame_path), "%s/%04d.png", content_current, next);
+    snprintf(frame_path, sizeof(frame_path), "%s/", content_current);
+    size_t base_len = strlen(frame_path);
+    snprintf(frame_path + base_len, sizeof(frame_path) - base_len, content_frame_pattern, next);
 
     unsigned w, h;
     uint8_t *rgb = decode_png_file(frame_path, &w, &h);

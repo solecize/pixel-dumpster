@@ -1,0 +1,8 @@
+{
+  "name": "Mai Shiranui",
+  "fps": 12,
+  "loop": true,
+  "frames": 25,
+  "pattern": "mai%04d.png",
+  "start": 0
+}
