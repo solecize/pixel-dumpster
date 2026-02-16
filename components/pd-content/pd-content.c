@@ -313,15 +313,34 @@ static uint8_t *decode_png_file(const char *path, unsigned *w, unsigned *h)
     fread(png_data, 1, sz, f);
     fclose(f);
 
-    unsigned char *rgb = NULL;
-    unsigned error = lodepng_decode24(&rgb, w, h, png_data, sz);
+    unsigned char *rgba = NULL;
+    unsigned error = lodepng_decode32(&rgba, w, h, png_data, sz);
     free(png_data);
 
-    if (error) {
+    if (error || !rgba) {
         ESP_LOGE(TAG, "lodepng error %u: %s", error, lodepng_error_text(error));
         return NULL;
     }
 
+    /* convert RGBA to RGB, compositing alpha against black background */
+    size_t pixels = (*w) * (*h);
+    unsigned char *rgb = malloc(pixels * 3);
+    if (!rgb) {
+        free(rgba);
+        return NULL;
+    }
+
+    for (size_t i = 0; i < pixels; i++) {
+        uint8_t r = rgba[i * 4 + 0];
+        uint8_t g = rgba[i * 4 + 1];
+        uint8_t b = rgba[i * 4 + 2];
+        uint8_t a = rgba[i * 4 + 3];
+        /* alpha blend against black (0,0,0) */
+        rgb[i * 3 + 0] = (r * a) / 255;
+        rgb[i * 3 + 1] = (g * a) / 255;
+        rgb[i * 3 + 2] = (b * a) / 255;
+    }
+    free(rgba);
     return rgb;
 }
 
