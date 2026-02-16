@@ -808,12 +808,17 @@ void pd_content_tick(void)
         return;  /* don't advance sequence frames during transition */
     }
 
-    /* advance animated overlay frame independently */
+    if (!content_playing) return;
+
+    /* use content fps for timing, default 24 for static content */
+    int effective_fps = content_is_seq ? content_fps : 24;
+    int64_t frame_interval = 1000000 / effective_fps;
+
+    /* advance animated overlay at content fps */
     if (overlay_is_seq && overlay_total_frames > 0) {
-        int64_t overlay_interval = 1000000 / overlay_fps;
         if (overlay_last_frame_us == 0) {
             overlay_last_frame_us = now;
-        } else if ((now - overlay_last_frame_us) >= overlay_interval) {
+        } else if ((now - overlay_last_frame_us) >= frame_interval) {
             overlay_last_frame_us = now;
             int next_ov = overlay_frame + 1;
             int last_ov = overlay_frame_start + overlay_total_frames - 1;
@@ -821,13 +826,23 @@ void pd_content_tick(void)
                 next_ov = overlay_frame_start;  /* loop overlay */
             }
             overlay_frame = next_ov;
+
+            /* for static content, re-render with updated overlay */
+            if (!content_is_seq && content_fb) {
+                unsigned w, h;
+                uint8_t *rgb = decode_png_file(content_current, &w, &h);
+                if (rgb) {
+                    pd_framebuf_blit_rgb(content_fb, rgb, (int)w, (int)h);
+                    pd_display_render_framebuf(content_fb->data);
+                    free(rgb);
+                }
+            }
         }
     }
 
-    if (!content_playing || !content_is_seq) return;
+    if (!content_is_seq) return;
 
-    int64_t frame_interval = 1000000 / content_fps;
-
+    /* sequence frame timing (frame_interval already computed above) */
     if (content_last_frame_us == 0) {
         content_last_frame_us = now;
         return;
