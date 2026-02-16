@@ -709,17 +709,17 @@ static esp_err_t content_setup_playback(const char *path, const char *full)
         content_loop = loop;
         content_total_frames = frames;
         content_frame = start;
-        content_playing = true;
         content_last_frame_us = 0;
+        /* content_playing set by caller after setup complete */
 
         ESP_LOGI(TAG, "playing sequence: %s (%d frames @ %d fps, pattern=%s, start=%d)",
                  path, frames, fps, pattern, start);
     } else if (path_exists(full) && is_png(full)) {
         strlcpy(content_current, full, sizeof(content_current));
         content_is_seq = false;
-        content_playing = true;
         content_frame = 0;
         content_total_frames = 1;
+        /* content_playing set by caller after setup complete */
 
         ESP_LOGI(TAG, "displaying static: %s", path);
     } else {
@@ -774,6 +774,8 @@ esp_err_t pd_content_play(const char *path)
         free(rgb);
     }
 
+    /* now safe to enable playback - everything is ready */
+    content_playing = true;
     return ESP_OK;
 }
 
@@ -784,9 +786,6 @@ esp_err_t pd_content_play_with_transition(const char *path, const char *transiti
         return pd_content_play(path);
     }
 
-    /* stop current playback immediately so tick() won't block us */
-    content_playing = false;
-
     char full[PD_CONTENT_MAX_PATH];
     snprintf(full, sizeof(full), "%s/%s", content_base, path);
 
@@ -795,27 +794,31 @@ esp_err_t pd_content_play_with_transition(const char *path, const char *transiti
         return pd_content_play(path);
     }
 
-    /* set up playback state first (applies per-item bg/overlay) */
+    /* capture current display as "from" BEFORE changing anything */
+    pd_framebuf_copy(content_transition->from, content_fb);
+
+    /* stop current playback so tick() won't interfere */
+    content_playing = false;
+
+    /* set up playback state (applies per-item bg/overlay) */
     esp_err_t err = content_setup_playback(path, full);
     if (err != ESP_OK) {
         return err;
     }
 
-    /* preload compositing cache before first frame */
+    /* preload compositing cache for new content */
     update_compositing_cache(64, 64);
-
-    /* capture current display as "from" */
-    pd_framebuf_copy(content_transition->from, content_fb);
 
     /* decode new content into "to" */
     if (!content_decode_first_frame(full, content_transition->to)) {
-        content_playing = false;
         return ESP_ERR_NOT_FOUND;
     }
 
     /* start the transition */
     pd_transition_start(content_transition, type, duration_ms);
 
+    /* now safe to enable playback - everything is ready */
+    content_playing = true;
     return ESP_OK;
 }
 
