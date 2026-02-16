@@ -737,9 +737,19 @@ esp_err_t pd_content_play(const char *path)
     char full[PD_CONTENT_MAX_PATH];
     snprintf(full, sizeof(full), "%s/%s", content_base, path);
 
+    /* set up playback state first (applies per-item bg/overlay) */
+    esp_err_t err = content_setup_playback(path, full);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    /* preload compositing cache before first frame */
+    update_compositing_cache(64, 64);
+
     /* decode first frame into content_fb and display it */
     if (content_fb) {
         if (!content_decode_first_frame(full, content_fb)) {
+            content_playing = false;
             return ESP_ERR_NOT_FOUND;
         }
         pd_display_render_framebuf(content_fb->data);
@@ -748,24 +758,23 @@ esp_err_t pd_content_play(const char *path)
         unsigned w, h;
         uint8_t *rgb = NULL;
         if (path_is_dir(full)) {
-            char pattern[64] = "%04d.png";
-            int start = 1;
-            load_sequence_meta(full, NULL, NULL, NULL, pattern, sizeof(pattern), &start, NULL, 0, NULL, 0);
-
             char fp[PD_CONTENT_MAX_PATH];
             snprintf(fp, sizeof(fp), "%s/", full);
             size_t base_len = strlen(fp);
-            snprintf(fp + base_len, sizeof(fp) - base_len, pattern, start);
+            snprintf(fp + base_len, sizeof(fp) - base_len, content_frame_pattern, content_frame_start);
             rgb = decode_png_file(fp, &w, &h);
         } else {
             rgb = decode_png_file(full, &w, &h);
         }
-        if (!rgb) return ESP_ERR_NOT_FOUND;
+        if (!rgb) {
+            content_playing = false;
+            return ESP_ERR_NOT_FOUND;
+        }
         pd_display_render_rgb(rgb, (int)w, (int)h);
         free(rgb);
     }
 
-    return content_setup_playback(path, full);
+    return ESP_OK;
 }
 
 esp_err_t pd_content_play_with_transition(const char *path, const char *transition,
@@ -786,18 +795,28 @@ esp_err_t pd_content_play_with_transition(const char *path, const char *transiti
         return pd_content_play(path);
     }
 
+    /* set up playback state first (applies per-item bg/overlay) */
+    esp_err_t err = content_setup_playback(path, full);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    /* preload compositing cache before first frame */
+    update_compositing_cache(64, 64);
+
     /* capture current display as "from" */
     pd_framebuf_copy(content_transition->from, content_fb);
 
     /* decode new content into "to" */
     if (!content_decode_first_frame(full, content_transition->to)) {
+        content_playing = false;
         return ESP_ERR_NOT_FOUND;
     }
 
     /* start the transition */
     pd_transition_start(content_transition, type, duration_ms);
 
-    return content_setup_playback(path, full);
+    return ESP_OK;
 }
 
 esp_err_t pd_content_stop(void)
