@@ -4,5 +4,7 @@
   "loop": true,
   "frames": 29,
   "pattern": "lizard-sprite%04d.png",
-  "start": 0
+  "start": 0,
+  "background": "backgrounds/green-gradient.png",
+  "overlay": "overlays/leaves-falling"
 }

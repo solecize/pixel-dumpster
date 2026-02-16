@@ -109,7 +109,8 @@ static int count_sequence_frames(const char *dir_path)
 }
 
 static bool load_sequence_meta(const char *dir_path, int *fps, bool *loop_out, int *frame_count,
-                               char *pattern_out, size_t pattern_size, int *start_out)
+                               char *pattern_out, size_t pattern_size, int *start_out,
+                               char *bg_out, size_t bg_size, char *ov_out, size_t ov_size)
 {
     char path[PD_CONTENT_MAX_PATH];
     snprintf(path, sizeof(path), "%s/meta.json", dir_path);
@@ -136,6 +137,8 @@ static bool load_sequence_meta(const char *dir_path, int *fps, bool *loop_out, i
     cJSON *j_frames = cJSON_GetObjectItem(root, "frames");
     cJSON *j_pattern = cJSON_GetObjectItem(root, "pattern");
     cJSON *j_start = cJSON_GetObjectItem(root, "start");
+    cJSON *j_bg = cJSON_GetObjectItem(root, "background");
+    cJSON *j_ov = cJSON_GetObjectItem(root, "overlay");
 
     if (fps && cJSON_IsNumber(j_fps)) *fps = j_fps->valueint;
     if (loop_out) *loop_out = cJSON_IsBool(j_loop) ? cJSON_IsTrue(j_loop) : true;
@@ -151,6 +154,12 @@ static bool load_sequence_meta(const char *dir_path, int *fps, bool *loop_out, i
     }
     if (start_out) {
         *start_out = cJSON_IsNumber(j_start) ? j_start->valueint : 1;
+    }
+    if (bg_out && cJSON_IsString(j_bg)) {
+        strlcpy(bg_out, j_bg->valuestring, bg_size);
+    }
+    if (ov_out && cJSON_IsString(j_ov)) {
+        strlcpy(ov_out, j_ov->valuestring, ov_size);
     }
 
     cJSON_Delete(root);
@@ -430,7 +439,7 @@ static void update_compositing_cache(int width, int height)
                 overlay_total_frames = 0;
                 load_sequence_meta(full, &overlay_fps, NULL, &overlay_total_frames,
                                    overlay_frame_pattern, sizeof(overlay_frame_pattern),
-                                   &overlay_frame_start);
+                                   &overlay_frame_start, NULL, 0, NULL, 0);
                 if (overlay_total_frames == 0) {
                     overlay_total_frames = count_sequence_frames(full);
                 }
@@ -589,7 +598,7 @@ int pd_content_list_images(pd_content_entry_t *entries, int max_entries)
             e->is_sequence = true;
             e->fps = 12;
             e->frame_count = 0;
-            load_sequence_meta(full, &e->fps, NULL, &e->frame_count, NULL, 0, NULL);
+            load_sequence_meta(full, &e->fps, NULL, &e->frame_count, NULL, 0, NULL, NULL, 0, NULL, 0);
         } else if (is_png(ent->d_name)) {
             e->is_sequence = false;
             e->fps = 0;
@@ -609,7 +618,7 @@ static bool content_decode_first_frame(const char *full_path, pd_framebuf_t *fb)
     if (path_is_dir(full_path)) {
         char pattern[64] = "%04d.png";
         int start = 1;
-        load_sequence_meta(full_path, NULL, NULL, NULL, pattern, sizeof(pattern), &start);
+        load_sequence_meta(full_path, NULL, NULL, NULL, pattern, sizeof(pattern), &start, NULL, 0, NULL, 0);
 
         char frame_path[PD_CONTENT_MAX_PATH];
         snprintf(frame_path, sizeof(frame_path), "%s/", full_path);
@@ -642,11 +651,24 @@ static esp_err_t content_setup_playback(const char *path, const char *full)
         int frames = 0;
         char pattern[64] = "%04d.png";
         int start = 1;
-        load_sequence_meta(full, &fps, &loop, &frames, pattern, sizeof(pattern), &start);
+        char item_bg[PD_CONTENT_MAX_PATH] = "";
+        char item_ov[PD_CONTENT_MAX_PATH] = "";
+        load_sequence_meta(full, &fps, &loop, &frames, pattern, sizeof(pattern), &start,
+                           item_bg, sizeof(item_bg), item_ov, sizeof(item_ov));
 
         if (frames == 0) {
             ESP_LOGW(TAG, "no frames in %s", full);
             return ESP_ERR_NOT_FOUND;
+        }
+
+        /* apply per-item background/overlay if specified */
+        if (item_bg[0] != '\0') {
+            strlcpy(content_config.background, item_bg, sizeof(content_config.background));
+            cached_bg_path[0] = '\0';  /* force cache refresh */
+        }
+        if (item_ov[0] != '\0') {
+            strlcpy(content_config.overlay, item_ov, sizeof(content_config.overlay));
+            cached_overlay_path[0] = '\0';  /* force cache refresh */
         }
 
         strlcpy(content_current, full, sizeof(content_current));
@@ -698,7 +720,7 @@ esp_err_t pd_content_play(const char *path)
         if (path_is_dir(full)) {
             char pattern[64] = "%04d.png";
             int start = 1;
-            load_sequence_meta(full, NULL, NULL, NULL, pattern, sizeof(pattern), &start);
+            load_sequence_meta(full, NULL, NULL, NULL, pattern, sizeof(pattern), &start, NULL, 0, NULL, 0);
 
             char fp[PD_CONTENT_MAX_PATH];
             snprintf(fp, sizeof(fp), "%s/", full);
