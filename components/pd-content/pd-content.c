@@ -51,11 +51,21 @@ static pd_content_config_t content_config = {
 
 /* ---- compositing state ---- */
 static uint8_t *cached_background_rgb = NULL;  /* cached background image (RGB) */
-static uint8_t *cached_overlay_rgba = NULL;    /* cached overlay image (RGBA) */
+static uint8_t *cached_overlay_rgba = NULL;    /* cached overlay image (RGBA) - only for static */
 static char cached_bg_path[PD_CONTENT_MAX_PATH] = "";
 static char cached_overlay_path[PD_CONTENT_MAX_PATH] = "";
 static int cached_width = 0;
 static int cached_height = 0;
+
+/* animated overlay state */
+static bool overlay_is_seq = false;
+static int overlay_fps = 12;
+static int overlay_frame = 0;
+static int overlay_frame_start = 0;
+static int overlay_total_frames = 0;
+static char overlay_frame_pattern[64] = "%04d.png";
+static char overlay_base_path[PD_CONTENT_MAX_PATH] = "";
+static int64_t overlay_last_frame_us = 0;
 
 /* ---- helpers ---- */
 
@@ -402,17 +412,41 @@ static void update_compositing_cache(int width, int height)
     if (strcmp(ov, cached_overlay_path) != 0) {
         free(cached_overlay_rgba);
         cached_overlay_rgba = NULL;
+        overlay_is_seq = false;
+        overlay_total_frames = 0;
         strlcpy(cached_overlay_path, ov, sizeof(cached_overlay_path));
 
         if (ov[0] != '\0') {
             char full[PD_CONTENT_MAX_PATH];
             snprintf(full, sizeof(full), "%s/%s", content_base, ov);
-            unsigned w, h;
-            cached_overlay_rgba = decode_png_rgba(full, &w, &h);
-            if (cached_overlay_rgba && ((int)w != width || (int)h != height)) {
-                free(cached_overlay_rgba);
-                cached_overlay_rgba = NULL;
-                ESP_LOGW(TAG, "overlay size mismatch");
+
+            if (path_is_dir(full)) {
+                /* animated overlay sequence */
+                overlay_is_seq = true;
+                strlcpy(overlay_base_path, full, sizeof(overlay_base_path));
+                strlcpy(overlay_frame_pattern, "%04d.png", sizeof(overlay_frame_pattern));
+                overlay_fps = 12;
+                overlay_frame_start = 0;
+                overlay_total_frames = 0;
+                load_sequence_meta(full, &overlay_fps, NULL, &overlay_total_frames,
+                                   overlay_frame_pattern, sizeof(overlay_frame_pattern),
+                                   &overlay_frame_start);
+                if (overlay_total_frames == 0) {
+                    overlay_total_frames = count_sequence_frames(full);
+                }
+                overlay_frame = overlay_frame_start;
+                overlay_last_frame_us = 0;
+                ESP_LOGI(TAG, "animated overlay: %s (%d frames @ %d fps)",
+                         ov, overlay_total_frames, overlay_fps);
+            } else {
+                /* static overlay */
+                unsigned w, h;
+                cached_overlay_rgba = decode_png_rgba(full, &w, &h);
+                if (cached_overlay_rgba && ((int)w != width || (int)h != height)) {
+                    free(cached_overlay_rgba);
+                    cached_overlay_rgba = NULL;
+                    ESP_LOGW(TAG, "overlay size mismatch");
+                }
             }
         }
     }
@@ -451,18 +485,40 @@ static uint8_t *composite_frame(uint8_t *content_rgba, int width, int height)
     }
 
     /* layer 3: overlay with alpha blending */
-    if (cached_overlay_rgba) {
+    uint8_t *overlay_rgba = NULL;
+    if (overlay_is_seq && overlay_total_frames > 0) {
+        /* load current frame of animated overlay */
+        char frame_path[PD_CONTENT_MAX_PATH];
+        snprintf(frame_path, sizeof(frame_path), "%s/", overlay_base_path);
+        size_t base_len = strlen(frame_path);
+        snprintf(frame_path + base_len, sizeof(frame_path) - base_len,
+                 overlay_frame_pattern, overlay_frame);
+        unsigned ow, oh;
+        overlay_rgba = decode_png_rgba(frame_path, &ow, &oh);
+        if (overlay_rgba && ((int)ow != width || (int)oh != height)) {
+            free(overlay_rgba);
+            overlay_rgba = NULL;
+        }
+    } else if (cached_overlay_rgba) {
+        overlay_rgba = cached_overlay_rgba;
+    }
+
+    if (overlay_rgba) {
         for (size_t i = 0; i < pixels; i++) {
-            uint8_t or_ = cached_overlay_rgba[i * 4 + 0];
-            uint8_t og = cached_overlay_rgba[i * 4 + 1];
-            uint8_t ob = cached_overlay_rgba[i * 4 + 2];
-            uint8_t oa = cached_overlay_rgba[i * 4 + 3];
+            uint8_t or_ = overlay_rgba[i * 4 + 0];
+            uint8_t og = overlay_rgba[i * 4 + 1];
+            uint8_t ob = overlay_rgba[i * 4 + 2];
+            uint8_t oa = overlay_rgba[i * 4 + 3];
             uint8_t br = rgb[i * 3 + 0];
             uint8_t bg = rgb[i * 3 + 1];
             uint8_t bb = rgb[i * 3 + 2];
             rgb[i * 3 + 0] = (or_ * oa + br * (255 - oa)) / 255;
             rgb[i * 3 + 1] = (og * oa + bg * (255 - oa)) / 255;
             rgb[i * 3 + 2] = (ob * oa + bb * (255 - oa)) / 255;
+        }
+        /* free if we loaded it dynamically (not the cached static one) */
+        if (overlay_rgba != cached_overlay_rgba) {
+            free(overlay_rgba);
         }
     }
 
@@ -717,6 +773,8 @@ pd_content_status_t pd_content_get_status(void)
 
 void pd_content_tick(void)
 {
+    int64_t now = esp_timer_get_time();
+
     /* drive active transition */
     if (content_transition && pd_transition_is_active(content_transition)) {
         bool still_going = pd_transition_tick(content_transition);
@@ -728,9 +786,24 @@ void pd_content_tick(void)
         return;  /* don't advance sequence frames during transition */
     }
 
+    /* advance animated overlay frame independently */
+    if (overlay_is_seq && overlay_total_frames > 0) {
+        int64_t overlay_interval = 1000000 / overlay_fps;
+        if (overlay_last_frame_us == 0) {
+            overlay_last_frame_us = now;
+        } else if ((now - overlay_last_frame_us) >= overlay_interval) {
+            overlay_last_frame_us = now;
+            int next_ov = overlay_frame + 1;
+            int last_ov = overlay_frame_start + overlay_total_frames - 1;
+            if (next_ov > last_ov) {
+                next_ov = overlay_frame_start;  /* loop overlay */
+            }
+            overlay_frame = next_ov;
+        }
+    }
+
     if (!content_playing || !content_is_seq) return;
 
-    int64_t now = esp_timer_get_time();
     int64_t frame_interval = 1000000 / content_fps;
 
     if (content_last_frame_us == 0) {
