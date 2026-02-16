@@ -1,0 +1,3 @@
+SystemView::onCursorChanged(): cursor changed to arcade
+GamelistView::onCursorChanged(): cursor changed to Pac-Man
+GamelistView::onCursorChanged(): cursor changed to lizard-sprite

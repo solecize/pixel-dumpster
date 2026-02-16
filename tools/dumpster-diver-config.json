@@ -1,0 +1,38 @@
+{
+  "device": {
+    "host": "192.168.1.154",
+    "port": 8088
+  },
+  "defaults": {
+    "system_fallback": "images/systems/default.png",
+    "game_fallback": "images/games/default.png",
+    "transition": "fade",
+    "duration_ms": 800
+  },
+  "events": {
+    "game_select": true,
+    "game_launch": true,
+    "game_end": true,
+    "system_select": true
+  },
+  "systems": {
+    "nes": {
+      "art": "images/systems/nes.png",
+      "game_path": "images/games/nes/"
+    },
+    "snes": {
+      "art": "images/systems/snes.png",
+      "game_path": "images/games/snes/"
+    },
+    "arcade": {
+      "art": "images/systems/arcade.png",
+      "game_path": "images/games/arcade/"
+    }
+  },
+  "games": {
+    "pac-ghost": "images/pac-ghost",
+    "Pac-Man": "images/pac-ghost",
+    "Super Mario Bros": "images/sprite-test",
+    "lizard-sprite": "images/lizard-sprite"
+  }
+}
