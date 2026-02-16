@@ -57,6 +57,10 @@ static char cached_overlay_path[PD_CONTENT_MAX_PATH] = "";
 static int cached_width = 0;
 static int cached_height = 0;
 
+/* saved global defaults (restored when switching content) */
+static char saved_background[PD_CONTENT_MAX_PATH] = "#000000";
+static char saved_overlay[PD_CONTENT_MAX_PATH] = "";
+
 /* animated overlay state */
 static bool overlay_is_seq = false;
 static int overlay_fps = 12;
@@ -255,6 +259,11 @@ static void load_config(void)
     }
 
     cJSON_Delete(root);
+
+    /* save global defaults for restoration when switching content */
+    strlcpy(saved_background, content_config.background, sizeof(saved_background));
+    strlcpy(saved_overlay, content_config.overlay, sizeof(saved_overlay));
+
     ESP_LOGI(TAG, "config loaded: mode=%d baseline=%s dur=%d",
              content_config.trans_mode, content_config.trans_baseline,
              content_config.trans_duration_ms);
@@ -645,6 +654,16 @@ static bool content_decode_first_frame(const char *full_path, pd_framebuf_t *fb)
 /* helper: set up playback state for a content path */
 static esp_err_t content_setup_playback(const char *path, const char *full)
 {
+    /* restore global defaults before applying per-item settings */
+    if (strcmp(content_config.background, saved_background) != 0) {
+        strlcpy(content_config.background, saved_background, sizeof(content_config.background));
+        cached_bg_path[0] = '\0';  /* force cache refresh */
+    }
+    if (strcmp(content_config.overlay, saved_overlay) != 0) {
+        strlcpy(content_config.overlay, saved_overlay, sizeof(content_config.overlay));
+        cached_overlay_path[0] = '\0';  /* force cache refresh */
+    }
+
     if (path_is_dir(full)) {
         int fps = 12;
         bool loop = true;
@@ -1130,13 +1149,17 @@ static esp_err_t http_config_set(httpd_req_t *req)
         if (cJSON_IsBool(loop_seq))
             content_config.loop_sequences = cJSON_IsTrue(loop_seq);
         cJSON *bg = cJSON_GetObjectItem(disp, "background");
-        if (cJSON_IsString(bg))
+        if (cJSON_IsString(bg)) {
             strlcpy(content_config.background, bg->valuestring,
                     sizeof(content_config.background));
+            strlcpy(saved_background, bg->valuestring, sizeof(saved_background));
+        }
         cJSON *ov = cJSON_GetObjectItem(disp, "overlay");
-        if (cJSON_IsString(ov))
+        if (cJSON_IsString(ov)) {
             strlcpy(content_config.overlay, ov->valuestring,
                     sizeof(content_config.overlay));
+            strlcpy(saved_overlay, ov->valuestring, sizeof(saved_overlay));
+        }
     }
 
     cJSON *attr = cJSON_GetObjectItem(root, "attract");
