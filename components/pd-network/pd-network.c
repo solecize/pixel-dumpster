@@ -17,6 +17,7 @@
 #include "lwip/sockets.h"
 #include "lwip/inet.h"
 #include "lwip/ip4_addr.h"
+#include "mdns.h"
 #include "pd-config.h"
 #include "pd-storage.h"
 
@@ -32,8 +33,12 @@ static pd_network_config_t pd_network_config = {
 static httpd_handle_t pd_http_server = NULL;
 static bool pd_wifi_connected = false;
 static bool pd_network_suspended = false;
+static bool pd_mdns_started = false;
 static int pd_udp_socket = -1;
 static time_t pd_now_mtime = 0;
+
+/* Forward declaration */
+static void pd_network_start_mdns(void);
 
 static void pd_network_handle_wifi_event(void *arg, esp_event_base_t event_base, int32_t event_id, void *event_data)
 {
@@ -56,6 +61,11 @@ static void pd_network_handle_wifi_event(void *arg, esp_event_base_t event_base,
     if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
         pd_wifi_connected = true;
         ESP_LOGI(TAG, "wifi connected");
+        /* Start mDNS now that we have an IP */
+        if (!pd_mdns_started) {
+            pd_network_start_mdns();
+            pd_mdns_started = true;
+        }
     }
 }
 
@@ -327,7 +337,7 @@ static esp_err_t pd_network_start_http(void)
 
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.server_port = pd_network_config.http_port;
-    config.max_uri_handlers = 16;
+    config.max_uri_handlers = 24;
     config.max_resp_headers = 8;
     config.recv_wait_timeout = 10;
     config.send_wait_timeout = 10;
@@ -466,6 +476,44 @@ static void pd_network_poll_now_json(void)
     }
 }
 
+static void pd_network_start_mdns(void)
+{
+    esp_err_t err = mdns_init();
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "mdns init failed: %s", esp_err_to_name(err));
+        return;
+    }
+
+    const char *hostname = pd_network_config.hostname[0]
+                           ? pd_network_config.hostname
+                           : "pixeldumpster";
+    mdns_hostname_set(hostname);
+    mdns_instance_name_set("Pixel Dumpster");
+
+    /* advertise HTTP service for control-center discovery */
+    mdns_service_add("Pixel Dumpster", "_pdumpster", "_tcp",
+                     pd_network_config.http_port, NULL, 0);
+
+    /* add TXT records with device metadata */
+    mdns_service_txt_item_set("_pdumpster", "_tcp", "version", "1");
+
+    /* load config for display dimensions */
+    pd_config_t cfg;
+    pd_config_init(&cfg);
+    pd_config_load(&cfg);
+
+    char w_str[8], h_str[8];
+    snprintf(w_str, sizeof(w_str), "%d", cfg.matrix_width);
+    snprintf(h_str, sizeof(h_str), "%d", cfg.matrix_height);
+    mdns_service_txt_item_set("_pdumpster", "_tcp", "width", w_str);
+    mdns_service_txt_item_set("_pdumpster", "_tcp", "height", h_str);
+    if (cfg.device_name[0])
+        mdns_service_txt_item_set("_pdumpster", "_tcp", "name", cfg.device_name);
+
+    ESP_LOGI(TAG, "mdns started: %s._pdumpster._tcp port %d",
+             hostname, pd_network_config.http_port);
+}
+
 esp_err_t pd_network_init(const pd_network_config_t *config)
 {
     if (config) {
@@ -534,6 +582,7 @@ void pd_network_start(void)
     ESP_LOGI(TAG, "wifi init started");
     pd_network_start_http();
     pd_network_start_udp();
+    /* mDNS will be started after WiFi connects (in GOT_IP handler) */
 }
 
 void pd_network_poll(void)

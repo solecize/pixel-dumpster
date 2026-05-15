@@ -18,6 +18,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "pd-display.h"
+#include "hub75_config.h"
 
 #if CONFIG_TINYUSB_HOST
 #include "tusb.h"
@@ -37,10 +38,20 @@ static const char *TAG = "pd-wizard";
 /* ---------- step definitions ---------- */
 
 typedef enum {
-    PD_STEP_MATRIX_SIZE = 0,
+    PD_STEP_MULTI_PANEL = 0,
+    PD_STEP_MATRIX_SIZE,
     PD_STEP_MATRIX_CUSTOM,
+    PD_STEP_PANEL_RES,
+    PD_STEP_PANEL_RES_CUSTOM,
+    PD_STEP_PANEL_ROWS,
+    PD_STEP_PANEL_COLS,
+    PD_STEP_CHAIN_PATTERN,
+    PD_STEP_PANEL_ROTATION,
+    PD_STEP_PANEL_LAYOUT,
     PD_STEP_ORIENTATION,
     PD_STEP_SCAN_WIRING,
+    PD_STEP_COLOR_ORDER,
+    PD_STEP_DEMO_PATTERNS,
     PD_STEP_WIFI_SSID,
     PD_STEP_WIFI_SSID_MANUAL,
     PD_STEP_WIFI_PASSWORD,
@@ -66,10 +77,20 @@ typedef struct {
 } pd_step_def_t;
 
 static const pd_step_def_t pd_step_defs[PD_STEP_COUNT] = {
+    [PD_STEP_MULTI_PANEL]      = {"multi_panel",      "Panel configuration",           PD_MODE_MENU, false},
     [PD_STEP_MATRIX_SIZE]      = {"matrix_size",      "Matrix size",                    PD_MODE_MENU, false},
     [PD_STEP_MATRIX_CUSTOM]    = {"matrix_custom",     "Custom size (e.g. 128x64)",     PD_MODE_TEXT, false},
+    [PD_STEP_PANEL_RES]        = {"panel_res",         "Panel resolution",              PD_MODE_MENU, false},
+    [PD_STEP_PANEL_RES_CUSTOM] = {"panel_res_custom",  "Custom panel size (e.g. 64x32)", PD_MODE_TEXT, false},
+    [PD_STEP_PANEL_ROWS]       = {"panel_rows",        "Panel rows (vertical count)",     PD_MODE_TEXT, false},
+    [PD_STEP_PANEL_COLS]       = {"panel_cols",        "Panel columns (horizontal count)", PD_MODE_TEXT, false},
+    [PD_STEP_CHAIN_PATTERN]    = {"chain_pattern",     "Panel chain pattern",           PD_MODE_MENU, false},
+    [PD_STEP_PANEL_ROTATION]   = {"panel_rotation",    "Panel rotation",                PD_MODE_MENU, false},
+    [PD_STEP_PANEL_LAYOUT]     = {"panel_layout",      "Panel layout test",             PD_MODE_MENU, false},
     [PD_STEP_ORIENTATION]      = {"orientation",       "Orientation",                    PD_MODE_MENU, false},
     [PD_STEP_SCAN_WIRING]      = {"scan_wiring",       "Scan wiring",                   PD_MODE_MENU, false},
+    [PD_STEP_COLOR_ORDER]      = {"color_order",       "Colour order",                  PD_MODE_MENU, false},
+    [PD_STEP_DEMO_PATTERNS]    = {"demo_patterns",    "Demo patterns",                PD_MODE_MENU, false},
     [PD_STEP_WIFI_SSID]        = {"wifi_ssid",         "WiFi SSID",                     PD_MODE_MENU, false},
     [PD_STEP_WIFI_SSID_MANUAL] = {"wifi_ssid_manual",  "Enter WiFi SSID",               PD_MODE_TEXT, false},
     [PD_STEP_WIFI_PASSWORD]    = {"wifi_password",     "WiFi password (blank=open)",     PD_MODE_TEXT, true},
@@ -78,7 +99,7 @@ static const pd_step_def_t pd_step_defs[PD_STEP_COUNT] = {
     [PD_STEP_TIMEZONE]         = {"timezone",          "Timezone (e.g. CST6CDT)",       PD_MODE_TEXT, false},
     [PD_STEP_STATIC_IP]        = {"static_ip",         "Static IP (blank=DHCP)",        PD_MODE_TEXT, false},
     [PD_STEP_STATIC_GATEWAY]   = {"static_gateway",    "Static gateway",                PD_MODE_TEXT, false},
-    [PD_STEP_STATIC_NETMASK]   = {"static_netmask",    "Static netmask",                PD_MODE_TEXT, false},
+    [PD_STEP_STATIC_NETMASK]   = {"static_netmask",    "Custom netmask",                PD_MODE_TEXT, false},
 };
 
 static const char *pd_matrix_options[] = {"16x16", "32x32", "64x64", "128x128", "other", "reztest"};
@@ -90,6 +111,46 @@ static const int pd_orientation_option_count = 4;
 
 static const char *pd_scan_options[] = {"Standard (1/16 or 1/32)", "1/4 scan 16px", "1/8 scan 32px", "1/8 scan 40px", "1/8 scan 64px"};
 static const int pd_scan_option_count = 5;
+
+static const char *pd_multi_panel_options[] = {"Single panel", "Multi-panel chain"};
+static const int pd_multi_panel_option_count = 2;
+
+static const char *pd_panel_res_options[] = {"16x16", "32x16", "32x32", "64x32", "64x64", "128x32", "128x64", "custom"};
+static const int pd_panel_res_option_count = 8;
+static const int pd_panel_res_sizes[][2] = {{16,16},{32,16},{32,32},{64,32},{64,64},{128,32},{128,64},{0,0}};
+
+static const char *pd_chain_pattern_options[] = {
+    "Horizontal (single row)",
+    "Serpentine top-left down",
+    "Serpentine top-right down",
+    "Serpentine bottom-left up",
+    "Serpentine bottom-right up",
+    "Zigzag top-left down",
+    "Zigzag top-right down",
+    "Zigzag bottom-left up",
+    "Zigzag bottom-right up"
+};
+static const int pd_chain_pattern_option_count = 9;
+
+static const char *pd_rotation_options[] = {"0 degrees", "90 degrees CW", "180 degrees", "270 degrees CW"};
+static const int pd_rotation_option_count = 4;
+
+static const char *pd_color_order_options[] = {"RGB", "BGR", "GRB", "BRG"};
+static const int pd_color_order_option_count = 4;
+
+static const char *pd_panel_layout_options[] = {"Run panel layout test", "Skip test"};
+static const int pd_panel_layout_option_count = 2;
+
+static const char *pd_demo_pattern_options[] = {
+    "None",
+    "Color Test",
+    "Numbered Panels",
+    "Checkerboard",
+    "RGB Sweep",
+    "Bouncing Ball",
+    "Panel Layout",
+};
+static const int pd_demo_pattern_option_count = 7;
 
 static const char *pd_manual_entry_label = "<manual entry>";
 
@@ -121,9 +182,10 @@ static bool wiz_reztest_active = false;  /* true while in reztest mode */
 
 static pd_config_t *wiz_config = NULL;
 static pd_wizard_state_t wiz_public_state = PD_WIZARD_STATE_IDLE;
-static pd_wizard_step_t wiz_step = PD_STEP_MATRIX_SIZE;
+static pd_wizard_step_t wiz_step = PD_STEP_MULTI_PANEL;
 static int wiz_menu_selected = 0;
 static char wiz_text_value[PD_WIZARD_VALUE_LEN] = {0};
+static bool wiz_multi_panel = false;   /* true = multi-panel chain mode */
 
 static char wiz_wifi_ssids[PD_WIZARD_MAX_SSIDS][PD_WIZARD_VALUE_LEN];
 static int wiz_wifi_ssid_count = 0;
@@ -176,13 +238,36 @@ static void wiz_send_json(cJSON *root)
 static bool wiz_step_active(pd_wizard_step_t step)
 {
     switch (step) {
+        case PD_STEP_MULTI_PANEL:
+            return true;
         case PD_STEP_MATRIX_SIZE:
         case PD_STEP_ORIENTATION:
-        case PD_STEP_SCAN_WIRING:
-            /* skip display steps if reztest already locked in a config */
+            /* single-panel display steps; skip if reztest already locked in */
+            if (wiz_multi_panel) return false;
             return !(wiz_config && wiz_config->reztest_done);
         case PD_STEP_MATRIX_CUSTOM:
+            if (wiz_multi_panel) return false;
             return wiz_config && wiz_config->matrix_width == 0;
+        case PD_STEP_PANEL_RES:
+            if (!wiz_multi_panel) return false;
+            /* reztest is single-panel only; if multi is chosen, always ask */
+            return true;
+        case PD_STEP_PANEL_RES_CUSTOM:
+            if (!wiz_multi_panel) return false;
+            return wiz_config && wiz_config->panel_width == 0;
+        case PD_STEP_PANEL_ROWS:
+        case PD_STEP_PANEL_COLS:
+        case PD_STEP_PANEL_ROTATION:
+        case PD_STEP_PANEL_LAYOUT:
+            return wiz_multi_panel;
+        case PD_STEP_CHAIN_PATTERN:
+            if (!wiz_multi_panel) return false;
+            return wiz_config && wiz_config->panel_rows > 1;
+        case PD_STEP_SCAN_WIRING:
+            /* skip if reztest already locked in (single-panel path) */
+            return !(wiz_config && wiz_config->reztest_done);
+        case PD_STEP_COLOR_ORDER:
+            return true;
         case PD_STEP_WIFI_SSID_MANUAL:
             return false;
         case PD_STEP_STATIC_GATEWAY:
@@ -218,6 +303,10 @@ static int wiz_active_step_count(void)
 static void wiz_get_menu_options(const char ***out_options, int *out_count)
 {
     switch (wiz_step) {
+        case PD_STEP_MULTI_PANEL:
+            *out_options = pd_multi_panel_options;
+            *out_count = pd_multi_panel_option_count;
+            break;
         case PD_STEP_MATRIX_SIZE:
             *out_options = pd_matrix_options;
             *out_count = pd_matrix_option_count;
@@ -229,6 +318,30 @@ static void wiz_get_menu_options(const char ***out_options, int *out_count)
         case PD_STEP_SCAN_WIRING:
             *out_options = pd_scan_options;
             *out_count = pd_scan_option_count;
+            break;
+        case PD_STEP_COLOR_ORDER:
+            *out_options = pd_color_order_options;
+            *out_count = pd_color_order_option_count;
+            break;
+        case PD_STEP_PANEL_RES:
+            *out_options = pd_panel_res_options;
+            *out_count = pd_panel_res_option_count;
+            break;
+        case PD_STEP_CHAIN_PATTERN:
+            *out_options = pd_chain_pattern_options;
+            *out_count = pd_chain_pattern_option_count;
+            break;
+        case PD_STEP_PANEL_ROTATION:
+            *out_options = pd_rotation_options;
+            *out_count = pd_rotation_option_count;
+            break;
+        case PD_STEP_PANEL_LAYOUT:
+            *out_options = pd_panel_layout_options;
+            *out_count = pd_panel_layout_option_count;
+            break;
+        case PD_STEP_DEMO_PATTERNS:
+            *out_options = pd_demo_pattern_options;
+            *out_count = pd_demo_pattern_option_count;
             break;
         case PD_STEP_WIFI_SSID:
             *out_options = wiz_wifi_menu_ptrs;
@@ -248,6 +361,30 @@ static const char *wiz_get_text_value(void)
             static char buf[32];
             if (wiz_config->matrix_width > 0 && wiz_config->matrix_height > 0) {
                 snprintf(buf, sizeof(buf), "%dx%d", wiz_config->matrix_width, wiz_config->matrix_height);
+                return buf;
+            }
+            return wiz_text_value;
+        }
+        case PD_STEP_PANEL_RES_CUSTOM: {
+            static char buf[32];
+            if (wiz_config->panel_width > 0 && wiz_config->panel_height > 0) {
+                snprintf(buf, sizeof(buf), "%dx%d", wiz_config->panel_width, wiz_config->panel_height);
+                return buf;
+            }
+            return wiz_text_value;
+        }
+        case PD_STEP_PANEL_ROWS: {
+            static char buf[12];
+            if (wiz_config->panel_rows > 0) {
+                snprintf(buf, sizeof(buf), "%d", wiz_config->panel_rows);
+                return buf;
+            }
+            return wiz_text_value;
+        }
+        case PD_STEP_PANEL_COLS: {
+            static char buf[12];
+            if (wiz_config->panel_cols > 0) {
+                snprintf(buf, sizeof(buf), "%d", wiz_config->panel_cols);
                 return buf;
             }
             return wiz_text_value;
@@ -303,7 +440,7 @@ static void wiz_send_state(void)
     }
 
     cJSON *nav = cJSON_AddObjectToObject(root, "nav");
-    cJSON_AddBoolToObject(nav, "back", wiz_step > PD_STEP_MATRIX_SIZE);
+    cJSON_AddBoolToObject(nav, "back", wiz_step > PD_STEP_MULTI_PANEL);
     cJSON_AddBoolToObject(nav, "next", true);
 
     wiz_send_json(root);
@@ -524,6 +661,22 @@ static void wiz_enter_step(void)
         wiz_public_state = PD_WIZARD_STATE_COMPLETE;
         wiz_config->setup_complete = true;
         wiz_config->reztest_done = false;
+
+        /* compute virtual canvas size from panel layout */
+        if (wiz_multi_panel && wiz_config->panel_width > 0 && wiz_config->panel_height > 0) {
+            if (wiz_config->panel_rotation_deg == 90 || wiz_config->panel_rotation_deg == 270) {
+                wiz_config->matrix_width = wiz_config->panel_height * wiz_config->panel_cols;
+                wiz_config->matrix_height = wiz_config->panel_width * wiz_config->panel_rows;
+            } else {
+                wiz_config->matrix_width = wiz_config->panel_width * wiz_config->panel_cols;
+                wiz_config->matrix_height = wiz_config->panel_height * wiz_config->panel_rows;
+            }
+        } else if (wiz_config->panel_width > 0 && wiz_config->panel_height > 0) {
+            /* single-panel parity: ensure matrix matches panel */
+            wiz_config->matrix_width = wiz_config->panel_width;
+            wiz_config->matrix_height = wiz_config->panel_height;
+        }
+
         pd_config_save(wiz_config);
 
         cJSON *done = cJSON_CreateObject();
@@ -533,6 +686,13 @@ static void wiz_enter_step(void)
         cJSON_AddNumberToObject(cfg, "matrix_height", wiz_config->matrix_height);
         cJSON_AddNumberToObject(cfg, "orientation_deg", wiz_config->orientation_deg);
         cJSON_AddNumberToObject(cfg, "scan_wiring", wiz_config->scan_wiring);
+        cJSON_AddNumberToObject(cfg, "panel_width", wiz_config->panel_width);
+        cJSON_AddNumberToObject(cfg, "panel_height", wiz_config->panel_height);
+        cJSON_AddNumberToObject(cfg, "panel_rows", wiz_config->panel_rows);
+        cJSON_AddNumberToObject(cfg, "panel_cols", wiz_config->panel_cols);
+        cJSON_AddNumberToObject(cfg, "chain_pattern", wiz_config->chain_pattern);
+        cJSON_AddNumberToObject(cfg, "panel_rotation_deg", wiz_config->panel_rotation_deg);
+        cJSON_AddNumberToObject(cfg, "color_order", wiz_config->color_order);
         cJSON_AddStringToObject(cfg, "wifi_ssid", wiz_config->wifi_ssid);
         cJSON_AddStringToObject(cfg, "device_name", wiz_config->device_name);
         cJSON_AddStringToObject(cfg, "hostname", wiz_config->hostname);
@@ -544,10 +704,12 @@ static void wiz_enter_step(void)
         vTaskDelay(pdMS_TO_TICKS(100));
 
         pd_display_wizard_status("Rebooting...");
-        ESP_LOGI(TAG, "wizard complete — saved: %dx%d orient=%d scan=%d reztest_done=%d",
+        ESP_LOGI(TAG, "wizard complete — saved: virtual=%dx%d panel=%dx%d chain=%dx%d pat=%d rot=%d scan=%d",
                  wiz_config->matrix_width, wiz_config->matrix_height,
-                 wiz_config->orientation_deg, wiz_config->scan_wiring,
-                 wiz_config->reztest_done);
+                 wiz_config->panel_width, wiz_config->panel_height,
+                 wiz_config->panel_rows, wiz_config->panel_cols,
+                 wiz_config->chain_pattern, wiz_config->panel_rotation_deg,
+                 wiz_config->scan_wiring, wiz_config->color_order);
         vTaskDelay(pdMS_TO_TICKS(500));
         esp_restart();
         return;
@@ -560,11 +722,26 @@ static void wiz_enter_step(void)
         wiz_do_wifi_scan();
     }
 
+    if (wiz_step == PD_STEP_MULTI_PANEL) {
+        wiz_menu_selected = wiz_multi_panel ? 1 : 0;
+    }
+
     if (wiz_step == PD_STEP_MATRIX_SIZE) {
         if (wiz_config->matrix_width == 64 && wiz_config->matrix_height == 64) wiz_menu_selected = 2;
         else if (wiz_config->matrix_width == 32 && wiz_config->matrix_height == 32) wiz_menu_selected = 1;
         else if (wiz_config->matrix_width == 16 && wiz_config->matrix_height == 16) wiz_menu_selected = 0;
         else if (wiz_config->matrix_width == 128 && wiz_config->matrix_height == 128) wiz_menu_selected = 3;
+    }
+
+    if (wiz_step == PD_STEP_PANEL_RES) {
+        if (wiz_config->panel_width == 16 && wiz_config->panel_height == 16) wiz_menu_selected = 0;
+        else if (wiz_config->panel_width == 32 && wiz_config->panel_height == 16) wiz_menu_selected = 1;
+        else if (wiz_config->panel_width == 32 && wiz_config->panel_height == 32) wiz_menu_selected = 2;
+        else if (wiz_config->panel_width == 64 && wiz_config->panel_height == 32) wiz_menu_selected = 3;
+        else if (wiz_config->panel_width == 64 && wiz_config->panel_height == 64) wiz_menu_selected = 4;
+        else if (wiz_config->panel_width == 128 && wiz_config->panel_height == 32) wiz_menu_selected = 5;
+        else if (wiz_config->panel_width == 128 && wiz_config->panel_height == 64) wiz_menu_selected = 6;
+        else wiz_menu_selected = 7; /* custom */
     }
 
     if (wiz_step == PD_STEP_ORIENTATION) {
@@ -576,10 +753,35 @@ static void wiz_enter_step(void)
         }
     }
 
+    if (wiz_step == PD_STEP_PANEL_ROTATION) {
+        int rot = wiz_config->panel_rotation_deg;
+        if (rot == 0) wiz_menu_selected = 0;
+        else if (rot == 90) wiz_menu_selected = 1;
+        else if (rot == 180) wiz_menu_selected = 2;
+        else if (rot == 270) wiz_menu_selected = 3;
+        else wiz_menu_selected = 0;
+    }
+
     if (wiz_step == PD_STEP_SCAN_WIRING) {
         if (wiz_config->scan_wiring >= 0 && wiz_config->scan_wiring < pd_scan_option_count) {
             wiz_menu_selected = wiz_config->scan_wiring;
         }
+    }
+
+    if (wiz_step == PD_STEP_COLOR_ORDER) {
+        if (wiz_config->color_order >= 0 && wiz_config->color_order < pd_color_order_option_count) {
+            wiz_menu_selected = wiz_config->color_order;
+        }
+    }
+
+    if (wiz_step == PD_STEP_CHAIN_PATTERN) {
+        if (wiz_config->chain_pattern >= 0 && wiz_config->chain_pattern < pd_chain_pattern_option_count) {
+            wiz_menu_selected = wiz_config->chain_pattern;
+        }
+    }
+
+    if (wiz_step == PD_STEP_DEMO_PATTERNS) {
+        wiz_menu_selected = 0; /* default to None */
     }
 
     if (wiz_step == PD_STEP_WIFI_SSID) {
@@ -604,13 +806,16 @@ static void wiz_go_next(void)
 
 static void wiz_go_back(void)
 {
-    if (wiz_step == PD_STEP_MATRIX_SIZE) return;
+    if (wiz_step == PD_STEP_MULTI_PANEL) return;
     wiz_step--;
-    while (wiz_step > PD_STEP_MATRIX_SIZE && !wiz_step_active(wiz_step)) {
+    while (wiz_step > PD_STEP_MULTI_PANEL && !wiz_step_active(wiz_step)) {
         wiz_step--;
     }
     wiz_enter_step();
 }
+
+/* forward declaration */
+static void wiz_process_command(const char *json_str);
 
 /* ---------- command: apply menu selection ---------- */
 
@@ -622,6 +827,27 @@ static void wiz_apply_menu_select(int index)
     if (index < 0 || index >= count) return;
 
     switch (wiz_step) {
+        case PD_STEP_MULTI_PANEL: {
+            wiz_multi_panel = (index == 1);
+            if (wiz_multi_panel) {
+                /* entering multi-panel path: reset panel fields to force selection */
+                wiz_config->panel_width = 0;
+                wiz_config->panel_height = 0;
+                wiz_config->panel_rows = 0;
+                wiz_config->panel_cols = 0;
+                wiz_config->chain_pattern = 0;
+                wiz_config->panel_rotation_deg = 0;
+                /* matrix_width/height will be computed from panel dims after setup */
+            } else {
+                /* single panel: keep legacy behavior, reset panel fields */
+                wiz_config->panel_rows = 1;
+                wiz_config->panel_cols = 1;
+                wiz_config->chain_pattern = 0;
+                wiz_config->panel_rotation_deg = wiz_config->orientation_deg;
+            }
+            wiz_go_next();
+            break;
+        }
         case PD_STEP_MATRIX_SIZE: {
             /* "reztest" is the last option */
             if (index == pd_matrix_option_count - 1) {
@@ -648,7 +874,47 @@ static void wiz_apply_menu_select(int index)
             }
             wiz_config->matrix_width = pd_matrix_sizes[index][0];
             wiz_config->matrix_height = pd_matrix_sizes[index][1];
+            /* single-panel: panel dims mirror matrix dims */
+            wiz_config->panel_width = wiz_config->matrix_width;
+            wiz_config->panel_height = wiz_config->matrix_height;
             wiz_go_next();
+            break;
+        }
+        case PD_STEP_PANEL_RES: {
+            /* "custom" is the last option */
+            if (index == pd_panel_res_option_count - 1) {
+                wiz_config->panel_width = 0;
+                wiz_config->panel_height = 0;
+                wiz_go_next();
+                return;
+            }
+            wiz_config->panel_width = pd_panel_res_sizes[index][0];
+            wiz_config->panel_height = pd_panel_res_sizes[index][1];
+            wiz_go_next();
+            break;
+        }
+        case PD_STEP_CHAIN_PATTERN:
+            wiz_config->chain_pattern = index;
+            wiz_go_next();
+            break;
+        case PD_STEP_PANEL_ROTATION:
+            wiz_config->panel_rotation_deg = index * 90; /* 0, 90, 180, 270 */
+            wiz_go_next();
+            break;
+        case PD_STEP_PANEL_LAYOUT: {
+            if (index == 0) {
+                /* Run test: start panel-layout pattern */
+                pd_display_test_start(PD_TEST_PATTERN_PANEL_LAYOUT, 0);
+                /* don't advance yet — wait for user confirmation via a new cmd */
+                cJSON *testing = cJSON_CreateObject();
+                cJSON_AddStringToObject(testing, "type", "panel_layout_test");
+                cJSON_AddBoolToObject(testing, "running", true);
+                wiz_send_json(testing);
+                return;
+            } else {
+                /* Skip test */
+                wiz_go_next();
+            }
             break;
         }
         case PD_STEP_ORIENTATION:
@@ -659,6 +925,29 @@ static void wiz_apply_menu_select(int index)
             wiz_config->scan_wiring = index;
             wiz_go_next();
             break;
+        case PD_STEP_COLOR_ORDER:
+            wiz_config->color_order = index;
+            wiz_go_next();
+            break;
+        case PD_STEP_DEMO_PATTERNS: {
+            /* start selected pattern, then advance */
+            const char *pattern_names[] = {
+                "none", "color_test", "numbered_panels",
+                "checkerboard", "rgb_sweep", "bouncing_ball", "panel_layout"
+            };
+            if (index >= 0 && index < 7) {
+                cJSON *cmd = cJSON_CreateObject();
+                cJSON_AddStringToObject(cmd, "cmd", "test_pattern");
+                cJSON_AddStringToObject(cmd, "pattern", pattern_names[index]);
+                char *json = cJSON_PrintUnformatted(cmd);
+                cJSON_Delete(cmd);
+                /* send through serial processor to avoid duplication */
+                wiz_process_command(json);
+                free(json);
+            }
+            wiz_go_next();
+            break;
+        }
         case PD_STEP_WIFI_SSID:
             if (index == wiz_wifi_menu_count - 1) {
                 wiz_step = PD_STEP_WIFI_SSID_MANUAL;
@@ -684,11 +973,54 @@ static void wiz_apply_text_input(const char *value)
             if (sscanf(value, "%dx%d", &w, &h) == 2 && w > 0 && h > 0) {
                 wiz_config->matrix_width = w;
                 wiz_config->matrix_height = h;
+                /* single-panel: panel dims mirror matrix dims */
+                wiz_config->panel_width = w;
+                wiz_config->panel_height = h;
                 wiz_go_next();
             } else {
                 cJSON *err = cJSON_CreateObject();
                 cJSON_AddStringToObject(err, "type", "error");
                 cJSON_AddStringToObject(err, "message", "Invalid size. Use WIDTHxHEIGHT (e.g. 128x64)");
+                wiz_send_json(err);
+            }
+            break;
+        }
+        case PD_STEP_PANEL_RES_CUSTOM: {
+            int w = 0, h = 0;
+            if (sscanf(value, "%dx%d", &w, &h) == 2 && w > 0 && h > 0) {
+                wiz_config->panel_width = w;
+                wiz_config->panel_height = h;
+                wiz_go_next();
+            } else {
+                cJSON *err = cJSON_CreateObject();
+                cJSON_AddStringToObject(err, "type", "error");
+                cJSON_AddStringToObject(err, "message", "Invalid panel size. Use WIDTHxHEIGHT (e.g. 64x32)");
+                wiz_send_json(err);
+            }
+            break;
+        }
+        case PD_STEP_PANEL_ROWS: {
+            int rows = atoi(value);
+            if (rows > 0 && rows <= HUB75_MAX_CHAINED_PANELS) {
+                wiz_config->panel_rows = rows;
+                wiz_go_next();
+            } else {
+                cJSON *err = cJSON_CreateObject();
+                cJSON_AddStringToObject(err, "type", "error");
+                cJSON_AddStringToObject(err, "message", "Enter rows (1-8)");
+                wiz_send_json(err);
+            }
+            break;
+        }
+        case PD_STEP_PANEL_COLS: {
+            int cols = atoi(value);
+            if (cols > 0 && cols <= HUB75_MAX_CHAINED_PANELS) {
+                wiz_config->panel_cols = cols;
+                wiz_go_next();
+            } else {
+                cJSON *err = cJSON_CreateObject();
+                cJSON_AddStringToObject(err, "type", "error");
+                cJSON_AddStringToObject(err, "message", "Enter columns (1-8)");
                 wiz_send_json(err);
             }
             break;
@@ -884,6 +1216,15 @@ static void wiz_handle_key(const char *code)
     }
 }
 
+/* ---------- external command callback ---------- */
+
+static pd_wizard_cmd_callback_t wiz_cmd_callback = NULL;
+
+void pd_wizard_set_cmd_callback(pd_wizard_cmd_callback_t cb)
+{
+    wiz_cmd_callback = cb;
+}
+
 /* ---------- JSON command dispatch ---------- */
 
 static void wiz_process_command(const char *json_str)
@@ -927,6 +1268,12 @@ static void wiz_process_command(const char *json_str)
             cJSON_AddNumberToObject(cfg, "matrix_height", wiz_config->matrix_height);
             cJSON_AddNumberToObject(cfg, "orientation_deg", wiz_config->orientation_deg);
             cJSON_AddNumberToObject(cfg, "scan_wiring", wiz_config->scan_wiring);
+            cJSON_AddNumberToObject(cfg, "panel_width", wiz_config->panel_width);
+            cJSON_AddNumberToObject(cfg, "panel_height", wiz_config->panel_height);
+            cJSON_AddNumberToObject(cfg, "panel_rows", wiz_config->panel_rows);
+            cJSON_AddNumberToObject(cfg, "panel_cols", wiz_config->panel_cols);
+            cJSON_AddNumberToObject(cfg, "chain_pattern", wiz_config->chain_pattern);
+            cJSON_AddNumberToObject(cfg, "panel_rotation_deg", wiz_config->panel_rotation_deg);
             cJSON_AddStringToObject(cfg, "wifi_ssid", wiz_config->wifi_ssid);
             cJSON_AddStringToObject(cfg, "device_name", wiz_config->device_name);
             cJSON_AddStringToObject(cfg, "hostname", wiz_config->hostname);
@@ -936,7 +1283,8 @@ static void wiz_process_command(const char *json_str)
         } else {
             ESP_LOGI(TAG, "CLI connected (hello) — resetting wizard");
             wiz_public_state = PD_WIZARD_STATE_MATRIX_SIZE;
-            wiz_step = PD_STEP_MATRIX_SIZE;
+            wiz_step = PD_STEP_MULTI_PANEL;
+            wiz_multi_panel = false;
             wiz_menu_selected = 0;
             wiz_text_value[0] = '\0';
             wiz_wifi_scanned = false;
@@ -950,6 +1298,10 @@ static void wiz_process_command(const char *json_str)
                 ESP_LOGI(TAG, "reztest: KEEP combo %d — %s", idx, c->label);
                 wiz_config->matrix_width = c->width;
                 wiz_config->matrix_height = c->height;
+                wiz_config->panel_width = c->width;
+                wiz_config->panel_height = c->height;
+                wiz_config->panel_rows = 1;
+                wiz_config->panel_cols = 1;
                 wiz_config->scan_wiring = c->scan_wiring;
                 wiz_config->reztest_mode = false;
                 wiz_config->reztest_done = true;
@@ -1036,6 +1388,41 @@ static void wiz_process_command(const char *json_str)
         wiz_do_wifi_scan();
         wiz_send_state();
         wiz_render_display();
+    } else if (strcmp(cmd_str, "panel_layout_confirm") == 0) {
+        /* user confirmed the panel layout looks correct */
+        pd_display_test_stop();
+        wiz_go_next();
+    } else if (strcmp(cmd_str, "panel_select") == 0) {
+        cJSON *index = cJSON_GetObjectItem(root, "index");
+        if (cJSON_IsNumber(index)) {
+            pd_display_test_set_layout_selected(index->valueint);
+        }
+    } else if (strcmp(cmd_str, "test_pattern") == 0) {
+        cJSON *pattern = cJSON_GetObjectItem(root, "pattern");
+        cJSON *brightness = cJSON_GetObjectItem(root, "brightness");
+        if (cJSON_IsString(pattern)) {
+            pd_test_pattern_t p = PD_TEST_PATTERN_NONE;
+            if (strcmp(pattern->valuestring, "numbered_panels") == 0) p = PD_TEST_PATTERN_NUMBERED_PANELS;
+            else if (strcmp(pattern->valuestring, "checkerboard") == 0) p = PD_TEST_PATTERN_CHECKERBOARD_SCROLL;
+            else if (strcmp(pattern->valuestring, "arrow_chain") == 0) p = PD_TEST_PATTERN_ARROW_CHAIN;
+            else if (strcmp(pattern->valuestring, "bouncing_ball") == 0) p = PD_TEST_PATTERN_BOUNCING_BALL;
+            else if (strcmp(pattern->valuestring, "rgb_sweep") == 0) p = PD_TEST_PATTERN_RGB_SWEEP;
+            else if (strcmp(pattern->valuestring, "color_test") == 0) p = PD_TEST_PATTERN_COLOR_TEST;
+            else if (strcmp(pattern->valuestring, "panel_layout") == 0) p = PD_TEST_PATTERN_PANEL_LAYOUT;
+            else if (strcmp(pattern->valuestring, "off") == 0 || strcmp(pattern->valuestring, "none") == 0) p = PD_TEST_PATTERN_NONE;
+            if (cJSON_IsNumber(brightness) && brightness->valueint > 0)
+                pd_display_set_brightness((uint8_t)brightness->valueint);
+            if (p == PD_TEST_PATTERN_NONE) {
+                pd_display_test_stop();
+            } else {
+                pd_display_test_start(p, -1);
+            }
+            cJSON *ack = cJSON_CreateObject();
+            cJSON_AddStringToObject(ack, "type", "test_pattern_ack");
+            cJSON_AddStringToObject(ack, "pattern", pattern->valuestring);
+            cJSON_AddBoolToObject(ack, "running", p != PD_TEST_PATTERN_NONE);
+            wiz_send_json(ack);
+        }
     } else if (strcmp(cmd_str, "goodbye") == 0) {
         ESP_LOGI(TAG, "CLI disconnected (goodbye)");
         if (wiz_config && wiz_config->setup_complete) {
@@ -1051,6 +1438,9 @@ static void wiz_process_command(const char *json_str)
         } else {
             pd_display_render_boot_message();
         }
+    } else if (wiz_cmd_callback && wiz_public_state == PD_WIZARD_STATE_COMPLETE) {
+        /* forward unrecognised commands to external handler */
+        wiz_cmd_callback(json_str);
     }
 
     cJSON_Delete(root);

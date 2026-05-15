@@ -30,6 +30,10 @@ esp_err_t pd_wizard_start(pd_config_t *config);
 void pd_wizard_tick(void);
 bool pd_wizard_is_complete(void);
 
+/* callback for forwarding unrecognised serial JSON commands */
+typedef void (*pd_wizard_cmd_callback_t)(const char *json_str);
+void pd_wizard_set_cmd_callback(pd_wizard_cmd_callback_t cb);
+
 /* reztest: get display config for current combo index (for app-main display init) */
 bool pd_wizard_reztest_get_display(const pd_config_t *config, int *width, int *height, int *scan_wiring);
 

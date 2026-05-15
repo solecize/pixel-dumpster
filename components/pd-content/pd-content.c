@@ -15,6 +15,9 @@
 #include "lodepng.h"
 #include "pd-display.h"
 #include "pd-transition.h"
+#include "pd-network.h"
+#include "pd-discovery.h"
+#include "pd-config.h"
 
 static const char *TAG = "pd-content";
 
@@ -60,6 +63,13 @@ static int cached_height = 0;
 /* saved global defaults (restored when switching content) */
 static char saved_background[PD_CONTENT_MAX_PATH] = "#000000";
 static char saved_overlay[PD_CONTENT_MAX_PATH] = "";
+
+/* source-status overlay state (on-demand screen) */
+static int64_t status_overlay_until_us = 0;
+static int64_t status_last_render_us = 0;
+static char status_resume_path[PD_CONTENT_MAX_PATH] = "";
+static bool status_resume_was_playing = false;
+static bool status_overlay_just_expired = false;
 
 /* animated overlay state */
 static bool overlay_is_seq = false;
@@ -731,8 +741,50 @@ static esp_err_t content_setup_playback(const char *path, const char *full)
 
 esp_err_t pd_content_play(const char *path)
 {
+    /* cancel any active status overlay — explicit play request takes priority */
+    if (status_overlay_until_us > 0) {
+        status_overlay_until_us = 0;
+        status_resume_path[0] = '\0';
+        status_resume_was_playing = false;
+        status_overlay_just_expired = false;
+    }
+
     /* stop current playback immediately so tick() won't block us */
     content_playing = false;
+
+    /* Handle special system paths */
+    if (strcmp(path, "system/default") == 0) {
+        pd_display_render_default_marquee();
+        strlcpy(content_current, "system/default", sizeof(content_current));
+        content_is_seq = false;
+        content_frame = 0;
+        content_total_frames = 1;
+        content_playing = true;
+        ESP_LOGI(TAG, "displaying default marquee");
+        return ESP_OK;
+    }
+    if (strcmp(path, "system/idle") == 0) {
+        /* Display panel configuration screen - render with current settings */
+        const char *ip = pd_network_get_ip();
+        int dw = pd_display_get_width();
+        int dh = pd_display_get_height();
+        /* Call render_idle with current display dimensions and IP */
+        pd_display_render_idle(
+            "pixel-dumpster",  /* default name */
+            dw, dh,
+            0,  /* orientation */
+            0,  /* scan */
+            ip ? ip : "DHCP"
+        );
+        /* Mark as "playing" so status shows correctly */
+        strlcpy(content_current, "system/idle", sizeof(content_current));
+        content_is_seq = false;
+        content_frame = 0;
+        content_total_frames = 1;
+        content_playing = true;
+        ESP_LOGI(TAG, "displaying system idle screen");
+        return ESP_OK;
+    }
 
     char full[PD_CONTENT_MAX_PATH];
     snprintf(full, sizeof(full), "%s/%s", content_base, path);
@@ -744,7 +796,7 @@ esp_err_t pd_content_play(const char *path)
     }
 
     /* preload compositing cache before first frame */
-    update_compositing_cache(64, 64);
+    update_compositing_cache(pd_display_get_width(), pd_display_get_height());
 
     /* decode first frame into content_fb and display it */
     if (content_fb) {
@@ -782,6 +834,11 @@ esp_err_t pd_content_play(const char *path)
 esp_err_t pd_content_play_with_transition(const char *path, const char *transition,
                                           int duration_ms)
 {
+    /* Handle special system paths - they don't support transitions */
+    if (strncmp(path, "system/", 7) == 0) {
+        return pd_content_play(path);
+    }
+
     if (!content_transition || !content_fb) {
         return pd_content_play(path);
     }
@@ -807,7 +864,7 @@ esp_err_t pd_content_play_with_transition(const char *path, const char *transiti
     }
 
     /* preload compositing cache for new content */
-    update_compositing_cache(64, 64);
+    update_compositing_cache(pd_display_get_width(), pd_display_get_height());
 
     /* decode new content into "to" */
     if (!content_decode_first_frame(full, content_transition->to)) {
@@ -848,6 +905,33 @@ pd_content_status_t pd_content_get_status(void)
 void pd_content_tick(void)
 {
     int64_t now = esp_timer_get_time();
+
+    /* handle on-demand source-status overlay */
+    if (status_overlay_until_us > 0) {
+        if (now < status_overlay_until_us) {
+            /* still showing - re-render every 500ms to catch discovery state updates */
+            if (now - status_last_render_us > 500000) {
+                pd_content_render_source_status();
+                status_last_render_us = now;
+            }
+            return;
+        }
+        /* timer expired - restore previous state */
+        status_overlay_until_us = 0;
+        if (status_resume_was_playing && status_resume_path[0]) {
+            char path_copy[PD_CONTENT_MAX_PATH];
+            strlcpy(path_copy, status_resume_path, sizeof(path_copy));
+            status_resume_path[0] = '\0';
+            status_resume_was_playing = false;
+            pd_content_play(path_copy);
+            return;
+        }
+        status_resume_path[0] = '\0';
+        status_resume_was_playing = false;
+        /* signal app-main to render idle screen */
+        status_overlay_just_expired = true;
+        /* fall through to normal tick (no-op since not playing) */
+    }
 
     /* drive active transition */
     if (content_transition && pd_transition_is_active(content_transition)) {
@@ -1084,6 +1168,35 @@ static esp_err_t http_content_stop(httpd_req_t *req)
     return ESP_OK;
 }
 
+static esp_err_t http_status_show(httpd_req_t *req)
+{
+    int duration_ms = 5000;
+
+    /* Read optional JSON body: {"duration_ms": N} */
+    int content_len = req->content_len;
+    if (content_len > 0 && content_len < 256) {
+        char buf[256];
+        int received = httpd_req_recv(req, buf, content_len);
+        if (received > 0) {
+            buf[received] = '\0';
+            cJSON *root = cJSON_Parse(buf);
+            if (root) {
+                cJSON *dur = cJSON_GetObjectItem(root, "duration_ms");
+                if (cJSON_IsNumber(dur)) {
+                    duration_ms = dur->valueint;
+                }
+                cJSON_Delete(root);
+            }
+        }
+    }
+
+    pd_content_show_source_status_for(duration_ms);
+
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, "{\"ok\":true}", HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+}
+
 static esp_err_t http_content_status(httpd_req_t *req)
 {
     pd_content_status_t s = pd_content_get_status();
@@ -1212,7 +1325,27 @@ static esp_err_t http_config_set(httpd_req_t *req)
             content_config.attract_idle_timeout_ms = idle->valueint;
     }
 
-    /* optionally save to disk */
+    /* device config fields (optional partial update) */
+    pd_config_t *cfg = pd_config_get_active();
+    if (cfg) {
+        cJSON *dev_name = cJSON_GetObjectItem(root, "device_name");
+        cJSON *wifi_ssid = cJSON_GetObjectItem(root, "wifi_ssid");
+        cJSON *wifi_password = cJSON_GetObjectItem(root, "wifi_password");
+        if (cJSON_IsString(dev_name)) {
+            strlcpy(cfg->device_name, dev_name->valuestring, sizeof(cfg->device_name));
+        }
+        if (cJSON_IsString(wifi_ssid)) {
+            strlcpy(cfg->wifi_ssid, wifi_ssid->valuestring, sizeof(cfg->wifi_ssid));
+        }
+        if (cJSON_IsString(wifi_password)) {
+            strlcpy(cfg->wifi_password, wifi_password->valuestring, sizeof(cfg->wifi_password));
+        }
+        if (dev_name || wifi_ssid || wifi_password) {
+            pd_config_save(cfg);
+        }
+    }
+
+    /* optionally save content config to disk */
     cJSON *save = cJSON_GetObjectItem(root, "save");
     bool do_save = cJSON_IsTrue(save);
     cJSON_Delete(root);
@@ -1242,36 +1375,331 @@ static esp_err_t http_content_upload(httpd_req_t *req)
     }
 
     int total = req->content_len;
-    if (total <= 0 || total > 512 * 1024) {
+    if (total <= 0 || total > 2 * 1024 * 1024) {
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "invalid content length");
         return ESP_FAIL;
     }
 
-    uint8_t *data = malloc(total);
-    if (!data) {
+    /* Stream to storage in chunks to avoid large RAM allocation */
+    #define CHUNK_SIZE 8192
+    uint8_t *chunk = malloc(CHUNK_SIZE);
+    if (!chunk) {
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "out of memory");
         return ESP_FAIL;
     }
 
-    int received = 0;
-    while (received < total) {
-        int ret = httpd_req_recv(req, (char *)data + received, total - received);
-        if (ret <= 0) {
-            free(data);
-            httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "receive failed");
-            return ESP_FAIL;
+    /* Ensure parent directories exist */
+    char full_path[PD_CONTENT_MAX_PATH + 32];
+    snprintf(full_path, sizeof(full_path), "%s/%s", content_base, rel_path);
+    
+    char dir[PD_CONTENT_MAX_PATH];
+    strlcpy(dir, full_path, sizeof(dir));
+    char *last_slash = strrchr(dir, '/');
+    if (last_slash) {
+        *last_slash = '\0';
+        /* create nested dirs one level at a time */
+        for (char *p = dir + strlen(content_base) + 1; *p; p++) {
+            if (*p == '/') {
+                *p = '\0';
+                ensure_dir(dir);
+                *p = '/';
+            }
         }
+        ensure_dir(dir);
+    }
+    
+    /* Open file for writing */
+    FILE *f = fopen(full_path, "wb");
+    if (!f) {
+        free(chunk);
+        ESP_LOGE(TAG, "upload: cannot create file: %s", full_path);
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "cannot create file");
+        return ESP_FAIL;
+    }
+
+    int received = 0;
+    esp_err_t err = ESP_OK;
+    
+    while (received < total) {
+        int to_recv = (total - received) < CHUNK_SIZE ? (total - received) : CHUNK_SIZE;
+        int ret = httpd_req_recv(req, (char *)chunk, to_recv);
+        if (ret <= 0) {
+            err = ESP_FAIL;
+            ESP_LOGE(TAG, "upload: receive failed at %d/%d", received, total);
+            break;
+        }
+        
+        size_t written = fwrite(chunk, 1, ret, f);
+        if (written != (size_t)ret) {
+            err = ESP_FAIL;
+            ESP_LOGE(TAG, "upload: write failed at %d/%d", received, total);
+            break;
+        }
+        
         received += ret;
     }
 
-    esp_err_t err = pd_content_store_file(rel_path, data, total);
-    free(data);
+    fflush(f);
+    fclose(f);
+    free(chunk);
 
     if (err != ESP_OK) {
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "store failed");
         return ESP_FAIL;
     }
+    
+    ESP_LOGI(TAG, "uploaded: %s (%d bytes)", rel_path, received);
 
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, "{\"ok\":true}", HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+}
+
+static esp_err_t http_layout_get(httpd_req_t *req)
+{
+    cJSON *root = cJSON_CreateObject();
+    cJSON_AddNumberToObject(root, "panel_width", pd_display_get_panel_width());
+    cJSON_AddNumberToObject(root, "panel_height", pd_display_get_panel_height());
+    cJSON_AddNumberToObject(root, "panel_rows", pd_display_get_panel_rows());
+    cJSON_AddNumberToObject(root, "panel_cols", pd_display_get_panel_cols());
+    cJSON_AddNumberToObject(root, "chain_pattern", pd_display_get_chain_pattern());
+    cJSON_AddNumberToObject(root, "panel_rotation_deg", pd_display_get_rotation_deg());
+    cJSON_AddNumberToObject(root, "color_order", pd_display_get_color_order());
+    cJSON_AddNumberToObject(root, "matrix_width", pd_display_get_width());
+    cJSON_AddNumberToObject(root, "matrix_height", pd_display_get_height());
+
+    pd_config_t *cfg = pd_config_get_active();
+    if (cfg) {
+        cJSON_AddStringToObject(root, "device_name", cfg->device_name);
+        cJSON_AddStringToObject(root, "wifi_ssid", cfg->wifi_ssid);
+        cJSON_AddStringToObject(root, "hostname", cfg->hostname);
+    }
+
+    char *json = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, json, HTTPD_RESP_USE_STRLEN);
+    free(json);
+    return ESP_OK;
+}
+
+static esp_err_t http_layout_set(httpd_req_t *req)
+{
+    char buf[512];
+    int len = httpd_req_recv(req, buf, sizeof(buf) - 1);
+    if (len <= 0) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "missing body");
+        return ESP_FAIL;
+    }
+    buf[len] = '\0';
+
+    cJSON *root = cJSON_Parse(buf);
+    if (!root) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "invalid JSON");
+        return ESP_FAIL;
+    }
+
+    pd_config_t *cfg = pd_config_get_active();
+    if (!cfg) {
+        cJSON_Delete(root);
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "config not active");
+        return ESP_FAIL;
+    }
+
+    cJSON *item = cJSON_GetObjectItem(root, "panel_width");
+    if (cJSON_IsNumber(item)) cfg->panel_width = item->valueint;
+    item = cJSON_GetObjectItem(root, "panel_height");
+    if (cJSON_IsNumber(item)) cfg->panel_height = item->valueint;
+    item = cJSON_GetObjectItem(root, "panel_rows");
+    if (cJSON_IsNumber(item)) cfg->panel_rows = item->valueint;
+    item = cJSON_GetObjectItem(root, "panel_cols");
+    if (cJSON_IsNumber(item)) cfg->panel_cols = item->valueint;
+    item = cJSON_GetObjectItem(root, "chain_pattern");
+    if (cJSON_IsNumber(item)) cfg->chain_pattern = item->valueint;
+    item = cJSON_GetObjectItem(root, "panel_rotation_deg");
+    if (cJSON_IsNumber(item)) cfg->panel_rotation_deg = item->valueint;
+    item = cJSON_GetObjectItem(root, "color_order");
+    if (cJSON_IsNumber(item)) cfg->color_order = item->valueint;
+
+    /* recompute virtual canvas
+     * With 90/270° rotation the driver swaps physical width and height:
+     *   virtual_w = panel_h * rows,  virtual_h = panel_w * cols
+     * Without rotation:
+     *   virtual_w = panel_w * cols,  virtual_h = panel_h * rows
+     */
+    if (cfg->panel_rotation_deg == 90 || cfg->panel_rotation_deg == 270) {
+        cfg->matrix_width  = cfg->panel_height * cfg->panel_rows;
+        cfg->matrix_height = cfg->panel_width  * cfg->panel_cols;
+    } else {
+        cfg->matrix_width  = cfg->panel_width  * cfg->panel_cols;
+        cfg->matrix_height = cfg->panel_height * cfg->panel_rows;
+    }
+
+    pd_config_save(cfg);
+    cJSON_Delete(root);
+
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, "{\"ok\":true,\"reboot\":true}", HTTPD_RESP_USE_STRLEN);
+
+    /* reboot after a short delay so the response can be sent */
+    vTaskDelay(pdMS_TO_TICKS(300));
+    esp_restart();
+    return ESP_OK;
+}
+
+/* Live preview: apply layout changes without saving or rebooting.
+ * Mutates the active in-memory config and reinitialises the driver.
+ * Changes are lost on reboot (the last saved config is restored). */
+static esp_err_t http_config_preview(httpd_req_t *req)
+{
+    char buf[512];
+    int len = httpd_req_recv(req, buf, sizeof(buf) - 1);
+    if (len <= 0) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "missing body");
+        return ESP_FAIL;
+    }
+    buf[len] = '\0';
+
+    cJSON *root = cJSON_Parse(buf);
+    if (!root) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "invalid JSON");
+        return ESP_FAIL;
+    }
+
+    pd_config_t *cfg = pd_config_get_active();
+    if (!cfg) {
+        cJSON_Delete(root);
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "config not active");
+        return ESP_FAIL;
+    }
+
+    cJSON *item = cJSON_GetObjectItem(root, "panel_width");
+    if (cJSON_IsNumber(item)) cfg->panel_width = item->valueint;
+    item = cJSON_GetObjectItem(root, "panel_height");
+    if (cJSON_IsNumber(item)) cfg->panel_height = item->valueint;
+    item = cJSON_GetObjectItem(root, "panel_rows");
+    if (cJSON_IsNumber(item)) cfg->panel_rows = item->valueint;
+    item = cJSON_GetObjectItem(root, "panel_cols");
+    if (cJSON_IsNumber(item)) cfg->panel_cols = item->valueint;
+    item = cJSON_GetObjectItem(root, "chain_pattern");
+    if (cJSON_IsNumber(item)) cfg->chain_pattern = item->valueint;
+    item = cJSON_GetObjectItem(root, "panel_rotation_deg");
+    if (cJSON_IsNumber(item)) cfg->panel_rotation_deg = item->valueint;
+    item = cJSON_GetObjectItem(root, "color_order");
+    if (cJSON_IsNumber(item)) cfg->color_order = item->valueint;
+
+    /* recompute virtual canvas */
+    if (cfg->panel_rotation_deg == 90 || cfg->panel_rotation_deg == 270) {
+        cfg->matrix_width  = cfg->panel_height * cfg->panel_rows;
+        cfg->matrix_height = cfg->panel_width  * cfg->panel_cols;
+    } else {
+        cfg->matrix_width  = cfg->panel_width  * cfg->panel_cols;
+        cfg->matrix_height = cfg->panel_height * cfg->panel_rows;
+    }
+
+    pd_display_config_t display_config = {
+        .panel_width    = cfg->panel_width,
+        .panel_height   = cfg->panel_height,
+        .panel_rows     = cfg->panel_rows,
+        .panel_cols     = cfg->panel_cols,
+        .chain_pattern  = cfg->chain_pattern,
+        .rotation_deg   = cfg->panel_rotation_deg,
+        .scan_wiring    = cfg->scan_wiring,
+        .color_order    = cfg->color_order,
+    };
+    esp_err_t err = pd_display_reinit(&display_config);
+    cJSON_Delete(root);
+
+    if (err == ESP_ERR_NOT_SUPPORTED) {
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_send(req, "{\"ok\":false,\"error\":\"Layout preview requires reboot on this hardware\"}", HTTPD_RESP_USE_STRLEN);
+        return ESP_OK;
+    }
+    if (err != ESP_OK) {
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_send(req, "{\"ok\":false,\"error\":\"reinit failed\"}", HTTPD_RESP_USE_STRLEN);
+        return ESP_FAIL;
+    }
+
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, "{\"ok\":true}", HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+}
+
+static esp_err_t http_test_start(httpd_req_t *req)
+{
+    char buf[256];
+    int len = httpd_req_recv(req, buf, sizeof(buf) - 1);
+    if (len <= 0) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "missing body");
+        return ESP_FAIL;
+    }
+    buf[len] = '\0';
+
+    cJSON *root = cJSON_Parse(buf);
+    if (!root) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "invalid JSON");
+        return ESP_FAIL;
+    }
+
+    cJSON *pattern = cJSON_GetObjectItem(root, "pattern");
+    cJSON *brightness = cJSON_GetObjectItem(root, "brightness");
+    if (!cJSON_IsString(pattern)) {
+        cJSON_Delete(root);
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "pattern required");
+        return ESP_FAIL;
+    }
+
+    pd_test_pattern_t p = pd_display_test_pattern_from_name(pattern->valuestring);
+    if (p == PD_TEST_PATTERN_NONE) {
+        cJSON_Delete(root);
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "unknown pattern");
+        return ESP_FAIL;
+    }
+
+    if (cJSON_IsNumber(brightness) && brightness->valueint > 0)
+        pd_display_set_brightness((uint8_t)brightness->valueint);
+    pd_display_test_start(p, -1);  /* run indefinitely until stopped */
+
+    cJSON_Delete(root);
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, "{\"ok\":true}", HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+}
+
+static esp_err_t http_test_stop(httpd_req_t *req)
+{
+    pd_display_test_stop();
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, "{\"ok\":true}", HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+}
+
+static esp_err_t http_test_panel_select(httpd_req_t *req)
+{
+    char buf[128];
+    int len = httpd_req_recv(req, buf, sizeof(buf) - 1);
+    if (len <= 0) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "missing body");
+        return ESP_FAIL;
+    }
+    buf[len] = '\0';
+
+    cJSON *root = cJSON_Parse(buf);
+    if (!root) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "invalid JSON");
+        return ESP_FAIL;
+    }
+
+    cJSON *idx = cJSON_GetObjectItem(root, "panel_index");
+    if (!cJSON_IsNumber(idx)) {
+        cJSON_Delete(root);
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "panel_index required");
+        return ESP_FAIL;
+    }
+
+    pd_display_test_set_layout_selected(idx->valueint);
+    cJSON_Delete(root);
     httpd_resp_set_type(req, "application/json");
     httpd_resp_send(req, "{\"ok\":true}", HTTPD_RESP_USE_STRLEN);
     return ESP_OK;
@@ -1299,6 +1727,11 @@ esp_err_t pd_content_register_http(httpd_handle_t server)
         .method = HTTP_GET,
         .handler = http_content_status
     };
+    httpd_uri_t status_show_uri = {
+        .uri = "/api/status/show",
+        .method = HTTP_POST,
+        .handler = http_status_show
+    };
     httpd_uri_t upload_uri = {
         .uri = "/api/upload",
         .method = HTTP_POST,
@@ -1314,15 +1747,113 @@ esp_err_t pd_content_register_http(httpd_handle_t server)
         .method = HTTP_POST,
         .handler = http_config_set
     };
+    httpd_uri_t layout_get_uri = {
+        .uri = "/api/config/layout",
+        .method = HTTP_GET,
+        .handler = http_layout_get
+    };
+    httpd_uri_t layout_set_uri = {
+        .uri = "/api/config/layout",
+        .method = HTTP_POST,
+        .handler = http_layout_set
+    };
+    httpd_uri_t config_preview_uri = {
+        .uri = "/api/config/preview",
+        .method = HTTP_POST,
+        .handler = http_config_preview
+    };
+    httpd_uri_t test_start_uri = {
+        .uri = "/api/test/start",
+        .method = HTTP_POST,
+        .handler = http_test_start
+    };
+    httpd_uri_t test_stop_uri = {
+        .uri = "/api/test/stop",
+        .method = HTTP_POST,
+        .handler = http_test_stop
+    };
+    httpd_uri_t test_panel_select_uri = {
+        .uri = "/api/test/panel_select",
+        .method = HTTP_POST,
+        .handler = http_test_panel_select
+    };
 
     httpd_register_uri_handler(server, &list_uri);
     httpd_register_uri_handler(server, &play_uri);
     httpd_register_uri_handler(server, &stop_uri);
     httpd_register_uri_handler(server, &status_uri);
+    httpd_register_uri_handler(server, &status_show_uri);
     httpd_register_uri_handler(server, &upload_uri);
     httpd_register_uri_handler(server, &config_get_uri);
     httpd_register_uri_handler(server, &config_set_uri);
+    httpd_register_uri_handler(server, &layout_get_uri);
+    httpd_register_uri_handler(server, &layout_set_uri);
+    httpd_register_uri_handler(server, &config_preview_uri);
+    httpd_register_uri_handler(server, &test_start_uri);
+    httpd_register_uri_handler(server, &test_stop_uri);
+    httpd_register_uri_handler(server, &test_panel_select_uri);
 
     ESP_LOGI(TAG, "HTTP endpoints registered");
     return ESP_OK;
+}
+
+void pd_content_show_source_status_for(int duration_ms)
+{
+    if (duration_ms <= 0) duration_ms = 5000;
+
+    /* Only snapshot resume state if we're not already overlaying */
+    if (status_overlay_until_us == 0) {
+        status_resume_was_playing = content_playing;
+        if (content_playing && content_current[0]) {
+            strlcpy(status_resume_path, content_current, sizeof(status_resume_path));
+        } else {
+            status_resume_path[0] = '\0';
+            status_resume_was_playing = false;
+        }
+    }
+
+    /* pause any ongoing content rendering */
+    content_playing = false;
+
+    /* render immediately and set timer */
+    pd_content_render_source_status();
+    status_last_render_us = esp_timer_get_time();
+    status_overlay_until_us = status_last_render_us + (int64_t)duration_ms * 1000;
+    status_overlay_just_expired = false;
+}
+
+bool pd_content_status_overlay_just_expired(void)
+{
+    if (status_overlay_just_expired) {
+        status_overlay_just_expired = false;
+        return true;
+    }
+    return false;
+}
+
+bool pd_content_status_overlay_active(void)
+{
+    return status_overlay_until_us > 0;
+}
+
+void pd_content_render_source_status(void)
+{
+    int state = pd_discovery_get_state();
+    pd_marquee_source_t *source = pd_discovery_get_active_source();
+    
+    if (!source || state == 0) {
+        // No source connected - show searching message
+        pd_display_render_no_source();
+    } else {
+        // Show source information
+        pd_display_render_source_status(
+            state,
+            source->hostname,
+            source->ip,
+            source->es_version,
+            source->browsing_events,
+            source->launch_events,
+            source->event_methods
+        );
+    }
 }

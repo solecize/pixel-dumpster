@@ -1,0 +1,48 @@
+{
+  "device": {
+    "host": "YOUR_DEVICE_IP",
+    "port": 8088
+  },
+  "transport": "wifi",
+  "es": {
+    "gamelists_path": "~/.emulationstation/gamelists",
+    "roms_path": "~/RetroPie/roms"
+  },
+  "fifo": "/tmp/dumpster-diver.fifo",
+  "marquee": {
+    "directories": [
+      {
+        "path": "/home/pi/marquee-custom",
+        "priority": 1,
+        "enabled": true,
+        "description": "Custom/animated marquees - highest priority"
+      },
+      {
+        "path": "/home/pi/PieMarquee2/marquee",
+        "priority": 2,
+        "enabled": true,
+        "description": "PieMarquee2 default library - fallback"
+      }
+    ],
+    "device_prefix": "marquees",
+    "auto_upload": true,
+    "upload_cache": "/tmp/dumpster-diver-cache.json",
+    "system_folder": "system"
+  },
+  "defaults": {
+    "system_fallback": "images/systems/default.png",
+    "game_fallback": "images/games/default.png",
+    "transition": "fade",
+    "duration_ms": 800
+  },
+  "events": {
+    "game_select": true,
+    "game_launch": true,
+    "game_end": true,
+    "system_select": true
+  },
+  "api": {
+    "enabled": true,
+    "port": 7070
+  }
+}

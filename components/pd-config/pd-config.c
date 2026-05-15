@@ -11,6 +11,7 @@
 
 static const char *TAG = "pd-config";
 static const char *PD_CONFIG_FILENAME = "config.json";
+static pd_config_t *s_active_config = NULL;
 
 static void pd_config_build_path(char *path, size_t length)
 {
@@ -28,6 +29,14 @@ static void pd_config_set_defaults(pd_config_t *config)
     config->matrix_height = 64;
     config->orientation_deg = 0;
     config->scan_wiring = 0;
+    /* default to single 64x64 panel — matches matrix_width/height above */
+    config->panel_width = 64;
+    config->panel_height = 64;
+    config->panel_rows = 1;
+    config->panel_cols = 1;
+    config->chain_pattern = 0;          /* HORIZONTAL */
+    config->panel_rotation_deg = 0;
+    config->color_order = 0;             /* RGB */
     config->wifi_ssid[0] = '\0';
     config->wifi_password[0] = '\0';
     strncpy(config->device_name, "pixel-dumpster", sizeof(config->device_name) - 1);
@@ -113,6 +122,15 @@ esp_err_t pd_config_load(pd_config_t *config)
     cJSON *reztest_index = cJSON_GetObjectItem(root, "reztest_index");
     cJSON *config_version = cJSON_GetObjectItem(root, "config_version");
 
+    /* multi-panel layout fields (may be absent on legacy configs) */
+    cJSON *panel_width  = cJSON_GetObjectItem(root, "panel_width");
+    cJSON *panel_height = cJSON_GetObjectItem(root, "panel_height");
+    cJSON *panel_rows   = cJSON_GetObjectItem(root, "panel_rows");
+    cJSON *panel_cols   = cJSON_GetObjectItem(root, "panel_cols");
+    cJSON *chain_pattern = cJSON_GetObjectItem(root, "chain_pattern");
+    cJSON *panel_rotation = cJSON_GetObjectItem(root, "panel_rotation_deg");
+    cJSON *color_order = cJSON_GetObjectItem(root, "color_order");
+
     if (cJSON_IsNumber(matrix_width)) {
         config->matrix_width = matrix_width->valueint;
     }
@@ -124,6 +142,49 @@ esp_err_t pd_config_load(pd_config_t *config)
     }
     if (cJSON_IsNumber(scan_wiring)) {
         config->scan_wiring = scan_wiring->valueint;
+    }
+
+    bool have_panel_fields = false;
+    if (cJSON_IsNumber(panel_width) && panel_width->valueint > 0) {
+        config->panel_width = panel_width->valueint;
+        have_panel_fields = true;
+    }
+    if (cJSON_IsNumber(panel_height) && panel_height->valueint > 0) {
+        config->panel_height = panel_height->valueint;
+        have_panel_fields = true;
+    }
+    if (cJSON_IsNumber(panel_rows) && panel_rows->valueint > 0) {
+        config->panel_rows = panel_rows->valueint;
+        have_panel_fields = true;
+    }
+    if (cJSON_IsNumber(panel_cols) && panel_cols->valueint > 0) {
+        config->panel_cols = panel_cols->valueint;
+        have_panel_fields = true;
+    }
+    if (cJSON_IsNumber(chain_pattern)) {
+        config->chain_pattern = chain_pattern->valueint;
+        have_panel_fields = true;
+    }
+    if (cJSON_IsNumber(panel_rotation)) {
+        config->panel_rotation_deg = panel_rotation->valueint;
+        have_panel_fields = true;
+    }
+    if (cJSON_IsNumber(color_order)) {
+        config->color_order = color_order->valueint;
+    }
+
+    /* Migration: legacy configs only stored matrix_width/height + orientation_deg.
+     * Treat them as a single-panel deployment so the new driver glue keeps working
+     * without forcing the user to re-run the wizard. */
+    if (!have_panel_fields) {
+        config->panel_width        = (config->matrix_width  > 0) ? config->matrix_width  : 64;
+        config->panel_height       = (config->matrix_height > 0) ? config->matrix_height : 64;
+        config->panel_rows         = 1;
+        config->panel_cols         = 1;
+        config->chain_pattern      = 0; /* HORIZONTAL */
+        config->panel_rotation_deg = config->orientation_deg;
+        ESP_LOGI(TAG, "migrated legacy config: %dx%d single panel, rotation %d",
+                 config->panel_width, config->panel_height, config->panel_rotation_deg);
     }
     if (cJSON_IsString(wifi_ssid)) {
         strlcpy(config->wifi_ssid, wifi_ssid->valuestring, sizeof(config->wifi_ssid));
@@ -184,6 +245,13 @@ esp_err_t pd_config_save(const pd_config_t *config)
     cJSON_AddNumberToObject(root, "matrix_height", config->matrix_height);
     cJSON_AddNumberToObject(root, "orientation_deg", config->orientation_deg);
     cJSON_AddNumberToObject(root, "scan_wiring", config->scan_wiring);
+    cJSON_AddNumberToObject(root, "panel_width", config->panel_width);
+    cJSON_AddNumberToObject(root, "panel_height", config->panel_height);
+    cJSON_AddNumberToObject(root, "panel_rows", config->panel_rows);
+    cJSON_AddNumberToObject(root, "panel_cols", config->panel_cols);
+    cJSON_AddNumberToObject(root, "chain_pattern", config->chain_pattern);
+    cJSON_AddNumberToObject(root, "panel_rotation_deg", config->panel_rotation_deg);
+    cJSON_AddNumberToObject(root, "color_order", config->color_order);
     cJSON_AddStringToObject(root, "wifi_ssid", config->wifi_ssid);
     cJSON_AddStringToObject(root, "wifi_password", config->wifi_password);
     cJSON_AddStringToObject(root, "device_name", config->device_name);
@@ -220,5 +288,15 @@ esp_err_t pd_config_save(const pd_config_t *config)
 
     ESP_LOGI(TAG, "config saved to %s", path);
     return ESP_OK;
+}
+
+void pd_config_set_active(pd_config_t *config)
+{
+    s_active_config = config;
+}
+
+pd_config_t *pd_config_get_active(void)
+{
+    return s_active_config;
 }
 

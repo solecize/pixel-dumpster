@@ -24,7 +24,7 @@
 #define MAX_ENTRIES  64
 #define MAX_PATH_LEN 512
 #define MAX_NAME_LEN 128
-#define HTTP_PORT    8088
+static int g_port = 8088;
 
 /* ---- data types ---- */
 
@@ -253,6 +253,27 @@ static int scan_local_images(const char *content_dir, content_entry_t *entries, 
     return count;
 }
 
+/* ---- URL encoding ---- */
+
+static void url_encode(const char *src, char *dst, size_t dst_sz)
+{
+    static const char hex[] = "0123456789ABCDEF";
+    size_t j = 0;
+    for (size_t i = 0; src[i] && j < dst_sz - 3; i++) {
+        unsigned char c = (unsigned char)src[i];
+        if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+            (c >= '0' && c <= '9') || c == '-' || c == '_' ||
+            c == '.' || c == '~' || c == '/') {
+            dst[j++] = c;
+        } else {
+            dst[j++] = '%';
+            dst[j++] = hex[c >> 4];
+            dst[j++] = hex[c & 0x0F];
+        }
+    }
+    dst[j] = '\0';
+}
+
 /* ---- sync ---- */
 
 static void collect_files(const char *base, const char *rel, char files[][MAX_PATH_LEN], int *count, int max)
@@ -316,10 +337,9 @@ static int sync_content(const char *host, const char *content_dir)
         snprintf(local_path, sizeof(local_path), "%s/%s", base, files[i]);
 
         char url[MAX_PATH_LEN];
-        /* URL-encode the path (simple: just replace spaces) */
         char encoded[MAX_PATH_LEN];
-        strlcpy(encoded, rel_content, sizeof(encoded));
-        snprintf(url, sizeof(url), "http://%s:%d/api/upload?path=%s", host, HTTP_PORT, encoded);
+        url_encode(rel_content, encoded, sizeof(encoded));
+        snprintf(url, sizeof(url), "http://%s:%d/api/upload?path=%s", host, g_port, encoded);
 
         /* progress bar */
         int pct = (i + 1) * 100 / file_count;
@@ -359,7 +379,7 @@ static void interactive_mode(const char *host, const char *content_dir)
 
     while (running) {
         clear();
-        mvprintw(0, 0, "Pixel Dumpster Content  [%s:%d]", host, HTTP_PORT);
+        mvprintw(0, 0, "Pixel Dumpster Content  [%s:%d]", host, g_port);
         mvprintw(1, 0, "Up/Down: select  Enter: play  s: sync  x: stop  q: quit");
 
         if (playing) {
@@ -404,7 +424,7 @@ static void interactive_mode(const char *host, const char *content_dir)
                     char body[MAX_PATH_LEN];
                     snprintf(body, sizeof(body), "{\"path\":\"%s\"}", entries[selected].path);
                     char url[MAX_PATH_LEN];
-                    snprintf(url, sizeof(url), "http://%s:%d/api/play", host, HTTP_PORT);
+                    snprintf(url, sizeof(url), "http://%s:%d/api/play", host, g_port);
 
                     nodelay(stdscr, TRUE);
                     mvprintw(LINES - 1, 0, "Sending play command...");
@@ -426,7 +446,7 @@ static void interactive_mode(const char *host, const char *content_dir)
                 break;
             case 'x': case 'X': {
                 char url[MAX_PATH_LEN];
-                snprintf(url, sizeof(url), "http://%s:%d/api/stop", host, HTTP_PORT);
+                snprintf(url, sizeof(url), "http://%s:%d/api/stop", host, g_port);
                 char *resp = http_post(url, "{}");
                 free(resp);
                 playing = false;
@@ -459,6 +479,7 @@ static void usage(const char *prog)
 {
     fprintf(stderr, "Usage: %s --host <ip> [options]\n", prog);
     fprintf(stderr, "  --host <ip>       Device IP address\n");
+    fprintf(stderr, "  --port <port>     Device port (default: 8088)\n");
     fprintf(stderr, "  --content <dir>   Content directory (default: ./content)\n");
     fprintf(stderr, "  --sync            Sync local content to device\n");
     fprintf(stderr, "  --list            List content on device\n");
@@ -471,6 +492,7 @@ int main(int argc, char **argv)
 {
     char host[128] = "";
     char content_dir[MAX_PATH_LEN] = "./content";
+    int port_arg = 0;
     bool do_sync = false;
     bool do_list = false;
     bool do_stop = false;
@@ -479,6 +501,8 @@ int main(int argc, char **argv)
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--host") == 0 && i + 1 < argc) {
             strlcpy(host, argv[++i], sizeof(host));
+        } else if (strcmp(argv[i], "--port") == 0 && i + 1 < argc) {
+            port_arg = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--content") == 0 && i + 1 < argc) {
             strlcpy(content_dir, argv[++i], sizeof(content_dir));
         } else if (strcmp(argv[i], "--sync") == 0) {
@@ -505,6 +529,8 @@ int main(int argc, char **argv)
         return 1;
     }
 
+    if (port_arg > 0) g_port = port_arg;
+
     curl_global_init(CURL_GLOBAL_ALL);
 
     bool did_command = false;
@@ -516,7 +542,7 @@ int main(int argc, char **argv)
 
     if (do_list) {
         char url[MAX_PATH_LEN];
-        snprintf(url, sizeof(url), "http://%s:%d/api/content", host, HTTP_PORT);
+        snprintf(url, sizeof(url), "http://%s:%d/api/content", host, g_port);
         char *resp = http_get(url);
         if (resp) {
             printf("%s\n", resp);
@@ -531,7 +557,7 @@ int main(int argc, char **argv)
         char body[MAX_PATH_LEN];
         snprintf(body, sizeof(body), "{\"path\":\"%s\"}", play_path);
         char url[MAX_PATH_LEN];
-        snprintf(url, sizeof(url), "http://%s:%d/api/play", host, HTTP_PORT);
+        snprintf(url, sizeof(url), "http://%s:%d/api/play", host, g_port);
         char *resp = http_post(url, body);
         if (resp) {
             printf("Playing: %s\n", play_path);
@@ -544,7 +570,7 @@ int main(int argc, char **argv)
 
     if (do_stop) {
         char url[MAX_PATH_LEN];
-        snprintf(url, sizeof(url), "http://%s:%d/api/stop", host, HTTP_PORT);
+        snprintf(url, sizeof(url), "http://%s:%d/api/stop", host, g_port);
         char *resp = http_post(url, "{}");
         if (resp) {
             printf("Playback stopped\n");

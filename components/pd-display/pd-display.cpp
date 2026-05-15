@@ -12,10 +12,43 @@
 static const char *TAG = "pd-display";
 static Hub75Driver *pd_display_driver = nullptr;
 static Hub75Config pd_display_hub75_config = {};
-static int pd_display_current_orientation = 0;
+/* Currently active layout (mirrors what was used to instantiate the driver). */
+static int pd_display_current_panel_width = 0;
+static int pd_display_current_panel_height = 0;
+static int pd_display_current_panel_rows = 1;
+static int pd_display_current_panel_cols = 1;
+static int pd_display_current_chain_pattern = 0;
+static int pd_display_current_rotation = 0;
+static int pd_display_current_scan = 0;
+static int pd_display_current_color_order = 0;
+/* Virtual canvas dimensions after rotation/tile (what the framebuffer logically is). */
 static int pd_display_current_width = 0;
 static int pd_display_current_height = 0;
-static int pd_display_current_scan = 0;
+static uint8_t pd_display_current_brightness = 96;
+
+/* Map logical RGB to wire-order RGB based on color_order:
+ * 0=RGB -> (r,g,b)
+ * 1=BGR -> (b,g,r)
+ * 2=GRB -> (g,r,b)
+ * 3=BRG -> (b,r,g)  (common on some panels) */
+static void pd_display_map_color(uint8_t lr, uint8_t lg, uint8_t lb,
+                                  uint8_t *out_r, uint8_t *out_g, uint8_t *out_b)
+{
+    switch (pd_display_current_color_order) {
+        case 1:  /* BGR */
+            *out_r = lb; *out_g = lg; *out_b = lr;
+            break;
+        case 2:  /* GRB */
+            *out_r = lg; *out_g = lr; *out_b = lb;
+            break;
+        case 3:  /* BRG */
+            *out_r = lb; *out_g = lr; *out_b = lg;
+            break;
+        default: /* RGB */
+            *out_r = lr; *out_g = lg; *out_b = lb;
+            break;
+    }
+}
 
 #define PD_FONT_W 5
 #define PD_FONT_H 7
@@ -273,7 +306,27 @@ static Hub75ScanWiring pd_display_scan_wiring_from_int(int val)
     }
 }
 
-static esp_err_t pd_display_start_driver(int width, int height, int orientation_deg, int scan_wiring)
+static Hub75PanelLayout pd_display_layout_from_int(int val)
+{
+    switch (val) {
+        case 1: return Hub75PanelLayout::TOP_LEFT_DOWN;
+        case 2: return Hub75PanelLayout::TOP_RIGHT_DOWN;
+        case 3: return Hub75PanelLayout::BOTTOM_LEFT_UP;
+        case 4: return Hub75PanelLayout::BOTTOM_RIGHT_UP;
+        case 5: return Hub75PanelLayout::TOP_LEFT_DOWN_ZIGZAG;
+        case 6: return Hub75PanelLayout::TOP_RIGHT_DOWN_ZIGZAG;
+        case 7: return Hub75PanelLayout::BOTTOM_LEFT_UP_ZIGZAG;
+        case 8: return Hub75PanelLayout::BOTTOM_RIGHT_UP_ZIGZAG;
+        case 0:
+        default: return Hub75PanelLayout::HORIZONTAL;
+    }
+}
+
+static esp_err_t pd_display_start_driver(int panel_w, int panel_h,
+                                         int panel_rows, int panel_cols,
+                                         int chain_pattern,
+                                         int rotation_deg, int scan_wiring,
+                                         int color_order)
 {
     if (pd_display_driver) {
         pd_display_driver->end();
@@ -281,32 +334,54 @@ static esp_err_t pd_display_start_driver(int width, int height, int orientation_
         pd_display_driver = nullptr;
     }
 
+    if (panel_w <= 0 || panel_h <= 0 || panel_rows <= 0 || panel_cols <= 0) {
+        ESP_LOGE(TAG, "invalid layout: panel=%dx%d rows=%d cols=%d",
+                 panel_w, panel_h, panel_rows, panel_cols);
+        return ESP_ERR_INVALID_ARG;
+    }
+
     pd_display_hub75_config = {};
-    pd_display_hub75_config.panel_width = width;
-    pd_display_hub75_config.panel_height = height;
+    pd_display_hub75_config.panel_width = (uint16_t)panel_w;
+    pd_display_hub75_config.panel_height = (uint16_t)panel_h;
+    pd_display_hub75_config.layout_rows = (uint16_t)panel_rows;
+    pd_display_hub75_config.layout_cols = (uint16_t)panel_cols;
+    pd_display_hub75_config.layout = pd_display_layout_from_int(chain_pattern);
     pd_display_hub75_config.shift_driver = Hub75ShiftDriver::FM6126A;
     pd_display_hub75_config.scan_wiring = pd_display_scan_wiring_from_int(scan_wiring);
-    pd_display_hub75_config.rotation = pd_display_rotation_from_degrees(orientation_deg);
+    pd_display_hub75_config.rotation = pd_display_rotation_from_degrees(rotation_deg);
     pd_display_apply_matrixportal_s3_pins(&pd_display_hub75_config.pins);
 
     pd_display_driver = new Hub75Driver(pd_display_hub75_config);
     if (!pd_display_driver->begin()) {
-        ESP_LOGE(TAG, "display driver begin() failed for %dx%d", width, height);
+        ESP_LOGE(TAG, "display driver begin() failed for panel %dx%d %dx%d chain pat=%d",
+                 panel_w, panel_h, panel_rows, panel_cols, chain_pattern);
         delete pd_display_driver;
         pd_display_driver = nullptr;
         return ESP_FAIL;
     }
 
-    pd_display_driver->set_brightness(96);
+    pd_display_driver->set_brightness(pd_display_current_brightness);
     pd_display_driver->clear();
     pd_display_driver->flip_buffer();
     pd_display_driver->clear();
     vTaskDelay(pdMS_TO_TICKS(100));
-    pd_display_current_width = width;
-    pd_display_current_height = height;
-    pd_display_current_orientation = orientation_deg;
+
+    pd_display_current_panel_width = panel_w;
+    pd_display_current_panel_height = panel_h;
+    pd_display_current_panel_rows = panel_rows;
+    pd_display_current_panel_cols = panel_cols;
+    pd_display_current_chain_pattern = chain_pattern;
+    pd_display_current_rotation = rotation_deg;
     pd_display_current_scan = scan_wiring;
-    ESP_LOGI(TAG, "display started: %dx%d @ %d scan=%d", width, height, orientation_deg, scan_wiring);
+    pd_display_current_color_order = color_order;
+    pd_display_current_width = pd_display_driver->get_width();
+    pd_display_current_height = pd_display_driver->get_height();
+
+    ESP_LOGI(TAG,
+             "display started: panel=%dx%d chain=%dx%d pat=%d rot=%d scan=%d color=%d virtual=%dx%d",
+             panel_w, panel_h, panel_rows, panel_cols, chain_pattern,
+             rotation_deg, scan_wiring, color_order,
+             pd_display_current_width, pd_display_current_height);
     return ESP_OK;
 }
 
@@ -316,19 +391,53 @@ extern "C" esp_err_t pd_display_init(const pd_display_config_t *config)
         return ESP_ERR_INVALID_ARG;
     }
 
-    return pd_display_start_driver(config->width, config->height, config->orientation_deg, config->scan_wiring);
+    int rows = config->panel_rows > 0 ? config->panel_rows : 1;
+    int cols = config->panel_cols > 0 ? config->panel_cols : 1;
+    return pd_display_start_driver(config->panel_width, config->panel_height,
+                                   rows, cols, config->chain_pattern,
+                                   config->rotation_deg, config->scan_wiring,
+                                   config->color_order);
 }
 
-extern "C" esp_err_t pd_display_reinit(int width, int height, int orientation_deg, int scan_wiring)
+extern "C" esp_err_t pd_display_reinit(const pd_display_config_t *config)
 {
-    if (pd_display_driver &&
-        width == pd_display_current_width &&
-        height == pd_display_current_height &&
-        orientation_deg == pd_display_current_orientation &&
-        scan_wiring == pd_display_current_scan) {
+    if (!config) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    int rows = config->panel_rows > 0 ? config->panel_rows : 1;
+    int cols = config->panel_cols > 0 ? config->panel_cols : 1;
+    bool layout_same = (pd_display_driver &&
+        config->panel_width == pd_display_current_panel_width &&
+        config->panel_height == pd_display_current_panel_height &&
+        rows == pd_display_current_panel_rows &&
+        cols == pd_display_current_panel_cols &&
+        config->chain_pattern == pd_display_current_chain_pattern &&
+        config->rotation_deg == pd_display_current_rotation &&
+        config->scan_wiring == pd_display_current_scan);
+    if (layout_same && config->color_order == pd_display_current_color_order) {
         return ESP_OK;
     }
-    return pd_display_start_driver(width, height, orientation_deg, scan_wiring);
+    if (layout_same) {
+        /* only color_order changed — no driver restart needed */
+        pd_display_current_color_order = config->color_order;
+        ESP_LOGI(TAG, "color_order updated to %d (no driver restart)", config->color_order);
+        return ESP_OK;
+    }
+    /* layout changed — driver restart required; not safe on this hardware at runtime */
+    return ESP_ERR_NOT_SUPPORTED;
+}
+
+extern "C" void pd_display_set_brightness(uint8_t brightness)
+{
+    pd_display_current_brightness = brightness;
+    if (pd_display_driver) {
+        pd_display_driver->set_brightness(brightness);
+    }
+}
+
+extern "C" uint8_t pd_display_get_brightness(void)
+{
+    return pd_display_current_brightness;
 }
 
 extern "C" void pd_display_clear(void)
@@ -341,14 +450,18 @@ extern "C" void pd_display_clear(void)
 extern "C" void pd_display_fill(uint16_t x, uint16_t y, uint16_t w, uint16_t h, pd_display_color_t color)
 {
     if (pd_display_driver) {
-        pd_display_driver->fill(x, y, w, h, color.r, color.g, color.b);
+        uint8_t mr, mg, mb;
+        pd_display_map_color(color.r, color.g, color.b, &mr, &mg, &mb);
+        pd_display_driver->fill(x, y, w, h, mr, mg, mb);
     }
 }
 
 extern "C" void pd_display_set_pixel(uint16_t x, uint16_t y, pd_display_color_t color)
 {
     if (pd_display_driver) {
-        pd_display_driver->set_pixel(x, y, color.r, color.g, color.b);
+        uint8_t mr, mg, mb;
+        pd_display_map_color(color.r, color.g, color.b, &mr, &mg, &mb);
+        pd_display_driver->set_pixel(x, y, mr, mg, mb);
     }
 }
 
@@ -366,8 +479,12 @@ extern "C" void pd_display_render_rgb(const uint8_t *rgb, int img_w, int img_h)
     for (int y = 0; y < blit_h; y++) {
         for (int x = 0; x < blit_w; x++) {
             int src_idx = (y * img_w + x) * 3;
-            pd_display_driver->set_pixel(ox + x, oy + y,
-                                         rgb[src_idx + 2], rgb[src_idx], rgb[src_idx + 1]);
+            uint8_t lr = rgb[src_idx];
+            uint8_t lg = rgb[src_idx + 1];
+            uint8_t lb = rgb[src_idx + 2];
+            uint8_t mr, mg, mb;
+            pd_display_map_color(lr, lg, lb, &mr, &mg, &mb);
+            pd_display_driver->set_pixel(ox + x, oy + y, mr, mg, mb);
         }
     }
 }
@@ -380,8 +497,12 @@ extern "C" void pd_display_render_framebuf(const uint8_t *rgb)
     for (int y = 0; y < dh; y++) {
         for (int x = 0; x < dw; x++) {
             int idx = (y * dw + x) * 3;
-            pd_display_driver->set_pixel(x, y,
-                                         rgb[idx + 2], rgb[idx], rgb[idx + 1]);
+            uint8_t lr = rgb[idx];
+            uint8_t lg = rgb[idx + 1];
+            uint8_t lb = rgb[idx + 2];
+            uint8_t mr, mg, mb;
+            pd_display_map_color(lr, lg, lb, &mr, &mg, &mb);
+            pd_display_driver->set_pixel(x, y, mr, mg, mb);
         }
     }
 }
@@ -389,13 +510,15 @@ extern "C" void pd_display_render_framebuf(const uint8_t *rgb)
 extern "C" void pd_display_draw_rect(uint16_t x, uint16_t y, uint16_t w, uint16_t h, pd_display_color_t color)
 {
     if (!pd_display_driver || w == 0 || h == 0) return;
+    uint8_t mr, mg, mb;
+    pd_display_map_color(color.r, color.g, color.b, &mr, &mg, &mb);
     for (uint16_t i = 0; i < w; i++) {
-        pd_display_driver->set_pixel(x + i, y, color.r, color.g, color.b);
-        pd_display_driver->set_pixel(x + i, y + h - 1, color.r, color.g, color.b);
+        pd_display_driver->set_pixel(x + i, y, mr, mg, mb);
+        pd_display_driver->set_pixel(x + i, y + h - 1, mr, mg, mb);
     }
     for (uint16_t i = 0; i < h; i++) {
-        pd_display_driver->set_pixel(x, y + i, color.r, color.g, color.b);
-        pd_display_driver->set_pixel(x + w - 1, y + i, color.r, color.g, color.b);
+        pd_display_driver->set_pixel(x, y + i, mr, mg, mb);
+        pd_display_driver->set_pixel(x + w - 1, y + i, mr, mg, mb);
     }
 }
 
@@ -421,7 +544,7 @@ extern "C" void pd_display_draw_char(uint16_t x, uint16_t y, char ch, pd_display
                 uint16_t px = x + col;
                 uint16_t py = y + row;
                 if (px < dw && py < dh) {
-                    pd_display_driver->set_pixel(px, py, color.r, color.g, color.b);
+                    pd_display_set_pixel(px, py, color);
                 }
             }
         }
@@ -468,7 +591,7 @@ extern "C" void pd_display_draw_char_tiny(uint16_t x, uint16_t y, char ch, pd_di
                 uint16_t px = x + col;
                 uint16_t py = y + row;
                 if (px < dw && py < dh) {
-                    pd_display_driver->set_pixel(px, py, color.r, color.g, color.b);
+                    pd_display_set_pixel(px, py, color);
                 }
             }
         }
@@ -513,6 +636,61 @@ extern "C" int pd_display_text_rows(void)
     return pd_display_driver ? pd_display_driver->get_height() / PD_CELL_H : 0;
 }
 
+extern "C" int pd_display_get_panel_width(void)  { return pd_display_current_panel_width; }
+extern "C" int pd_display_get_panel_height(void) { return pd_display_current_panel_height; }
+extern "C" int pd_display_get_panel_rows(void)   { return pd_display_current_panel_rows; }
+extern "C" int pd_display_get_panel_cols(void)   { return pd_display_current_panel_cols; }
+extern "C" int pd_display_get_chain_pattern(void) { return pd_display_current_chain_pattern; }
+extern "C" int pd_display_get_rotation_deg(void) { return pd_display_current_rotation; }
+extern "C" int pd_display_get_color_order(void) { return pd_display_current_color_order; }
+
+extern "C" void pd_display_flip_buffer(void)
+{
+    if (pd_display_driver) {
+        pd_display_driver->flip_buffer();
+    }
+}
+
+/* Map (row, col) of the chain to the rectangle on the *virtual canvas*.
+ *
+ * Implementation detail: rotation is applied first by the driver, then panel
+ * layout. From the framebuffer's perspective, the virtual canvas is always
+ * exactly (panel_cols × panel_w_eff) × (panel_rows × panel_h_eff) where
+ * (w_eff, h_eff) are the panel's apparent size after rotation. The scan_wiring
+ * and chain_pattern only affect the *physical* mapping inside the driver, not
+ * the framebuffer coordinates we draw to. So a simple grid carve is correct
+ * for the purposes of overlaying per-panel content. */
+extern "C" bool pd_display_get_panel_rect(int row, int col,
+                                          int *out_x, int *out_y,
+                                          int *out_w, int *out_h)
+{
+    if (!pd_display_driver) return false;
+    int rows = pd_display_current_panel_rows;
+    int cols = pd_display_current_panel_cols;
+    if (row < 0 || row >= rows || col < 0 || col >= cols) return false;
+
+    int pw = pd_display_current_panel_width;
+    int ph = pd_display_current_panel_height;
+    int rot = pd_display_current_rotation;
+
+    /* With 90/270° rotation the driver transposes the virtual canvas:
+     *   virtual_w = ph * rows,  virtual_h = pw * cols
+     * so the physical panel grid is laid out with swapped dimensions.
+     */
+    if (rot == 90 || rot == 270) {
+        if (out_x) *out_x = row * ph;
+        if (out_y) *out_y = col * pw;
+        if (out_w) *out_w = ph;
+        if (out_h) *out_h = pw;
+    } else {
+        if (out_x) *out_x = col * pw;
+        if (out_y) *out_y = row * ph;
+        if (out_w) *out_w = pw;
+        if (out_h) *out_h = ph;
+    }
+    return true;
+}
+
 extern "C" void pd_display_render_boot_message(void)
 {
     if (!pd_display_driver) {
@@ -520,8 +698,20 @@ extern "C" void pd_display_render_boot_message(void)
     }
 
     pd_display_driver->clear();
-    pd_display_draw_text_tiny(1, 1, "SETUP", PD_COLOR_YELLOW);
-    ESP_LOGI(TAG, "render boot message: SETUP");
+
+    /* Center "SETUP" on the full virtual canvas so it reads correctly
+     * regardless of panel chain length / orientation. */
+    int dw = pd_display_driver->get_width();
+    int dh = pd_display_driver->get_height();
+    const char *msg = "SETUP";
+    int text_w = (int)strlen(msg) * PD_CELL_W - (PD_CELL_W - PD_FONT_W);
+    int x = (dw - text_w) / 2;
+    int y = (dh - PD_FONT_H) / 2;
+    if (x < 0) x = 0;
+    if (y < 0) y = 0;
+    pd_display_draw_text(x, y, msg, PD_COLOR_YELLOW);
+    pd_display_driver->flip_buffer();
+    ESP_LOGI(TAG, "render boot message: SETUP (centered on %dx%d)", dw, dh);
 }
 
 extern "C" void pd_display_render_idle(const char *device_name, int res_w, int res_h,
@@ -539,38 +729,39 @@ extern "C" void pd_display_render_idle(const char *device_name, int res_w, int r
     /* 1px border at the display edges */
     pd_display_draw_rect(0, 0, dw, dh, PD_COLOR_DIM);
 
-    /* device name */
-    char line[24];
-    int row = 0;
+    /* Build up to 5 lines of info; render centered as a block on the canvas. */
+    char lines[5][32];
+    pd_display_color_t colors[5];
+    int line_count = 0;
     if (device_name && device_name[0]) {
-        snprintf(line, sizeof(line), "%s", device_name);
-        pd_display_draw_text_tiny(2, 2 + row * PD_TINY_CELL_H, line, PD_COLOR_CYAN);
-        row++;
+        snprintf(lines[line_count], sizeof(lines[0]), "%s", device_name);
+        colors[line_count++] = PD_COLOR_CYAN;
+    }
+    snprintf(lines[line_count], sizeof(lines[0]), "%dx%d", res_w, res_h);
+    colors[line_count++] = PD_COLOR_WHITE;
+    snprintf(lines[line_count], sizeof(lines[0]), "rot %d sc %d", orient, scan);
+    colors[line_count++] = PD_COLOR_WHITE;
+    if (ip && ip[0]) {
+        snprintf(lines[line_count], sizeof(lines[0]), "%s", ip);
+        colors[line_count++] = PD_COLOR_GREEN;
+    } else {
+        snprintf(lines[line_count], sizeof(lines[0]), "DHCP");
+        colors[line_count++] = PD_COLOR_DIM;
     }
 
-    /* resolution */
-    snprintf(line, sizeof(line), "%dx%d", res_w, res_h);
-    pd_display_draw_text_tiny(2, 2 + row * PD_TINY_CELL_H, line, PD_COLOR_WHITE);
-    row++;
+    int block_h = line_count * PD_TINY_CELL_H;
+    int y0 = (dh - block_h) / 2;
+    if (y0 < 1) y0 = 1;
 
-    /* orientation */
-    snprintf(line, sizeof(line), "rot %d", orient);
-    pd_display_draw_text_tiny(2, 2 + row * PD_TINY_CELL_H, line, PD_COLOR_WHITE);
-    row++;
-
-    /* scan wiring */
-    snprintf(line, sizeof(line), "scan %d", scan);
-    pd_display_draw_text_tiny(2, 2 + row * PD_TINY_CELL_H, line, PD_COLOR_WHITE);
-    row++;
-
-    /* IP address */
-    if (ip && ip[0]) {
-        snprintf(line, sizeof(line), "%s", ip);
-        pd_display_draw_text_tiny(2, 2 + row * PD_TINY_CELL_H, line, PD_COLOR_GREEN);
-        row++;
-    } else {
-        pd_display_draw_text_tiny(2, 2 + row * PD_TINY_CELL_H, "DHCP", PD_COLOR_DIM);
-        row++;
+    for (int i = 0; i < line_count; i++) {
+        int len = (int)strlen(lines[i]);
+        int text_w = len * PD_TINY_CELL_W - (PD_TINY_CELL_W - PD_TINY_W);
+        if (text_w < 0) text_w = 0;
+        int x = (dw - text_w) / 2;
+        if (x < 1) x = 1;
+        pd_display_draw_text_tiny((uint16_t)x,
+                                  (uint16_t)(y0 + i * PD_TINY_CELL_H),
+                                  lines[i], colors[i]);
     }
 
     pd_display_driver->flip_buffer();
@@ -647,4 +838,137 @@ extern "C" void pd_display_wizard_status(const char *message)
 
     pd_display_driver->clear();
     pd_display_draw_text_tiny(0, 0, message, PD_COLOR_GREEN);
+}
+
+extern "C" void pd_display_render_default_marquee(void)
+{
+    if (!pd_display_driver) {
+        return;
+    }
+    pd_display_driver->clear();
+    int dw = pd_display_driver->get_width();
+    int dh = pd_display_driver->get_height();
+    /* Simple centered two-line text, large enough to read */
+    const char *line1 = "DEFAULT";
+    const char *line2 = "MARQUEE";
+    /* each PD_CELL is small; use tiny renderer for small panels */
+    int text_w = 7 * 4;  /* approx chars * cell width */
+    int x = (dw - text_w) / 2; if (x < 0) x = 0;
+    int y1 = dh / 2 - PD_TINY_CELL_H - 1;
+    int y2 = dh / 2 + 1;
+    pd_display_draw_text_tiny(x, y1, line1, PD_COLOR_YELLOW);
+    pd_display_draw_text_tiny(x, y2, line2, PD_COLOR_YELLOW);
+    pd_display_driver->flip_buffer();
+}
+
+extern "C" void pd_display_render_no_source(void)
+{
+    if (!pd_display_driver) {
+        return;
+    }
+
+    pd_display_driver->clear();
+    
+    int row = 0;
+    pd_display_draw_text_tiny(2, 2 + row * PD_TINY_CELL_H, "NO MARQUEE SOURCE", PD_COLOR_YELLOW);
+    row += 2;
+    
+    // Animated dots
+    static int dots = 0;
+    dots = (dots + 1) % 4;
+    char searching[16];
+    snprintf(searching, sizeof(searching), "Searching%.*s", dots, "...");
+    pd_display_draw_text_tiny(2, 2 + row * PD_TINY_CELL_H, searching, PD_COLOR_CYAN);
+    row += 2;
+    
+    pd_display_draw_text_tiny(2, 2 + row * PD_TINY_CELL_H, "Device:", PD_COLOR_DIM);
+    row++;
+    pd_display_draw_text_tiny(2, 2 + row * PD_TINY_CELL_H, "pixel-dumpster", PD_COLOR_WHITE);
+    row++;
+    
+    char line[24];
+    int dw = pd_display_driver->get_width();
+    int dh = pd_display_driver->get_height();
+    snprintf(line, sizeof(line), "%dx%d", dw, dh);
+    pd_display_draw_text_tiny(2, 2 + row * PD_TINY_CELL_H, line, PD_COLOR_WHITE);
+    
+    pd_display_driver->flip_buffer();
+}
+
+extern "C" void pd_display_render_source_status(int state, const char *hostname, const char *ip,
+                                                const char *es_version, bool browsing, bool launch,
+                                                const char *methods)
+{
+    if (!pd_display_driver) {
+        return;
+    }
+
+    pd_display_driver->clear();
+    
+    int row = 0;
+    
+    // Title
+    pd_display_draw_text_tiny(2, 2 + row * PD_TINY_CELL_H, "MARQUEE SOURCE", PD_COLOR_YELLOW);
+    row += 2;
+    
+    // State indicator
+    if (state == 0) {
+        // Searching
+        static int dots = 0;
+        dots = (dots + 1) % 4;
+        char msg[16];
+        snprintf(msg, sizeof(msg), "searching%.*s", dots, "...");
+        pd_display_draw_text_tiny(2, 2 + row * PD_TINY_CELL_H, msg, PD_COLOR_CYAN);
+    } else if (state == 1) {
+        // Connecting
+        static int dots = 0;
+        dots = (dots + 1) % 4;
+        char msg[16];
+        snprintf(msg, sizeof(msg), "connecting%.*s", dots, "...");
+        pd_display_draw_text_tiny(2, 2 + row * PD_TINY_CELL_H, msg, PD_COLOR_CYAN);
+    } else if (state == 2) {
+        // Connected
+        pd_display_draw_text_tiny(2, 2 + row * PD_TINY_CELL_H, "connected!", PD_COLOR_GREEN);
+    }
+    row += 2;
+    
+    // Hostname
+    if (hostname && hostname[0]) {
+        pd_display_draw_text_tiny(2, 2 + row * PD_TINY_CELL_H, hostname, PD_COLOR_WHITE);
+        row++;
+    }
+    
+    // IP address
+    if (ip && ip[0]) {
+        pd_display_draw_text_tiny(2, 2 + row * PD_TINY_CELL_H, ip, PD_COLOR_CYAN);
+        row++;
+    }
+    
+    // ES version
+    if (es_version && es_version[0]) {
+        char line[24];
+        snprintf(line, sizeof(line), "ES: %.10s", es_version);
+        pd_display_draw_text_tiny(2, 2 + row * PD_TINY_CELL_H, line, PD_COLOR_DIM);
+        row++;
+    }
+    
+    // Event capabilities
+    if (browsing && launch) {
+        pd_display_draw_text_tiny(2, 2 + row * PD_TINY_CELL_H, "Events: Full", PD_COLOR_GREEN);
+    } else if (launch) {
+        pd_display_draw_text_tiny(2, 2 + row * PD_TINY_CELL_H, "Events: Launch", PD_COLOR_YELLOW);
+    } else {
+        pd_display_draw_text_tiny(2, 2 + row * PD_TINY_CELL_H, "Events: None", PD_COLOR_RED);
+    }
+    row++;
+    
+    // Methods (if provided and fits)
+    if (methods && methods[0] && row < 10) {
+        char line[24];
+        snprintf(line, sizeof(line), "%.18s", methods);
+        pd_display_draw_text_tiny(2, 2 + row * PD_TINY_CELL_H, line, PD_COLOR_DIM);
+    }
+    
+    pd_display_driver->flip_buffer();
+    ESP_LOGI(TAG, "render source status: state=%d host=%s", state, hostname ? hostname : "none");
 }

@@ -22,3 +22,12 @@ tools/playlist-cli
 
 # Logs
 logs/
+
+# pd-control (Tauri/React app) build artifacts
+pd-control/node_modules/
+pd-control/dist/
+pd-control/src-tauri/target/
+
+# Compiled tool binaries
+tools/dumpster-diver
+tools/dumpster-diver-enhanced

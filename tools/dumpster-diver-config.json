@@ -1,7 +1,20 @@
 {
   "device": {
-    "host": "192.168.1.154",
+    "host": "YOUR_DEVICE_IP",
     "port": 8088
+  },
+  "transport": "wifi",
+  "serial": {
+    "device": "/dev/ttyACM0",
+    "baud": 115200
+  },
+  "fifo": "/tmp/dumpster-diver.fifo",
+  "es": {
+    "gamelists_path": "~/.emulationstation/gamelists",
+    "roms_path": "~/RetroPie/roms"
+  },
+  "marquee": {
+    "device_prefix": "marquees"
   },
   "defaults": {
     "system_fallback": "images/systems/default.png",

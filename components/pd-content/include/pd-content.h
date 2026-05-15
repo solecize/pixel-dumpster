@@ -80,6 +80,21 @@ esp_err_t pd_content_register_http(httpd_handle_t server);
 esp_err_t pd_content_store_file(const char *rel_path, const uint8_t *data, size_t len);
 esp_err_t pd_content_delete_file(const char *rel_path);
 
+/* Render discovery/source status screen (immediate, no auto-revert) */
+void pd_content_render_source_status(void);
+
+/* Show source status as a non-blocking overlay for `duration_ms`, then
+ * automatically revert to the previously playing content (or signal via
+ * pd_content_status_overlay_just_expired() if nothing was playing). */
+void pd_content_show_source_status_for(int duration_ms);
+
+/* Returns true once when the overlay expires with no content to resume.
+ * Caller is expected to render the idle screen. */
+bool pd_content_status_overlay_just_expired(void);
+
+/* Returns true while the overlay is currently active. */
+bool pd_content_status_overlay_active(void);
+
 #ifdef __cplusplus
 }
 #endif
