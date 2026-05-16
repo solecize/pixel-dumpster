@@ -2,234 +2,176 @@
 
 ## Your infinite bin of pixel-punk trash
 
-A network-addressable display app for ESP32 devices connected to LED matrix displays.
+An open-source alternative to commercial arcade marquee systems, built on ESP32 and HUB75 LED panels. Pixel Dumpster displays game art, animated sequences, and transitions on your cabinet's marquee — automatically, as you play — driven by your RetroPie setup over WiFi.
 
-This repository is treated as a living specification: you define project needs and goals, and the firmware is implemented to match those requirements.
+> ⚠️ **Early/experimental.** Core features work but expect rough edges. Hardware bring-up, configuration, and content management all require some technical patience.
 
-Naming: this project uses kebab-style naming for files and folders (see `documentation/kebab-style-naming.md`).
+---
 
-### Features
-
-- **ESP32 Support**: Optimized for ESP32 Matrix Portal and similar devices
-- **LED Matrix Driver**: HUB75 and PxMatrix support with configurable resolution
-- **Setup Wizard**: First-run configuration with USB keyboard input
-- **Artifact Storage**: Local pixel art library with organized directory structure
-- **Push Notifications**: UDP doorbell and HTTP API for remote updates
-- **Web Interface**: RESTful API for asset management and control
-- **Robust Design**: Deterministic fallback and error handling
-
-### Hardware Requirements
-
-- ESP32 development board (Matrix Portal recommended)
-- HUB75 LED matrix panel (224x64 default, configurable)
-- USB keyboard for setup (optional after configuration)
-- Power supply for LED matrix
-
-### Software Requirements
-
-- ESP-IDF (native toolchain)
-- ESP32 toolchain + `idf.py`
-- USB drivers for flashing (platform dependent)
-
-### Quick Start (ESP-IDF)
-
-1. **Install ESP-IDF** using Espressif's installer
-2. **Set up your environment** (`. $IDF_PATH/export.sh`)
-3. **Build** the firmware
-   ```bash
-   idf.py build
-   ```
-4. **Flash** the firmware
-   ```bash
-   idf.py flash
-   ```
-5. **Monitor** logs
-   ```bash
-   idf.py monitor
-   ```
-6. **Connect USB keyboard** for first-time setup
-7. **Follow the wizard** to configure:
-   - Matrix resolution (e.g., 224x64)
-   - Matrix orientation (0/90/180/270 degrees)
-   - WiFi credentials
-   - Device name
-
-### Configuration
-
-The device stores configuration in `/pd/config.json`:
-
-```json
-{
-  "matrix_width": 224,
-  "matrix_height": 64,
-  "orientation_deg": 0,
-  "wifi_ssid": "your-network",
-  "wifi_password": "your-password",
-  "device_name": "pixel-dumpster",
-  "setup_complete": true,
-  "config_version": 1
-}
-```
-
-### Artifact Storage
-
-Artifacts are stored in the `/pd/` directory:
+## What it does
 
 ```
-/pd/
-├── now.json          # Current display state
-├── default.png       # Default/fallback image
-├── system/           # System-specific art
-├── game/             # Game-specific art
-│   └── mame/         # Per-system subdirs
-└── assets/           # Custom assets
+RetroPie (EmulationStation)
+        │  scripting hooks
+        ▼
+  dumpster-diver          ← daemon running on your Pi
+  (game/system events)
+        │  WiFi / HTTP
+        ▼
+   ESP32 firmware         ← flashed to your display board
+   (pd-control app)
+        │  HUB75
+        ▼
+  LED matrix panel        ← your marquee
 ```
 
-### Display State
+When you select a game in EmulationStation, `dumpster-diver` detects the event and pushes the matching marquee artwork to your ESP32 over WiFi. The display transitions to the new image automatically. No commercial software, no subscriptions.
 
-The current display state is maintained in `/pd/now.json`:
+---
 
-```json
-{
-  "mode": "idle|system|game|custom",
-  "system": "mame",
-  "game": "pacman",
-  "asset": "assets/custom.png",
-  "updated_at": 1768109057
-}
-```
+## Components
 
-### API Endpoints
+### ESP32 Firmware (`main/` + `components/`)
+The heart of the system. Runs on an ESP32-S3 connected directly to HUB75 LED panels via ribbon cable. Handles:
+- HUB75 panel driving (FM6126A shift driver, configurable scan mode and orientation)
+- WiFi connection and mDNS advertising (`_pdumpster._tcp` on port 8088)
+- HTTP API for content playback, configuration, and status
+- 24 transition types (wipe, slide, zoom, fade, flip, and more)
+- Background/overlay compositing for animated content
+- SPIFFS/LittleFS storage for config and content
 
-#### POST `/reload`
-Triggers reload of `now.json`
-- Response: 204 No Content
+### pd-control (`pd-control/`)
+A cross-platform desktop app (Tauri + React) for managing your devices without touching a terminal. Features:
+- Auto-discovers ESP32 devices and `dumpster-diver` daemons on your network via mDNS
+- Content browser and playback control
+- Live device configuration
+- ESP32 firmware flasher (auto-detects connected boards)
+- Raspberry Pi SSH installer for `dumpster-diver`
 
-#### GET `/state`
-Returns current display state
-- Response: JSON with current state
+Requires Rust 1.70+ and Node 18+. See [`pd-control/README.md`](pd-control/README.md).
 
-#### POST `/upload`
-Upload PNG asset to specified path
-- Form data: file upload
-- Response: 200 OK
+### dumpster-diver (`tools/dumpster-diver.c`)
+A lightweight C daemon that runs on your RetroPie Pi and bridges EmulationStation events to your display. It:
+- Hooks into EmulationStation's native scripting system (no custom ES builds needed)
+- Watches for game-select, game-launch, game-end, and system-select events
+- Walks a 6-level artwork lookup chain to find the best matching image
+- Pushes content to the ESP32 via WiFi or serial
+- Exposes a control API on port 7070 for `pd-control` to monitor and manage
 
-#### GET `/list`
-Returns asset inventory
-- Response: JSON array of available assets
+See [`documentation/dumpster-diver.md`](documentation/dumpster-diver.md).
 
-#### GET `/status`
-Returns system status and statistics
-- Response: JSON with system information
+### Content System (`content/`)
+Images and animated sequences stored on the device or pushed from the Pi. Supports:
+- Static PNG images (auto-scaled to panel resolution)
+- Animated sequences — ordered PNG frames with `meta.json` timing metadata
+- Background and overlay compositing layers
+- Per-item transition, duration, and display overrides via `meta.json`
 
-### Push Notifications
+See [`documentation/api.md`](documentation/api.md) for the full HTTP API reference.
 
-#### UDP Doorbell (Primary)
-- Port: 9876
-- Any packet received triggers reload of `now.json`
+---
 
-#### Polling Backstop
-- Interval: ~1 second
-- Checks for changes in `now.json`
+## Hardware
 
-### Integration Examples
+| Part | Notes |
+|------|-------|
+| ESP32-S3 dev board | Any board with enough GPIO; confirm HUB75 pinout |
+| HUB75 LED matrix panels | 32×64 pixels per panel; chain up to 7 for 224×64 total |
+| FM6126A shift driver | Confirmed working; standard driver also supported |
+| 5V power supply | Sized for your panel count — panels draw ~3–4A each at full white |
+| USB keyboard | Only needed during first-time setup wizard |
 
-#### Python Client
-```python
-import socket
-import json
+Panel resolution, chain length, orientation (0/90/180/270°), and scan mode are all configurable via the setup wizard and can be changed later in `pd-control`.
 
-# Send UDP notification
-sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-sock.sendto(b"refresh", ("pixel-dumpster.local", 9876))
+---
 
-# Update display state
-import requests
-state = {
-    "mode": "game",
-    "system": "mame", 
-    "game": "pacman",
-    "updated_at": int(time.time())
-}
-requests.post("http://pixel-dumpster.local:8088/upload", files={"file": open("pacman.png", "rb")})
-```
+## Getting Started
 
-#### Node.js Client
-```javascript
-const dgram = require('dgram');
-const client = dgram.createSocket('udp4');
+### 1. Flash the firmware
 
-// Send UDP notification
-client.send('refresh', 9876, 'pixel-dumpster.local', (err) => {
-    client.close();
-});
-```
+Use `pd-control` (easiest) or flash manually with ESP-IDF:
 
-### Development
-
-#### Building
 ```bash
-idf.py build
+# Install ESP-IDF, then:
+idf.py build flash monitor
 ```
 
-#### Flashing
+### 2. Run the setup wizard
+
+Connect a USB keyboard to the ESP32 board on first boot. The wizard will walk you through:
+- Panel resolution and chain count
+- Scan mode and orientation
+- WiFi credentials
+- Device name
+
+The device reboots once to apply settings, then advertises itself on your network as `pixel-dumpster.local`.
+
+### 3. Install dumpster-diver on your Pi
+
+SSH into your RetroPie and run the install script:
+
 ```bash
-idf.py flash
+bash tools/install-retropie.sh
 ```
 
-#### Monitoring
-```bash
-idf.py monitor
-```
+This installs the daemon, registers EmulationStation scripting hooks, and adds `dumpster-diver` to autostart. Edit `~/.config/dumpster-diver/config.json` to point at your ESP32's IP or hostname.
 
-#### Configuration
-```bash
-idf.py menuconfig
-```
+### 4. Open pd-control
 
-### Troubleshooting
+Launch `pd-control` on your desktop machine. It will discover your ESP32 and Pi daemon automatically via mDNS. From here you can browse content, push images, adjust config, and monitor the daemon log.
 
-#### Setup Issues
-- Ensure USB keyboard is connected before power on
-- Check serial monitor for setup wizard prompts
-- Verify matrix panel connections
+### 5. Add content
 
-#### WiFi Issues
-- Check SSID and password in configuration
-- Verify network availability
-- Monitor serial output for connection status
+Drop PNG files or animated sequence folders into the content directories. The lookup chain searches by game name, system, and fallbacks — see [`documentation/dumpster-diver.md`](documentation/dumpster-diver.md) for the full priority order.
 
-#### Display Issues
-- Verify matrix resolution matches physical panel
-- Check orientation settings
-- Ensure adequate power supply
+---
 
-### Architecture
+## Documentation
 
-The system follows these design principles:
+| File | Contents |
+|------|----------|
+| [`documentation/api.md`](documentation/api.md) | Full ESP32 HTTP API reference |
+| [`documentation/dumpster-diver.md`](documentation/dumpster-diver.md) | Daemon setup, config, and event protocol |
+| [`documentation/wizard-protocol.md`](documentation/wizard-protocol.md) | Setup wizard serial protocol |
+| [`documentation/transitions.md`](documentation/transitions.md) | Transition types and parameters |
+| [`documentation/development.md`](documentation/development.md) | Build environment and development notes |
+| [`pd-control/README.md`](pd-control/README.md) | Control app build and architecture |
 
-- **Artifacts are truth**: Display state derived from stored files
-- **Push is advisory**: Notifications suggest changes, files confirm
-- **Controller-agnostic**: Works with any upstream system
-- **Frontend-agnostic**: No specific UI requirements
-- **Deterministic fallback**: Always shows something meaningful
-- **Minimal API surface**: Simple, focused endpoints
+---
 
-### License
+## Troubleshooting
 
-This project is open source. See LICENSE file for details.
+**Display is blank after wizard completes**
+- Verify HUB75 ribbon cable orientation and pinout
+- Check that panel power supply is on before the ESP32 boots
+- Monitor serial output: `idf.py monitor`
 
-### Contributing
+**WiFi not connecting**
+- Double-check SSID and password entered during wizard (case-sensitive)
+- Confirm the network is 2.4 GHz — ESP32 does not support 5 GHz
 
-1. Fork the repository
-2. Create a feature branch
-3. Make your changes
-4. Test thoroughly
-5. Submit a pull request
+**dumpster-diver not finding artwork**
+- Check `config.json` on the Pi: `host` must point to your ESP32's IP
+- Verify EmulationStation scripting hooks are installed in `~/.emulationstation/scripts/`
+- Use `pd-control`'s daemon log view to see what events are being received and what artwork paths are being searched
 
-### Support
+**pd-control doesn't see the device**
+- Confirm ESP32 is on the same LAN as your desktop
+- Try adding the device manually by IP in pd-control's sidebar
+- Check that mDNS is not blocked by your router or firewall
 
-For issues and questions:
-- Check the troubleshooting section
-- Review serial monitor output
-- Open an issue on the project repository
+---
+
+## Contributing
+
+Fork the repo, create a branch, make your changes, and open a pull request. Issues and feedback welcome — this is an early project and rough edges are expected.
+
+---
+
+## License
+
+No license file yet — coming soon.
+
+---
+
+*Naming: this project uses kebab-style naming for files and folders. See [`documentation/kebab-style-naming.md`](documentation/kebab-style-naming.md).*
