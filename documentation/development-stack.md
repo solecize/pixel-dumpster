@@ -1,5 +1,6 @@
 # Development & Production Stack
 
+![Hardware & Software Stack](../docs/hardware-software-stack.jpg)
 
 ## ESP32 (Top — Production)
 
