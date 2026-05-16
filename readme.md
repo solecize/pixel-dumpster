@@ -1,5 +1,9 @@
 # pixel-dumpster
 
+<p align="center">
+  <img src="content/icon/app-icon.png" alt="pixel-dumpster icon" width="160"/>
+</p>
+
 ## Your infinite bin of pixel-punk trash
 
 An open-source alternative to commercial arcade marquee systems, built on ESP32 and HUB75 LED panels. Pixel Dumpster displays game art, animated sequences, and transitions on your cabinet's marquee — automatically, as you play — driven by your RetroPie setup over WiFi.
