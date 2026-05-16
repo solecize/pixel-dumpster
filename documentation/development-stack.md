@@ -1,8 +1,5 @@
 # Development & Production Stack
 
-Three stacks for the hardware/software diagram.
-
----
 
 ## ESP32 (Top — Production)
 
