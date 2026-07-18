@@ -32,7 +32,8 @@
 static const char *TAG = "pd-wizard";
 
 #define PD_WIZARD_MAX_SSIDS 32
-#define PD_WIZARD_LINE_BUF 1024
+/* Large enough for upload_chunk NDJSON (base64 payload + framing). */
+#define PD_WIZARD_LINE_BUF 2048
 #define PD_WIZARD_VALUE_LEN 128
 
 /* ---------- step definitions ---------- */
@@ -209,8 +210,20 @@ static bool wiz_usb_warned = false;
 
 /* ---------- serial output ---------- */
 
+static void wiz_feed_byte(char ch);
+
+static pd_wizard_tx_hook_t wiz_tx_hook = NULL;
+
+void pd_wizard_set_tx_hook(pd_wizard_tx_hook_t hook)
+{
+    wiz_tx_hook = hook;
+}
+
 static void wiz_serial_write(const char *data, size_t len)
 {
+    if (wiz_tx_hook && data && len > 0) {
+        wiz_tx_hook(data, len);
+    }
 #if SOC_USB_SERIAL_JTAG_SUPPORTED
     if (wiz_usb_serial_started) {
         /* usb_serial_jtag_write_bytes() silently fails (returns 0, no
@@ -250,6 +263,19 @@ static void wiz_serial_write(const char *data, size_t len)
 #endif
     if (wiz_uart_started) {
         uart_write_bytes(UART_NUM_0, data, len);
+    }
+}
+
+void pd_wizard_write_raw(const char *data, size_t len)
+{
+    wiz_serial_write(data, len);
+}
+
+void pd_wizard_feed_bytes(const uint8_t *data, size_t len)
+{
+    if (!data) return;
+    for (size_t i = 0; i < len; i++) {
+        wiz_feed_byte((char)data[i]);
     }
 }
 

@@ -1,13 +1,18 @@
 import type { DiscoveredDevice } from "../lib/types";
+import type { TransportKind, TransportLinks } from "../lib/transport";
+import { EMPTY_TRANSPORT } from "../lib/transport";
+import { TransportDock } from "./TransportDock";
 
 type NavTab = "content" | "device-setup" | "flash" | "pi-setup";
 
 interface SidebarProps {
   devices: DiscoveredDevice[];
   selected: DiscoveredDevice | null;
+  links?: TransportLinks;
   onSelect: (device: DiscoveredDevice) => void;
   onSetView: (view: NavTab) => void;
   activeView: NavTab;
+  onConfigureTransport: (kind: TransportKind) => void;
 }
 
 const TABS: { id: NavTab; label: string; icon: React.ReactNode }[] = [
@@ -22,7 +27,7 @@ const TABS: { id: NavTab; label: string; icon: React.ReactNode }[] = [
   },
   {
     id: "device-setup",
-    label: "Device Setup",
+    label: "Settings",
     icon: (
       <svg xmlns="http://www.w3.org/2000/svg" className="w-5 h-5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
         <path d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.39a2 2 0 0 0-.73-2.73l-.15-.1a2 2 0 0 1-1-1.72v-.51a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z"/><circle cx="12" cy="12" r="3"/>
@@ -49,7 +54,15 @@ const TABS: { id: NavTab; label: string; icon: React.ReactNode }[] = [
   },
 ];
 
-export function Sidebar({ devices: _devices, selected, onSelect: _onSelect, onSetView, activeView }: SidebarProps) {
+export function Sidebar({
+  devices: _devices,
+  selected,
+  links = EMPTY_TRANSPORT,
+  onSelect: _onSelect,
+  onSetView,
+  activeView,
+  onConfigureTransport,
+}: SidebarProps) {
   return (
     <aside className="w-64 bg-pd-panel border-r border-pd-border flex flex-col select-none">
       {/* Header */}
@@ -82,21 +95,40 @@ export function Sidebar({ devices: _devices, selected, onSelect: _onSelect, onSe
           Selected Device
         </div>
         {selected ? (
-          <button
-            onClick={() => onSetView("content")}
-            className="w-full text-left px-3 py-2 rounded-lg bg-pd-bg border border-pd-border hover:border-pd-accent/50 transition"
-          >
-            <div className="flex items-center gap-2">
-              <span className="w-2 h-2 rounded-full bg-pd-green" />
-              <span className="text-sm font-medium truncate">{selected.name}</span>
-            </div>
-            <div className="text-xs text-gray-500 mt-0.5 ml-4">
-              {selected.ip}:{selected.port}
-            </div>
-          </button>
+          <div className="px-3 py-2 rounded-lg bg-pd-bg border border-pd-border space-y-2">
+            <button
+              type="button"
+              onClick={() => onSetView("content")}
+              className="w-full text-left"
+            >
+              <div className="flex items-center gap-2">
+                <span
+                  className={`w-2 h-2 rounded-full shrink-0 ${
+                    links.wifi ? "bg-pd-green" : "bg-gray-600"
+                  }`}
+                />
+                <span className="text-sm font-medium truncate">{selected.name}</span>
+              </div>
+              <div className="text-xs text-gray-500 mt-0.5 ml-4">
+                {selected.ip}:{selected.port}
+              </div>
+            </button>
+            <TransportDock
+              links={links}
+              size="sm"
+              className="w-full justify-center"
+              onConfigure={onConfigureTransport}
+            />
+          </div>
         ) : (
-          <div className="px-3 py-2 text-xs text-gray-600">
-            No device selected
+          <div className="px-3 py-2 rounded-lg bg-pd-bg border border-pd-border space-y-2">
+            <div className="text-xs text-gray-600">No device selected</div>
+            <TransportDock
+              links={links}
+              size="sm"
+              className="w-full justify-center"
+              onConfigure={onConfigureTransport}
+            />
           </div>
         )}
       </div>

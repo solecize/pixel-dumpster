@@ -1,18 +1,20 @@
 import { useState, useEffect, useCallback, useRef } from "react";
 import {
-  listSerialPorts,
-  wizardConnect,
-  wizardDisconnect,
   wizardSend,
   wizardReboot,
   wizardPoll,
+  wizardIsConnected,
+  bleSend,
+  blePoll,
+  bleIsConnected,
 } from "../lib/api";
-
-interface SerialPort {
-  port_name: string;
-  description: string;
-  is_esp32: boolean;
-}
+import {
+  loadTransportPrefs,
+  saveTransportPrefs,
+  type LinkKind,
+} from "../lib/transportPrefs";
+import { UsbConnectionCard } from "./UsbConnectionCard";
+import { BluetoothConnectionCard } from "./BluetoothConnectionCard";
 
 interface WizardNav {
   back: boolean;
@@ -99,11 +101,33 @@ const emptySettingsForm = {
   static_netmask: "",
 };
 
-export default function WizardPanel() {
-  const [ports, setPorts] = useState<SerialPort[]>([]);
-  const [selectedPort, setSelectedPort] = useState("");
+interface WizardPanelProps {
+  initialLinkKind?: LinkKind;
+  /** localStorage key for remembering serial/BLE choice for this device */
+  prefsKey?: string;
+  /** When embedded under App's wizard chrome, hide the duplicate page title. */
+  hideTitle?: boolean;
+  /** Attempt to reconnect the last BLE device when opening on Bluetooth. */
+  autoReconnectBle?: boolean;
+}
+
+export default function WizardPanel({
+  initialLinkKind = "usb",
+  prefsKey = "default",
+  hideTitle = false,
+  autoReconnectBle = true,
+}: WizardPanelProps) {
+  const [linkKind, setLinkKind] = useState<LinkKind>(() => {
+    const saved = loadTransportPrefs(prefsKey);
+    return initialLinkKind || saved.linkKind || "usb";
+  });
   const [connected, setConnected] = useState(false);
-  const [connecting, setConnecting] = useState(false);
+  const [usbLinked, setUsbLinked] = useState(false);
+  const [bleLinked, setBleLinked] = useState(false);
+  const linkKindRef = useRef<LinkKind>("usb");
+  linkKindRef.current = linkKind;
+  const prefsKeyRef = useRef(prefsKey);
+  prefsKeyRef.current = prefsKey;
   const [wizardState, setWizardState] = useState<WizardState | null>(null);
   const [complete, setComplete] = useState(false);
   const [completeConfig, setCompleteConfig] = useState<Record<string, unknown> | null>(null);
@@ -129,26 +153,10 @@ export default function WizardPanel() {
     setLog((prev) => [...prev, msg]);
   }, []);
 
-  // Refresh ports
-  const refreshPorts = useCallback(async () => {
-    try {
-      const p = await listSerialPorts();
-      setPorts(p);
-      if (!selectedPort) {
-        const esp = p.find((port) => port.is_esp32);
-        if (esp) setSelectedPort(esp.port_name);
-        else if (p.length > 0) setSelectedPort(p[0].port_name);
-      }
-    } catch (err) {
-      console.error("Failed to list ports:", err);
-    }
-  }, [selectedPort]);
-
   useEffect(() => {
-    refreshPorts();
-    const interval = setInterval(refreshPorts, 3000);
-    return () => clearInterval(interval);
-  }, [refreshPorts]);
+    setLinkKind(initialLinkKind);
+    saveTransportPrefs(prefsKeyRef.current, { linkKind: initialLinkKind });
+  }, [initialLinkKind]);
 
   // Auto-scroll log
   useEffect(() => {
@@ -245,7 +253,8 @@ export default function WizardPanel() {
     if (!connected) return;
     pollRef.current = setInterval(async () => {
       try {
-        const lines = await wizardPoll();
+        const lines =
+          linkKindRef.current === "ble" ? await blePoll() : await wizardPoll();
         if (lines.length > 0) processMessages(lines);
       } catch {
         // ignore poll errors
@@ -256,35 +265,65 @@ export default function WizardPanel() {
     };
   }, [connected, processMessages]);
 
-  const handleConnect = async () => {
-    if (!selectedPort) return;
-    setConnecting(true);
-    setError(null);
-    setLog([]);
+  // Resume an existing USB/BLE session opened from Settings cards.
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const [ble, usb] = await Promise.all([
+          bleIsConnected().catch(() => false),
+          wizardIsConnected().catch(() => false),
+        ]);
+        if (cancelled) return;
+        setBleLinked(ble);
+        setUsbLinked(usb);
+        if (ble) {
+          setLinkKind("ble");
+          setConnected(true);
+          addLog("Resumed existing BLE session");
+        } else if (usb) {
+          setLinkKind("usb");
+          setConnected(true);
+          addLog("Resumed existing USB session");
+        }
+      } catch {
+        /* ignore */
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [addLog]);
+
+  const markUsbConnected = () => {
+    setUsbLinked(true);
+    setBleLinked(false);
+    setLinkKind("usb");
+    setConnected(true);
     setComplete(false);
     setCompleteConfig(null);
     setWizardState(null);
     setReztest(null);
-    try {
-      addLog(`Connecting to ${selectedPort}...`);
-      const lines = await wizardConnect(selectedPort);
-      setConnected(true);
-      addLog("Connected!");
-      processMessages(lines);
-    } catch (err) {
-      setError(String(err));
-      addLog(`ERROR: ${err}`);
-    } finally {
-      setConnecting(false);
-    }
+    setError(null);
+    addLog("USB connected");
   };
 
-  const handleDisconnect = async () => {
-    try {
-      await wizardDisconnect();
-    } catch {
-      // ignore
-    }
+  const markBleConnected = () => {
+    setBleLinked(true);
+    setUsbLinked(false);
+    setLinkKind("ble");
+    setConnected(true);
+    setComplete(false);
+    setCompleteConfig(null);
+    setWizardState(null);
+    setReztest(null);
+    setError(null);
+    addLog("BLE connected");
+  };
+
+  const markDisconnected = (kind: LinkKind) => {
+    if (kind === "ble") setBleLinked(false);
+    else setUsbLinked(false);
     setConnected(false);
     setWizardState(null);
     setComplete(false);
@@ -297,7 +336,10 @@ export default function WizardPanel() {
     try {
       const json = JSON.stringify(cmd);
       addLog(`>> ${json}`);
-      const lines = await wizardSend(json);
+      const lines =
+        linkKindRef.current === "ble"
+          ? await bleSend(json)
+          : await wizardSend(json);
       processMessages(lines);
     } catch (err) {
       setError(String(err));
@@ -403,60 +445,34 @@ export default function WizardPanel() {
 
   return (
     <div>
-      <div className="flex items-center justify-between mb-6">
-        <div>
-          <h2 className="text-xl font-bold">Device Setup Wizard</h2>
-          <p className="text-sm text-gray-500">
-            Configure your ESP32 device via USB serial
-          </p>
-        </div>
-        <span className="px-2 py-1 text-xs rounded bg-purple-500/20 text-purple-400">
-          Serial Wizard
-        </span>
-      </div>
-
-      {/* Connection */}
-      <div className="bg-pd-panel rounded-lg p-4 border border-pd-border mb-4">
-        <h3 className="font-semibold text-sm mb-3">Serial Connection</h3>
-        <div className="flex items-center gap-2">
-          <select
-            value={selectedPort}
-            onChange={(e) => setSelectedPort(e.target.value)}
-            className="flex-1 bg-pd-bg border border-pd-border rounded px-3 py-1.5 text-sm"
-            disabled={connected}
-          >
-            <option value="">Select port...</option>
-            {ports.map((p) => (
-              <option key={p.port_name} value={p.port_name}>
-                {p.port_name}
-                {p.is_esp32 ? " (ESP32)" : ""}
-                {p.description ? ` — ${p.description}` : ""}
-              </option>
-            ))}
-          </select>
-          {!connected ? (
-            <button
-              onClick={handleConnect}
-              disabled={!selectedPort || connecting}
-              className="px-4 py-1.5 bg-purple-600 text-white text-sm rounded hover:bg-purple-500 disabled:opacity-50 disabled:cursor-not-allowed"
-            >
-              {connecting ? "Connecting..." : "Connect"}
-            </button>
-          ) : (
-            <button
-              onClick={handleDisconnect}
-              className="px-4 py-1.5 bg-red-600 text-white text-sm rounded hover:bg-red-500"
-            >
-              Disconnect
-            </button>
-          )}
-        </div>
-        {connected && (
-          <div className="mt-2 flex items-center gap-2 text-xs text-pd-green">
-            <span className="w-2 h-2 rounded-full bg-pd-green" />
-            Connected to {selectedPort}
+      {!hideTitle && (
+        <div className="flex items-center justify-between mb-6">
+          <div>
+            <h2 className="text-xl font-bold">Hardware layout setup</h2>
+            <p className="text-sm text-gray-500">
+              Firmware wizard for reztest, chain, and matrix steps over USB/BLE
+            </p>
           </div>
-        )}
+          <span className="px-2 py-1 text-xs rounded bg-pd-accent/20 text-pd-accent">
+            Hardware Wizard
+          </span>
+        </div>
+      )}
+
+      <div className="space-y-3 mb-4">
+        <UsbConnectionCard
+          prefsKey={prefsKey}
+          linked={usbLinked}
+          onConnected={markUsbConnected}
+          onDisconnected={() => markDisconnected("usb")}
+        />
+        <BluetoothConnectionCard
+          prefsKey={prefsKey}
+          linked={bleLinked}
+          autoReconnect={autoReconnectBle && initialLinkKind === "ble"}
+          onConnected={markBleConnected}
+          onDisconnected={() => markDisconnected("ble")}
+        />
       </div>
 
       {/* Wizard Step */}

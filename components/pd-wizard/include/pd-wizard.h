@@ -2,6 +2,8 @@
 #define PD_WIZARD_H
 
 #include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
 
 #include "esp_err.h"
 #include "pd-config.h"
@@ -33,6 +35,16 @@ bool pd_wizard_is_complete(void);
 /* callback for forwarding unrecognised serial JSON commands */
 typedef void (*pd_wizard_cmd_callback_t)(const char *json_str);
 void pd_wizard_set_cmd_callback(pd_wizard_cmd_callback_t cb);
+
+/* Feed host→device NDJSON bytes (USB serial, UART, or BLE). */
+void pd_wizard_feed_bytes(const uint8_t *data, size_t len);
+
+/* Write a raw response to all active link transports (USB/UART + TX hooks). */
+void pd_wizard_write_raw(const char *data, size_t len);
+
+/* Optional TX mirror (e.g. BLE notify) called for every outbound NDJSON byte. */
+typedef void (*pd_wizard_tx_hook_t)(const char *data, size_t len);
+void pd_wizard_set_tx_hook(pd_wizard_tx_hook_t hook);
 
 /* reztest: get display config for current combo index (for app-main display init) */
 bool pd_wizard_reztest_get_display(const pd_config_t *config, int *width, int *height, int *scan_wiring);

@@ -68,6 +68,8 @@ void pd_display_draw_rect(uint16_t x, uint16_t y, uint16_t w, uint16_t h, pd_dis
 void pd_display_set_pixel(uint16_t x, uint16_t y, pd_display_color_t color);
 
 void pd_display_render_rgb(const uint8_t *rgb, int img_w, int img_h);
+/* Positioned blit of tightly-packed RGB888; clips to the canvas. */
+void pd_display_render_rgb_at(int x, int y, const uint8_t *rgb, int img_w, int img_h);
 void pd_display_render_framebuf(const uint8_t *rgb);
 
 void pd_display_wizard_menu(const char *title, const char **options, int count, int selected);

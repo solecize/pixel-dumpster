@@ -30,5 +30,16 @@
 	<true/>
 	<key>NSHighResolutionCapable</key>
 	<true/>
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>Pixel Dumpster Control discovers and controls LED panels on your local network.</string>
+	<key>NSBonjourServices</key>
+	<array>
+		<string>_pdumpster._tcp</string>
+		<string>_dumpster-diver._tcp</string>
+	</array>
+	<key>NSBluetoothAlwaysUsageDescription</key>
+	<string>Pixel Dumpster Control uses Bluetooth to set up and control nearby Pixel Dumpster devices when WiFi is unavailable.</string>
+	<key>NSBluetoothPeripheralUsageDescription</key>
+	<string>Pixel Dumpster Control uses Bluetooth to set up and control nearby Pixel Dumpster devices when WiFi is unavailable.</string>
 </dict>
 </plist>

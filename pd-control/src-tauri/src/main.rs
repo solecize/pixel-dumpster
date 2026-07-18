@@ -1,6 +1,7 @@
 // Prevents additional console window on Windows in release, DO NOT REMOVE!!
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod ble_link;
 mod commands;
 mod daemon_api;
 mod device_api;
@@ -14,6 +15,7 @@ fn main() {
 
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
+        .plugin(tauri_plugin_dialog::init())
         .manage(commands::AppState::default())
         .invoke_handler(tauri::generate_handler![
             commands::discover_devices,
@@ -51,7 +53,18 @@ fn main() {
             commands::wizard_send,
             commands::wizard_reboot,
             commands::wizard_poll,
+            commands::wizard_is_connected,
+            commands::ble_scan,
+            commands::ble_connect,
+            commands::ble_disconnect,
+            commands::ble_send,
+            commands::ble_poll,
+            commands::ble_play,
+            commands::ble_stop,
+            commands::ble_status,
+            commands::ble_is_connected,
             commands::upload_content_to_device,
+            commands::upload_local_file_to_device,
         ])
         .setup(|app| {
             log::info!("Pixel Dumpster Control starting");

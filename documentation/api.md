@@ -166,6 +166,31 @@ curl -X POST --data-binary @fire/0001.png \
   "http://pixel-dumpster.local:8088/api/upload?path=fire/0001.png"
 ```
 
+### POST /api/ota
+
+Pushes a firmware image over WiFi into the inactive OTA partition, validates it,
+sets it as the next boot target, and reboots. Body is the raw `.bin` (same file
+`idf.py` flashes as the app image). Requires `Content-Length`. Max size is the
+OTA slot size (~1.81 MiB).
+
+**Request:**
+```
+POST /api/ota
+Content-Type: application/octet-stream
+
+<raw pixel-dumpster.bin>
+```
+
+**Response:** `{"ok":true,"reboot":true}` then the device restarts.
+
+```bash
+curl -X POST --data-binary @build/pixel-dumpster.bin \
+  "http://pixel-dumpster.local:8088/api/ota"
+```
+
+The first image that includes this endpoint must still be flashed over USB; after
+that, subsequent firmware updates can use this path.
+
 ### GET /api/config
 
 Returns the current transition/display/attract configuration.

@@ -526,32 +526,56 @@ extern "C" void pd_display_set_pixel(uint16_t x, uint16_t y, pd_display_color_t 
     }
 }
 
+extern "C" void pd_display_render_rgb_at(int x, int y, const uint8_t *rgb, int img_w, int img_h)
+{
+    if (!pd_display_driver || !rgb || img_w <= 0 || img_h <= 0) return;
+    int dw = pd_display_current_width;
+    int dh = pd_display_current_height;
+
+    /* Clip destination rect to the canvas and adjust source origin. */
+    int src_x = 0;
+    int src_y = 0;
+    int blit_w = img_w;
+    int blit_h = img_h;
+    int dx = x;
+    int dy = y;
+
+    if (dx < 0) {
+        src_x = -dx;
+        blit_w += dx;
+        dx = 0;
+    }
+    if (dy < 0) {
+        src_y = -dy;
+        blit_h += dy;
+        dy = 0;
+    }
+    if (dx + blit_w > dw) blit_w = dw - dx;
+    if (dy + blit_h > dh) blit_h = dh - dy;
+    if (blit_w <= 0 || blit_h <= 0) return;
+
+    if (src_x == 0 && blit_w == img_w) {
+        /* No horizontal crop: rows stay tightly packed — one bulk call, or
+         * a vertical crop via a row offset into the source. */
+        const uint8_t *src = rgb + (size_t)src_y * (size_t)img_w * 3;
+        pd_display_draw_bulk_rgb888(dx, dy, blit_w, blit_h, src);
+    } else {
+        /* Horizontal crop: source row stride is img_w, so draw row-by-row. */
+        for (int row = 0; row < blit_h; row++) {
+            const uint8_t *src = rgb + ((size_t)(src_y + row) * (size_t)img_w + (size_t)src_x) * 3;
+            pd_display_draw_bulk_rgb888(dx, dy + row, blit_w, 1, src);
+        }
+    }
+}
+
 extern "C" void pd_display_render_rgb(const uint8_t *rgb, int img_w, int img_h)
 {
     if (!pd_display_driver || !rgb) return;
     int dw = pd_display_current_width;
     int dh = pd_display_current_height;
-    /* center the image if smaller than display */
     int ox = (img_w < dw) ? (dw - img_w) / 2 : 0;
     int oy = (img_h < dh) ? (dh - img_h) / 2 : 0;
-    /* blit image pixels (no clear — overwrite in place to avoid flicker) */
-    int blit_w = (img_w < dw) ? img_w : dw;
-    int blit_h = (img_h < dh) ? img_h : dh;
-
-    if (blit_w == img_w) {
-        /* common case: no horizontal cropping, so the source is already
-         * tightly packed at blit_w — one bulk call for the whole image. */
-        pd_display_draw_bulk_rgb888(ox, oy, blit_w, blit_h, rgb);
-    } else {
-        /* image wider than display: source row stride (img_w) doesn't match
-         * the drawn width (blit_w), so draw_pixels()'s "tightly packed"
-         * assumption doesn't hold for the whole buffer at once — bulk-draw
-         * one row at a time instead (still blit_h calls instead of
-         * blit_w*blit_h). */
-        for (int y = 0; y < blit_h; y++) {
-            pd_display_draw_bulk_rgb888(ox, oy + y, blit_w, 1, rgb + (size_t)y * img_w * 3);
-        }
-    }
+    pd_display_render_rgb_at(ox, oy, rgb, img_w, img_h);
 }
 
 extern "C" void pd_display_render_framebuf(const uint8_t *rgb)

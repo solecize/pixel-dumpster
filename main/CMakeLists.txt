@@ -1,5 +1,5 @@
 idf_component_register(
     SRCS "app-main.c"
     INCLUDE_DIRS "."
-    REQUIRES pd-config pd-content pd-display pd-network pd-serial-cmd pd-storage pd-wizard pd-discovery esp_timer
+    REQUIRES pd-config pd-content pd-display pd-network pd-serial-cmd pd-storage pd-wizard pd-discovery pd-ble esp_timer
 )

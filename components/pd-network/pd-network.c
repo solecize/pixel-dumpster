@@ -39,7 +39,7 @@ static int pd_udp_socket = -1;
 static time_t pd_now_mtime = 0;
 
 /* Forward declaration */
-static void pd_network_start_mdns(void);
+static bool pd_network_start_mdns(void);
 
 static void pd_network_handle_wifi_event(void *arg, esp_event_base_t event_base, int32_t event_id, void *event_data)
 {
@@ -340,10 +340,11 @@ static esp_err_t pd_network_start_http(void)
 
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.server_port = pd_network_config.http_port;
-    config.max_uri_handlers = 24;
+    config.max_uri_handlers = 28;
     config.max_resp_headers = 8;
-    config.recv_wait_timeout = 10;
-    config.send_wait_timeout = 10;
+    /* OTA flash erase can stall WiFi for >10s; keep the socket alive. */
+    config.recv_wait_timeout = 60;
+    config.send_wait_timeout = 60;
     config.stack_size = 8192;
 
     if (httpd_start(&pd_http_server, &config) != ESP_OK) {
@@ -479,33 +480,36 @@ static void pd_network_poll_now_json(void)
     }
 }
 
-static void pd_network_start_mdns(void)
+static bool pd_network_start_mdns(void)
 {
     esp_err_t err = mdns_init();
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "mdns init failed: %s", esp_err_to_name(err));
-        return;
+        return false;
     }
 
-    const char *hostname = pd_network_config.hostname[0]
-                           ? pd_network_config.hostname
-                           : "pixeldumpster";
+    /* Use the config already loaded once at boot instead of re-reading and
+     * re-parsing config.json from flash here. */
+    pd_config_t *cfg = pd_config_get_active();
+
+    /* Prefer explicit hostname; fall back to device_name so .local matches the
+     * BLE/advertise name users already know (e.g. pixel-dumpster-1). */
+    const char *hostname = "pixeldumpster";
+    if (pd_network_config.hostname[0]) {
+        hostname = pd_network_config.hostname;
+    } else if (cfg && cfg->device_name[0]) {
+        hostname = cfg->device_name;
+    }
     mdns_hostname_set(hostname);
-    mdns_instance_name_set("Pixel Dumpster");
+    mdns_instance_name_set(hostname);
 
     /* advertise HTTP service for control-center discovery */
-    mdns_service_add("Pixel Dumpster", "_pdumpster", "_tcp",
+    mdns_service_add(hostname, "_pdumpster", "_tcp",
                      pd_network_config.http_port, NULL, 0);
 
     /* add TXT records with device metadata */
     mdns_service_txt_item_set("_pdumpster", "_tcp", "version", "1");
 
-    /* Use the config already loaded once at boot instead of re-reading and
-     * re-parsing config.json from flash here. This handler can run on the
-     * small sys_evt task stack (see pd_network_handle_wifi_event), and a
-     * fresh pd_config_load() + cJSON_Parse() call chain on that stack was
-     * overflowing it and corrupting adjacent heap metadata. */
-    pd_config_t *cfg = pd_config_get_active();
     int width = cfg ? cfg->matrix_width : 0;
     int height = cfg ? cfg->matrix_height : 0;
 
@@ -519,6 +523,7 @@ static void pd_network_start_mdns(void)
 
     ESP_LOGI(TAG, "mdns started: %s._pdumpster._tcp port %d",
              hostname, pd_network_config.http_port);
+    return true;
 }
 
 esp_err_t pd_network_init(const pd_network_config_t *config)
@@ -609,9 +614,11 @@ void pd_network_poll(void)
     pd_network_check_udp();
     pd_network_poll_now_json();
     if (pd_mdns_pending && !pd_mdns_started) {
-        pd_network_start_mdns();
-        pd_mdns_started = true;
-        pd_mdns_pending = false;
+        /* Only clear pending on success so a transient OOM can retry. */
+        if (pd_network_start_mdns()) {
+            pd_mdns_started = true;
+            pd_mdns_pending = false;
+        }
     }
     if (!pd_http_server && pd_wifi_connected) {
         pd_network_start_http();

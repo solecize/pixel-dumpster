@@ -30,6 +30,9 @@ typedef struct {
     int  current_frame;
     int  total_frames;
     int  fps;
+    /* Palette-cache state for the current sequence when auto_quantize is on:
+     * "off" | "building" | "live" | "fallback" */
+    char cache[16];
 } pd_content_status_t;
 
 /* transition mode */
@@ -75,6 +78,10 @@ int pd_content_list_images(pd_content_entry_t *entries, int max_entries);
 esp_err_t pd_content_play(const char *path);
 esp_err_t pd_content_play_with_transition(const char *path, const char *transition,
                                           int duration_ms);
+/* Cheap path check + enqueue onto the pd_play worker (same as HTTP /api/play).
+ * Safe to call from NimBLE / USB wizard context. Returns ESP_ERR_NOT_FOUND if
+ * the path is missing; decode/play errors are logged on the worker. */
+esp_err_t pd_content_play_async(const char *path, const char *transition, int duration_ms);
 esp_err_t pd_content_stop(void);
 pd_content_status_t pd_content_get_status(void);
 
@@ -84,6 +91,15 @@ esp_err_t pd_content_register_http(httpd_handle_t server);
 
 esp_err_t pd_content_store_file(const char *rel_path, const uint8_t *data, size_t len);
 esp_err_t pd_content_delete_file(const char *rel_path);
+
+/* Streaming upload (BLE / serial NDJSON). Max size matches HTTP /api/upload. */
+#define PD_CONTENT_UPLOAD_MAX_BYTES (2 * 1024 * 1024)
+esp_err_t pd_content_upload_begin(const char *rel_path, size_t total_size);
+esp_err_t pd_content_upload_write(const uint8_t *data, size_t len);
+esp_err_t pd_content_upload_finish(void);
+void pd_content_upload_abort(void);
+bool pd_content_upload_active(void);
+size_t pd_content_upload_received(void);
 
 /* Render discovery/source status screen (immediate, no auto-revert) */
 void pd_content_render_source_status(void);

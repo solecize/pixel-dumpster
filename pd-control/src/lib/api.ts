@@ -311,16 +311,91 @@ export async function wizardPoll(): Promise<string[]> {
   return invoke("wizard_poll");
 }
 
+export async function wizardIsConnected(): Promise<boolean> {
+  return invoke("wizard_is_connected");
+}
+
+// --- BLE secondary transport ---
+
+export interface BleDeviceInfo {
+  id: string;
+  name: string;
+  rssi: number | null;
+}
+
+export async function bleScan(nameFilter?: string): Promise<BleDeviceInfo[]> {
+  return invoke("ble_scan", { nameFilter: nameFilter ?? null });
+}
+
+export async function bleConnect(id: string): Promise<string[]> {
+  return invoke("ble_connect", { id });
+}
+
+export async function bleDisconnect(): Promise<void> {
+  return invoke("ble_disconnect");
+}
+
+export async function bleSend(command: string): Promise<string[]> {
+  return invoke("ble_send", { command });
+}
+
+export async function blePoll(): Promise<string[]> {
+  return invoke("ble_poll");
+}
+
+export async function blePlay(
+  path: string,
+  transition?: string,
+  durationMs?: number
+): Promise<string[]> {
+  return invoke("ble_play", {
+    path,
+    transition: transition ?? null,
+    durationMs: durationMs ?? null,
+  });
+}
+
+export async function bleStop(): Promise<string[]> {
+  return invoke("ble_stop");
+}
+
+export async function bleStatus(): Promise<string[]> {
+  return invoke("ble_status");
+}
+
+export async function bleIsConnected(): Promise<boolean> {
+  return invoke("ble_is_connected");
+}
+
 // --- Content Upload ---
 
 export async function uploadContentToDevice(
   deviceIp: string,
   devicePort: number,
-  contentPath: string
+  contentPath: string,
+  via?: "wifi" | "bluetooth" | "usb"
 ): Promise<void> {
   return invoke("upload_content_to_device", {
     deviceIp,
     devicePort,
     contentPath,
+    via: via ?? null,
+  });
+}
+
+/** Upload a local PNG; returns the remote path written on the device. */
+export async function uploadLocalFileToDevice(
+  deviceIp: string,
+  devicePort: number,
+  localPath: string,
+  remotePath?: string,
+  via?: "wifi" | "bluetooth" | "usb"
+): Promise<string> {
+  return invoke("upload_local_file_to_device", {
+    deviceIp,
+    devicePort,
+    localPath,
+    remotePath: remotePath ?? null,
+    via: via ?? null,
   });
 }

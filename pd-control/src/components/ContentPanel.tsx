@@ -1,76 +1,134 @@
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, useRef } from "react";
+import { open } from "@tauri-apps/plugin-dialog";
 import type { DiscoveredDevice, DeviceStatus, ContentEntry } from "../lib/types";
+import { addManualDevice } from "../lib/api";
 import {
-  getDeviceStatus,
-  getDeviceContent,
-  getDeviceConfig,
-  setDeviceConfig,
-  devicePlay,
-  deviceStop,
-  addManualDevice,
-  uploadContentToDevice,
-} from "../lib/api";
-import { testContent } from "../lib/testContent";
+  controlGetAutoQuantize,
+  controlListContent,
+  controlPlay,
+  controlSetAutoQuantize,
+  controlStatus,
+  controlStop,
+  controlUploadLocal,
+  preferredControlTransport,
+} from "../lib/deviceControl";
+import type { TransportKind, TransportLinks } from "../lib/transport";
+import { EMPTY_TRANSPORT } from "../lib/transport";
+import {
+  loadAutoQuantizePref,
+  saveAutoQuantizePref,
+} from "../lib/deviceSession";
+import type { ControlViaPref } from "../lib/transportPrefs";
+import { DeviceCard } from "./DeviceCard";
+import { TransportDock } from "./TransportDock";
+import { ControlViaPicker } from "./ControlViaPicker";
 
 interface ContentPanelProps {
   devices: DiscoveredDevice[];
   selected: DiscoveredDevice | null;
+  links?: TransportLinks;
+  controlViaPref?: ControlViaPref | null;
+  onControlViaChange?: (kind: ControlViaPref) => void;
   onSelect: (device: DiscoveredDevice) => void;
   onScan: () => void;
   scanning: boolean;
   onDevicesChange: (devices: DiscoveredDevice[]) => void;
+  onConfigureTransport: (
+    device: DiscoveredDevice | null,
+    kind: TransportKind
+  ) => void;
 }
 
 export function ContentPanel({
   devices,
   selected,
+  links = EMPTY_TRANSPORT,
+  controlViaPref = null,
+  onControlViaChange,
   onSelect,
   onScan,
   scanning,
   onDevicesChange,
+  onConfigureTransport,
 }: ContentPanelProps) {
   const [status, setStatus] = useState<DeviceStatus | null>(null);
   const [content, setContent] = useState<ContentEntry[]>([]);
   const [error, setError] = useState<string | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
   const [showManual, setShowManual] = useState(false);
   const [manualIp, setManualIp] = useState("");
   const [manualPort, setManualPort] = useState("8088");
-  const [uploadingTest, setUploadingTest] = useState<string | null>(null);
-  const [autoQuantizePalette, setAutoQuantizePalette] = useState(false);
+  const [uploading, setUploading] = useState(false);
+  const [autoQuantizePalette, setAutoQuantizePalette] = useState(() =>
+    Boolean(loadAutoQuantizePref(selected))
+  );
   const [autoQuantizeSaving, setAutoQuantizeSaving] = useState(false);
   const [autoQuantizeSaved, setAutoQuantizeSaved] = useState<string | null>(null);
 
   const device = selected;
+  const controlVia = preferredControlTransport(links, controlViaPref);
+  const linksRef = useRef(links);
+  linksRef.current = links;
+  const preferRef = useRef(controlViaPref);
+  preferRef.current = controlViaPref;
+  /** Skip background status polls while play/list/upload owns the link. */
+  const busyRef = useRef(false);
+
+  useEffect(() => {
+    const remembered = loadAutoQuantizePref(device);
+    if (remembered !== null) setAutoQuantizePalette(remembered);
+  }, [device?.name, device?.ip]);
 
   const refreshStatus = useCallback(async () => {
-    if (!device) return;
+    if (!device || busyRef.current) return;
+    const l = linksRef.current;
+    if (!preferredControlTransport(l, preferRef.current)) return;
     try {
-      const s = await getDeviceStatus(device.ip, device.port);
+      const s = await controlStatus(device, l);
       setStatus(s);
-      setError(null);
+      /* Clear only connectivity-style banners; keep play/action errors until
+       * the next explicit action clears them. */
+      setError((prev) =>
+        prev &&
+        /timed out|could not connect|error sending request|No control transport/i.test(
+          prev
+        )
+          ? null
+          : prev
+      );
     } catch (err) {
-      setError(String(err));
+      /* Status is polled every few seconds — don't flash a red banner when
+       * the device is briefly busy (e.g. building a palette cache). */
+      console.warn("status poll failed:", err);
     }
   }, [device]);
 
   const refreshContent = useCallback(async () => {
     if (!device) return;
+    const l = linksRef.current;
+    if (!preferredControlTransport(l, preferRef.current)) return;
+    busyRef.current = true;
     try {
-      const c = await getDeviceContent(device.ip, device.port);
+      const c = await controlListContent(device, l);
       setContent(c.items || []);
     } catch (err) {
-      setError(String(err));
+      console.warn("content list failed:", err);
+    } finally {
+      busyRef.current = false;
     }
   }, [device]);
 
   const refreshPlaybackConfig = useCallback(async () => {
     if (!device) return;
+    const remembered = loadAutoQuantizePref(device);
+    if (remembered !== null) setAutoQuantizePalette(remembered);
     try {
-      const cfg = (await getDeviceConfig(device.ip, device.port)) as {
-        display?: { auto_quantize_palette?: boolean };
-      };
-      setAutoQuantizePalette(Boolean(cfg?.display?.auto_quantize_palette));
-      setAutoQuantizeSaved(null);
+      const aq = await controlGetAutoQuantize(device, linksRef.current);
+      if (aq !== null) {
+        setAutoQuantizePalette(aq);
+        saveAutoQuantizePref(device, aq);
+        setAutoQuantizeSaved(null);
+      }
     } catch (err) {
       /* Non-fatal — older firmware may not expose the field yet. */
       console.warn("Playback config load error:", err);
@@ -81,20 +139,28 @@ export function ContentPanel({
     refreshStatus();
     refreshContent();
     refreshPlaybackConfig();
-    const interval = setInterval(refreshStatus, 3000);
+    /* BLE/USB status is expensive and used to steal play/list bandwidth.
+     * Poll much less often than WiFi HTTP. */
+    const ms =
+      controlVia === "bluetooth" || controlVia === "usb" ? 15000 : 3000;
+    const interval = setInterval(refreshStatus, ms);
     return () => clearInterval(interval);
-  }, [refreshStatus, refreshContent, refreshPlaybackConfig]);
+  }, [
+    controlVia,
+    controlViaPref,
+    refreshStatus,
+    refreshContent,
+    refreshPlaybackConfig,
+  ]);
 
   const handleAutoQuantizeChange = async (next: boolean) => {
     if (!device) return;
     setAutoQuantizePalette(next);
+    saveAutoQuantizePref(device, next);
     setAutoQuantizeSaving(true);
     setAutoQuantizeSaved(null);
     try {
-      await setDeviceConfig(device.ip, device.port, {
-        display: { auto_quantize_palette: next },
-        save: true,
-      });
+      await controlSetAutoQuantize(device, links, next);
       setAutoQuantizeSaved(
         next
           ? "On — sequences will use a 64-color PSRAM cache on next play."
@@ -102,6 +168,7 @@ export function ContentPanel({
       );
     } catch (err) {
       setAutoQuantizePalette(!next);
+      saveAutoQuantizePref(device, !next);
       setAutoQuantizeSaved(`Error: ${String(err)}`);
     } finally {
       setAutoQuantizeSaving(false);
@@ -110,46 +177,70 @@ export function ContentPanel({
 
   const handlePlay = async (path: string) => {
     if (!device) return;
+    busyRef.current = true;
     try {
-      await devicePlay(device.ip, device.port, path, "fade", 800);
-      setTimeout(refreshStatus, 500);
+      /* Instant cut — fade 800ms was a large chunk of BLE "lag" for stills. */
+      await controlPlay(device, links, path, "none", 0);
+      setTimeout(refreshStatus, 400);
     } catch (err) {
       setError(String(err));
+    } finally {
+      busyRef.current = false;
     }
   };
 
   const handleStop = async () => {
     if (!device) return;
+    busyRef.current = true;
     try {
-      await deviceStop(device.ip, device.port);
+      await controlStop(device, links);
       setTimeout(refreshStatus, 500);
-    } catch (err) {
-      setError(String(err));
-    }
-  };
-
-  const handlePlayTest = async (testPath: string) => {
-    if (!device) return;
-    setUploadingTest(testPath);
-    try {
-      if (testPath.startsWith("system/")) {
-        await devicePlay(device.ip, device.port, testPath, "fade", 800);
-      } else {
-        // First try to play - if the device doesn't have it yet, upload then play
-        try {
-          await devicePlay(device.ip, device.port, testPath, "fade", 800);
-        } catch {
-          await uploadContentToDevice(device.ip, device.port, testPath);
-          await new Promise((resolve) => setTimeout(resolve, 500));
-          await devicePlay(device.ip, device.port, testPath, "fade", 800);
-        }
-      }
-      setTimeout(refreshStatus, 500);
-      setError(null);
     } catch (err) {
       setError(String(err));
     } finally {
-      setUploadingTest(null);
+      busyRef.current = false;
+    }
+  };
+
+  const handleUpload = async () => {
+    if (!device) return;
+    if (!preferredControlTransport(links, controlViaPref)) {
+      setError("Connect WiFi, Bluetooth, or USB before uploading.");
+      return;
+    }
+    try {
+      const selectedPath = await open({
+        multiple: false,
+        filters: [{ name: "PNG image", extensions: ["png"] }],
+      });
+      if (!selectedPath || Array.isArray(selectedPath)) return;
+
+      setUploading(true);
+      busyRef.current = true;
+      setError(null);
+      setNotice(null);
+      const via = preferredControlTransport(links, controlViaPref);
+      const remote = await controlUploadLocal(device, links, selectedPath);
+      await refreshContent();
+      setNotice(`Uploaded ${remote} via ${via}.`);
+      try {
+        await controlPlay(device, links, remote, "none", 0);
+        setTimeout(refreshStatus, 400);
+      } catch (playErr) {
+        setNotice(
+          `Uploaded ${remote} via ${via}, but play failed: ${String(playErr)}`
+        );
+      }
+    } catch (err) {
+      const via = preferredControlTransport(links, controlViaPref);
+      setError(
+        via
+          ? `Upload failed (${via}): ${String(err)}`
+          : String(err)
+      );
+    } finally {
+      busyRef.current = false;
+      setUploading(false);
     }
   };
 
@@ -168,61 +259,87 @@ export function ContentPanel({
 
   // No device selected
   if (!device) {
+    const hasOfflineLink = links.bluetooth || links.usb;
     return (
       <div className="space-y-6">
-        <div className="flex items-center justify-between">
+        <div className="flex items-center justify-between gap-2 flex-wrap">
           <h2 className="text-xl font-bold">Content</h2>
-          <button
-            onClick={onScan}
-            disabled={scanning}
-            className="px-4 py-1.5 text-sm bg-pd-accent hover:bg-indigo-600 text-white rounded transition disabled:opacity-50"
-          >
-            {scanning ? "Scanning..." : "Scan Network"}
-          </button>
+          <div className="flex items-center gap-2">
+            <TransportDock
+              links={links}
+              onConfigure={(kind) => onConfigureTransport(null, kind)}
+            />
+            <button
+              onClick={onScan}
+              disabled={scanning}
+              className="px-4 py-1.5 text-sm bg-pd-accent hover:bg-indigo-600 text-white rounded transition disabled:opacity-50"
+            >
+              {scanning ? "Scanning..." : "Scan Network"}
+            </button>
+          </div>
         </div>
 
         {scanning ? (
           <div className="flex items-center justify-center h-64">
             <div className="text-center">
-              <div className="inline-block w-8 h-8 border-2 border-gray-600 border-t-purple-500 rounded-full animate-spin mb-4" />
+              <div className="inline-block w-8 h-8 border-2 border-gray-600 border-t-pd-accent rounded-full animate-spin mb-4" />
               <p className="text-gray-400">Scanning for devices...</p>
             </div>
           </div>
         ) : devices.length > 0 ? (
           <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
-            {devices.map((d, i) => (
-              <button
-                key={i}
-                onClick={() => onSelect(d)}
-                className="bg-pd-panel border border-pd-border rounded-lg p-4 text-left hover:border-pd-accent/50 transition"
-              >
-                <div className="flex items-center gap-2 mb-2">
-                  <span className="w-2 h-2 rounded-full bg-pd-green" />
-                  <span className="font-medium">{d.name}</span>
-                </div>
-                <div className="text-sm text-gray-500">
-                  {d.ip}:{d.port}
-                  {d.txt.width && (
-                    <span className="ml-2">
-                      {d.txt.width}x{d.txt.height}
-                    </span>
-                  )}
-                </div>
-              </button>
+            {devices.map((d) => (
+              <DeviceCard
+                key={`${d.ip}:${d.port}`}
+                device={d}
+                links={{
+                  bluetooth: links.bluetooth,
+                  usb: links.usb,
+                  /* Discovered over mDNS ⇒ reachable on WiFi for listing purposes */
+                  wifi: d.ip !== "0.0.0.0",
+                }}
+                onSelect={onSelect}
+                onConfigureTransport={onConfigureTransport}
+              />
             ))}
+          </div>
+        ) : hasOfflineLink ? (
+          <div className="bg-pd-panel rounded-lg p-8 border border-pd-border text-center">
+            <p className="text-gray-300 mb-2">
+              {links.bluetooth ? "Bluetooth" : "USB"} is connected.
+            </p>
+            <p className="text-sm text-gray-500">
+              Preparing content over{" "}
+              {links.bluetooth ? "Bluetooth" : "USB"}…
+            </p>
           </div>
         ) : (
           <div className="bg-pd-panel rounded-lg p-8 border border-pd-border text-center">
-            <p className="text-gray-400 mb-4">No devices found on the network.</p>
+            <p className="text-gray-400 mb-4">No device selected.</p>
             <p className="text-sm text-gray-600 mb-6">
-              Make sure your ESP32 is powered on and connected to WiFi.
+              Connect Bluetooth or USB in Settings, or scan the network when the
+              device is on WiFi.
             </p>
-            <div className="flex gap-2 justify-center">
+            <div className="flex gap-2 justify-center flex-wrap">
+              <button
+                type="button"
+                onClick={() => onConfigureTransport(null, "bluetooth")}
+                className="px-4 py-2 text-sm bg-pd-accent hover:bg-indigo-600 text-white rounded transition"
+              >
+                Connect Bluetooth
+              </button>
+              <button
+                type="button"
+                onClick={() => onConfigureTransport(null, "usb")}
+                className="px-4 py-2 text-sm bg-pd-border hover:bg-gray-600 text-white rounded transition"
+              >
+                Connect USB
+              </button>
               <button
                 onClick={() => setShowManual(!showManual)}
                 className="px-4 py-2 text-sm bg-pd-border hover:bg-gray-600 text-white rounded transition"
               >
-                Add Manually
+                Add WiFi Manually
               </button>
             </div>
             {showManual && (
@@ -261,17 +378,35 @@ export function ContentPanel({
   return (
     <div className="space-y-6">
       {/* Header with device selector */}
-      <div className="flex items-center justify-between">
+      <div className="flex items-center justify-between gap-3 flex-wrap">
         <div>
           <h2 className="text-xl font-bold">{device.name}</h2>
           <p className="text-sm text-gray-500">
-            {device.ip}:{device.port}
+            {controlVia === "bluetooth"
+              ? "via Bluetooth"
+              : controlVia === "usb"
+                ? "via USB"
+                : device.ip !== "0.0.0.0"
+                  ? `${device.ip}:${device.port}`
+                  : "not reachable over WiFi"}
             {device.txt.width && (
-              <span className="ml-2">{device.txt.width}x{device.txt.height}</span>
+              <span className="ml-2">
+                {device.txt.width}x{device.txt.height}
+              </span>
             )}
           </p>
         </div>
-        <div className="flex items-center gap-2">
+        <div className="flex items-center gap-2 flex-wrap">
+          <ControlViaPicker
+            links={links}
+            value={controlVia}
+            onChange={(kind) => onControlViaChange?.(kind)}
+          />
+          <TransportDock
+            links={links}
+            activeControl={controlVia}
+            onConfigure={(kind) => onConfigureTransport(device, kind)}
+          />
           <select
             value={`${device.ip}:${device.port}`}
             onChange={(e) => {
@@ -300,6 +435,11 @@ export function ContentPanel({
       {error && (
         <div className="p-3 bg-pd-red/10 border border-pd-red/30 rounded text-sm text-pd-red">
           {error}
+        </div>
+      )}
+      {notice && (
+        <div className="p-3 bg-pd-green/10 border border-pd-green/30 rounded text-sm text-pd-green">
+          {notice}
         </div>
       )}
 
@@ -371,14 +511,25 @@ export function ContentPanel({
 
       {/* Content Library */}
       <div>
-        <div className="flex items-center justify-between mb-3">
+        <div className="flex items-center justify-between mb-3 gap-2">
           <h3 className="font-semibold">Content Library ({content.length})</h3>
-          <button
-            onClick={refreshContent}
-            className="px-3 py-1 text-sm bg-pd-border hover:bg-gray-600 rounded transition"
-          >
-            Refresh
-          </button>
+          <div className="flex items-center gap-2">
+            <button
+              onClick={handleUpload}
+              disabled={
+                uploading || !preferredControlTransport(links, controlViaPref)
+              }
+              className="px-3 py-1 text-sm bg-pd-accent hover:bg-indigo-600 text-white rounded transition disabled:opacity-50"
+            >
+              {uploading ? "Uploading…" : "Upload PNG"}
+            </button>
+            <button
+              onClick={refreshContent}
+              className="px-3 py-1 text-sm bg-pd-border hover:bg-gray-600 rounded transition"
+            >
+              Refresh
+            </button>
+          </div>
         </div>
         <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
           {content.map((item) => (
@@ -399,47 +550,9 @@ export function ContentPanel({
         </div>
         {content.length === 0 && (
           <p className="text-gray-500 text-sm text-center py-8">
-            No content found on device.
+            No content on device. Upload a PNG to get started.
           </p>
         )}
-      </div>
-
-      {/* Test Content — built-in samples for trying out animations/transitions */}
-      <div>
-        <div className="flex items-center justify-between mb-3">
-          <h3 className="font-semibold">Test Content</h3>
-          <span className="text-xs text-gray-600">Built-in samples</span>
-        </div>
-        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
-          {testContent.map((item) => (
-            <button
-              key={item.path}
-              onClick={() => handlePlayTest(item.path)}
-              disabled={uploadingTest === item.path}
-              className="bg-pd-panel/50 border border-pd-border/50 rounded-lg p-3 text-left hover:border-purple-500/50 transition disabled:opacity-50 disabled:cursor-wait"
-            >
-              <div className="flex items-start justify-between mb-1">
-                <div className="text-sm font-medium truncate flex-1">
-                  {item.name}
-                </div>
-                <span className="text-xs px-1.5 py-0.5 rounded bg-purple-600/20 text-purple-400 ml-2 flex-shrink-0">
-                  {item.category}
-                </span>
-              </div>
-              <div className="text-xs text-gray-500 mb-1">
-                {item.description}
-              </div>
-              <div className="text-xs text-gray-600">
-                {item.path}
-              </div>
-              {uploadingTest === item.path && (
-                <div className="text-xs text-purple-400 mt-1">
-                  Uploading...
-                </div>
-              )}
-            </button>
-          ))}
-        </div>
       </div>
     </div>
   );

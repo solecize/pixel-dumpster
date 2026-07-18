@@ -6,15 +6,12 @@ import {
   getDeviceContent,
   devicePlay,
   deviceStop,
-  uploadContentToDevice,
   getDeviceLayout,
   setDeviceLayout,
   previewDeviceLayout,
   startTestPattern,
   stopTestPattern,
 } from "../lib/api";
-import { testContent } from "../lib/testContent";
-
 const TEST_PATTERNS = [
   { id: "color_test", label: "Color Test", desc: "Red / Green / Blue bands — best for checking colour order" },
   { id: "numbered_panels", label: "Numbered Panels", desc: "Panel 1, 2, 3… on each module" },
@@ -33,7 +30,6 @@ export function DevicePanel({ device }: DevicePanelProps) {
   const [status, setStatus] = useState<DeviceStatus | null>(null);
   const [content, setContent] = useState<ContentEntry[]>([]);
   const [error, setError] = useState<string | null>(null);
-  const [uploadingTest, setUploadingTest] = useState<string | null>(null);
   const [layout, setLayout] = useState<Record<string, unknown> | null>(null);
   const [editLayout, setEditLayout] = useState(false);
   const [layoutForm, setLayoutForm] = useState({ panel_width: 64, panel_height: 32, panel_rows: 1, panel_cols: 1, chain_pattern: 0, panel_rotation_deg: 0, color_order: 0 });
@@ -48,9 +44,14 @@ export function DevicePanel({ device }: DevicePanelProps) {
     try {
       const s = await getDeviceStatus(device.ip, device.port);
       setStatus(s);
-      setError(null);
+      setError((prev) =>
+        prev && /timed out|could not connect|error sending request/i.test(prev)
+          ? null
+          : prev
+      );
     } catch (err) {
-      setError(String(err));
+      /* Polled — don't surface transient busy-device timeouts as a banner. */
+      console.warn("status poll failed:", err);
     }
   }, [device.ip, device.port]);
 
@@ -104,33 +105,6 @@ export function DevicePanel({ device }: DevicePanelProps) {
       setTimeout(refreshStatus, 500);
     } catch (err) {
       setError(String(err));
-    }
-  };
-
-  const handlePlayTest = async (testPath: string) => {
-    setUploadingTest(testPath);
-    try {
-      // System paths are special and don't need upload
-      if (testPath.startsWith("system/")) {
-        await devicePlay(device.ip, device.port, testPath, "fade", 800);
-      } else {
-        // First try to play - if it fails, upload then play
-        try {
-          await devicePlay(device.ip, device.port, testPath, "fade", 800);
-        } catch {
-          // Content not on device, upload it
-          await uploadContentToDevice(device.ip, device.port, testPath);
-          // Wait a moment for upload to complete, then play
-          await new Promise(resolve => setTimeout(resolve, 500));
-          await devicePlay(device.ip, device.port, testPath, "fade", 800);
-        }
-      }
-      setTimeout(refreshStatus, 500);
-      setError(null);
-    } catch (err) {
-      setError(String(err));
-    } finally {
-      setUploadingTest(null);
     }
   };
 
@@ -291,45 +265,6 @@ export function DevicePanel({ device }: DevicePanelProps) {
             </p>
           )}
 
-          {/* Test Content Section */}
-          <div className="mt-8 pt-6 border-t border-pd-border">
-            <div className="flex items-center justify-between mb-3">
-              <h3 className="font-semibold text-sm text-gray-400">
-                Test Content
-              </h3>
-              <span className="text-xs text-gray-600">Built-in samples</span>
-            </div>
-            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
-              {testContent.map((item) => (
-                <button
-                  key={item.path}
-                  onClick={() => handlePlayTest(item.path)}
-                  disabled={uploadingTest === item.path}
-                  className="bg-pd-panel/50 border border-pd-border/50 rounded-lg p-3 text-left hover:border-purple-500/50 transition disabled:opacity-50 disabled:cursor-wait"
-                >
-                  <div className="flex items-start justify-between mb-1">
-                    <div className="text-sm font-medium truncate flex-1">
-                      {item.name}
-                    </div>
-                    <span className="text-xs px-1.5 py-0.5 rounded bg-purple-600/20 text-purple-400 ml-2 flex-shrink-0">
-                      {item.category}
-                    </span>
-                  </div>
-                  <div className="text-xs text-gray-500 mb-1">
-                    {item.description}
-                  </div>
-                  <div className="text-xs text-gray-600">
-                    {item.path}
-                  </div>
-                  {uploadingTest === item.path && (
-                    <div className="text-xs text-purple-400 mt-1">
-                      Uploading...
-                    </div>
-                  )}
-                </button>
-              ))}
-            </div>
-          </div>
         </div>
       )}
 

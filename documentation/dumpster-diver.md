@@ -128,6 +128,16 @@ POST http://192.168.1.154:8088/api/play
 {"path":"marquees/arcade/pacman","transition":"fade","duration_ms":500}
 ```
 
+### BLE (via pd-ble-bridge)
+
+Secondary path when WiFi is down. Run [`tools/pd-ble-bridge`](../tools/pd-ble-bridge/README.md) on the Pi, then:
+
+```bash
+./dumpster-diver --ble-bridge 127.0.0.1:9877
+```
+
+or config `"transport": "ble", "ble": { "bridge": "127.0.0.1:9877" }`. Same NDJSON framing as USB serial. See [ble-transport.md](ble-transport.md).
+
 ### USB Serial
 
 For wired setups. Sends newline-terminated JSON over serial:
@@ -152,6 +162,14 @@ Commands sent from host to ESP32:
 | Stop playback | `{"cmd":"stop"}` | `{"type":"ack","cmd":"stop","ok":true}` |
 | Get status | `{"cmd":"status"}` | `{"type":"status","playing":true,"path":"..."}` |
 | List content | `{"cmd":"list"}` | `{"type":"list","items":[...]}` |
+| Upload begin | `{"cmd":"upload_begin","path":"...","size":N}` | `{"type":"ack","cmd":"upload_begin","ok":true,"size":N}` |
+| Upload chunk | `{"cmd":"upload_chunk","data":"<base64>"}` | `{"type":"ack","cmd":"upload_chunk","ok":true,"received":N}` |
+| Upload end | `{"cmd":"upload_end"}` | `{"type":"ack","cmd":"upload_end","ok":true,"size":N}` |
+| Upload abort | `{"cmd":"upload_abort"}` | `{"type":"ack","cmd":"upload_abort","ok":true}` |
+
+When `transport` is `serial` or `ble`, marquee auto-upload uses the NDJSON
+upload commands above. WiFi transport still uses `POST /api/upload`. See
+[ble-transport.md](ble-transport.md).
 
 ## Event Sources
 

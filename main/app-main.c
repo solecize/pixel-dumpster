@@ -18,6 +18,7 @@
 #include "pd-serial-cmd.h"
 #include "pd-wizard.h"
 #include "pd-discovery.h"
+#include "pd-ble.h"
 
 static const char *TAG = "pixel-dumpster";
 
@@ -129,6 +130,15 @@ static void initialize_system(void)
     pd_discovery_init();
     pd_wizard_start(&pd_app_config);
     pd_serial_cmd_init();
+    /* BLE NUS advertises even when WiFi is down so setup/control can bypass LAN. */
+    {
+        const char *ble_name = pd_app_config.device_name[0] ? pd_app_config.device_name
+                              : (pd_app_config.hostname[0] ? pd_app_config.hostname
+                                 : "pixel-dumpster");
+        if (pd_ble_start(ble_name) != ESP_OK) {
+            ESP_LOGW(TAG, "BLE start failed — USB serial / WiFi only");
+        }
+    }
     if (pd_app_config.setup_complete) {
         pd_display_render_idle(
             pd_app_config.device_name,

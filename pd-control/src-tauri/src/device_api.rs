@@ -47,11 +47,27 @@ pub struct DeviceApi {
 impl DeviceApi {
     pub fn new(ip: &str, port: u16) -> Self {
         Self {
+            // Default timeout for status/config/etc. Play uses a longer
+            // per-request timeout because palette-cache builds can exceed 5s.
             client: Client::builder()
-                .timeout(std::time::Duration::from_secs(5))
+                .timeout(std::time::Duration::from_secs(15))
                 .build()
                 .unwrap(),
             base_url: format!("http://{}:{}", ip, port),
+        }
+    }
+
+    fn map_reqwest_err(err: reqwest::Error, action: &str) -> String {
+        if err.is_timeout() {
+            format!(
+                "{action} timed out talking to device — it may still be building a palette cache; wait and retry"
+            )
+        } else if err.is_connect() {
+            format!(
+                "could not connect to device for {action} — check Wi‑Fi / IP and Local Network permission for this app"
+            )
+        } else {
+            err.to_string()
         }
     }
 
@@ -60,7 +76,7 @@ impl DeviceApi {
             .get(format!("{}/api/status", self.base_url))
             .send()
             .await
-            .map_err(|e| e.to_string())?
+            .map_err(|e| Self::map_reqwest_err(e, "status"))?
             .json::<DeviceStatus>()
             .await
             .map_err(|e| e.to_string())
@@ -80,12 +96,14 @@ impl DeviceApi {
             body["duration_ms"] = serde_json::json!(d);
         }
 
+        // Palette quantize + PSRAM cache build can take several seconds on play.
         self.client
             .post(format!("{}/api/play", self.base_url))
+            .timeout(std::time::Duration::from_secs(60))
             .json(&body)
             .send()
             .await
-            .map_err(|e| e.to_string())?
+            .map_err(|e| Self::map_reqwest_err(e, "play"))?
             .json::<serde_json::Value>()
             .await
             .map_err(|e| e.to_string())
