@@ -3,6 +3,8 @@ import type { DiscoveredDevice, DeviceStatus, ContentEntry } from "../lib/types"
 import {
   getDeviceStatus,
   getDeviceContent,
+  getDeviceConfig,
+  setDeviceConfig,
   devicePlay,
   deviceStop,
   addManualDevice,
@@ -34,6 +36,9 @@ export function ContentPanel({
   const [manualIp, setManualIp] = useState("");
   const [manualPort, setManualPort] = useState("8088");
   const [uploadingTest, setUploadingTest] = useState<string | null>(null);
+  const [autoQuantizePalette, setAutoQuantizePalette] = useState(false);
+  const [autoQuantizeSaving, setAutoQuantizeSaving] = useState(false);
+  const [autoQuantizeSaved, setAutoQuantizeSaved] = useState<string | null>(null);
 
   const device = selected;
 
@@ -58,12 +63,50 @@ export function ContentPanel({
     }
   }, [device]);
 
+  const refreshPlaybackConfig = useCallback(async () => {
+    if (!device) return;
+    try {
+      const cfg = (await getDeviceConfig(device.ip, device.port)) as {
+        display?: { auto_quantize_palette?: boolean };
+      };
+      setAutoQuantizePalette(Boolean(cfg?.display?.auto_quantize_palette));
+      setAutoQuantizeSaved(null);
+    } catch (err) {
+      /* Non-fatal — older firmware may not expose the field yet. */
+      console.warn("Playback config load error:", err);
+    }
+  }, [device]);
+
   useEffect(() => {
     refreshStatus();
     refreshContent();
+    refreshPlaybackConfig();
     const interval = setInterval(refreshStatus, 3000);
     return () => clearInterval(interval);
-  }, [refreshStatus, refreshContent]);
+  }, [refreshStatus, refreshContent, refreshPlaybackConfig]);
+
+  const handleAutoQuantizeChange = async (next: boolean) => {
+    if (!device) return;
+    setAutoQuantizePalette(next);
+    setAutoQuantizeSaving(true);
+    setAutoQuantizeSaved(null);
+    try {
+      await setDeviceConfig(device.ip, device.port, {
+        display: { auto_quantize_palette: next },
+        save: true,
+      });
+      setAutoQuantizeSaved(
+        next
+          ? "On — sequences will use a 64-color PSRAM cache on next play."
+          : "Off — full-color decoding (slower)."
+      );
+    } catch (err) {
+      setAutoQuantizePalette(!next);
+      setAutoQuantizeSaved(`Error: ${String(err)}`);
+    } finally {
+      setAutoQuantizeSaving(false);
+    }
+  };
 
   const handlePlay = async (path: string) => {
     if (!device) return;
@@ -293,6 +336,37 @@ export function ContentPanel({
         ) : (
           <p className="text-gray-500 text-sm">Loading...</p>
         )}
+      </div>
+
+      {/* Playback */}
+      <div className="bg-pd-panel rounded-lg p-4 border border-pd-border">
+        <h3 className="font-semibold mb-3">Playback</h3>
+        <label className="flex items-start gap-3 cursor-pointer">
+          <input
+            type="checkbox"
+            className="mt-1"
+            checked={autoQuantizePalette}
+            disabled={autoQuantizeSaving}
+            onChange={(e) => {
+              void handleAutoQuantizeChange(e.target.checked);
+            }}
+          />
+          <span>
+            <span className="text-sm text-gray-200">
+              Auto-quantize animations to 64 colors (faster playback)
+            </span>
+            <span className="block text-xs text-gray-500 mt-1">
+              When on, each sequence is converted to a shared 64-color palette and
+              cached in PSRAM for smoother playback. Stop and play again after
+              changing this setting so the cache rebuilds.
+            </span>
+            {autoQuantizeSaved && (
+              <span className="block text-xs text-pd-amber mt-1">
+                {autoQuantizeSaved}
+              </span>
+            )}
+          </span>
+        </label>
       </div>
 
       {/* Content Library */}
