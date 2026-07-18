@@ -13,6 +13,7 @@
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/semphr.h"
 #include "lodepng.h"
 #include "pd-display.h"
 #include "pd-transition.h"
@@ -37,6 +38,30 @@ static int  content_frame_start = 1;                  /* first frame index (0 or
 /* ---- transition state ---- */
 static pd_transition_t *content_transition = NULL;
 static pd_framebuf_t   *content_fb = NULL;  /* current display framebuffer */
+
+/* ---- background decode pipeline ----
+ * decode_png_file() (LittleFS read + PNG inflate + composite) takes ~60ms,
+ * and the display's bulk draw_pixels() call takes ~55ms — together they
+ * capped playback at ~7-8fps even after switching off per-pixel set_pixel().
+ * Since decode and render don't depend on each other for *different*
+ * frames, a dedicated task on the other core decodes frame N+1 while the
+ * main task is still busy pushing frame N to the panel, turning the
+ * per-frame cost from decode+render into roughly max(decode, render). Only
+ * one frame of lookahead is kept (not the whole sequence) to keep the RAM
+ * cost to a single extra framebuffer regardless of sequence length. */
+static pd_framebuf_t     *content_prefetch_fb = NULL;
+static TaskHandle_t       content_decode_task = NULL;
+static SemaphoreHandle_t  content_decode_request_sem = NULL;
+static volatile bool      content_decode_busy = false;
+static volatile bool      content_prefetch_valid = false;
+static volatile int       content_prefetch_frame = -1;
+static char               content_decode_req_base[PD_CONTENT_MAX_PATH];
+static char               content_decode_req_pattern[64];
+static volatile int       content_decode_req_frame = -1;
+/* bumped on every play()/stop()/transition-play() so a decode that was
+ * in-flight for content that's no longer current gets discarded instead of
+ * being published into content_prefetch_fb for the wrong sequence. */
+static volatile uint32_t  content_epoch = 0;
 
 /* ---- global config ---- */
 static pd_content_config_t content_config = {
@@ -585,6 +610,63 @@ static uint8_t *decode_png_file(const char *path, unsigned *w, unsigned *h)
     return rgb;
 }
 
+/* ---- background decode pipeline (see content_prefetch_fb comment above) ---- */
+
+static void content_decode_task_fn(void *arg)
+{
+    (void)arg;
+    for (;;) {
+        xSemaphoreTake(content_decode_request_sem, portMAX_DELAY);
+
+        uint32_t epoch = content_epoch;
+        int frame = content_decode_req_frame;
+        char frame_path[PD_CONTENT_MAX_PATH];
+        snprintf(frame_path, sizeof(frame_path), "%s/", content_decode_req_base);
+        size_t base_len = strlen(frame_path);
+        snprintf(frame_path + base_len, sizeof(frame_path) - base_len, content_decode_req_pattern, frame);
+
+        unsigned w, h;
+        uint8_t *rgb = decode_png_file(frame_path, &w, &h);
+
+        /* discard if playback moved on (new play()/stop() call) while we
+         * were decoding — publishing now would corrupt the new sequence's
+         * display with a stale frame from the old one. */
+        if (rgb && epoch == content_epoch && content_prefetch_fb) {
+            pd_framebuf_blit_rgb(content_prefetch_fb, rgb, (int)w, (int)h);
+            content_prefetch_frame = frame;
+            content_prefetch_valid = true;
+        }
+        free(rgb);
+        content_decode_busy = false;
+    }
+}
+
+/* Ask the background task to decode `frame` of the currently-playing
+ * sequence ahead of time. No-op if the task is still busy with a previous
+ * request — the caller will simply retry on a later tick once it frees up,
+ * so playback always falls back to a synchronous decode rather than
+ * blocking on the request slot. */
+static void content_request_prefetch(int frame)
+{
+    if (!content_decode_task || content_decode_busy || !content_is_seq) return;
+
+    content_decode_busy = true;
+    strlcpy(content_decode_req_base, content_current, sizeof(content_decode_req_base));
+    strlcpy(content_decode_req_pattern, content_frame_pattern, sizeof(content_decode_req_pattern));
+    content_decode_req_frame = frame;
+    xSemaphoreGive(content_decode_request_sem);
+}
+
+/* Invalidate any in-flight/queued prefetch — call whenever playback target
+ * changes (new play(), stop(), transition) so a decode result for the old
+ * content can never land in the new content's frame sequence. */
+static void content_invalidate_prefetch(void)
+{
+    content_epoch++;
+    content_prefetch_valid = false;
+    content_prefetch_frame = -1;
+}
+
 /* ---- public API ---- */
 
 esp_err_t pd_content_init(const char *base_path)
@@ -601,9 +683,28 @@ esp_err_t pd_content_init(const char *base_path)
     if (dw > 0 && dh > 0) {
         content_transition = pd_transition_create(dw, dh);
         content_fb = pd_framebuf_create(dw, dh);
-        if (!content_transition || !content_fb) {
+        content_prefetch_fb = pd_framebuf_create(dw, dh);
+        if (!content_transition || !content_fb || !content_prefetch_fb) {
             ESP_LOGW(TAG, "failed to allocate transition engine");
         }
+    }
+
+    content_decode_request_sem = xSemaphoreCreateBinary();
+    if (content_decode_request_sem && content_prefetch_fb) {
+        /* pinned to core 1 (main task/network/wizard/render all run on core
+         * 0, see CONFIG_ESP_MAIN_TASK_AFFINITY_CPU0) so the decode actually
+         * overlaps with rendering instead of just interleaving on the same
+         * core. Same stack size as the main task needed for this call chain
+         * (see CONFIG_ESP_MAIN_TASK_STACK_SIZE) — decode_png_file() ->
+         * LittleFS/lodepng is stack-hungry. */
+        BaseType_t ok = xTaskCreatePinnedToCore(content_decode_task_fn, "pd_decode", 8192, NULL,
+                                                 tskIDLE_PRIORITY + 1, &content_decode_task, 1);
+        if (ok != pdPASS) {
+            ESP_LOGW(TAG, "failed to create background decode task — falling back to synchronous decode");
+            content_decode_task = NULL;
+        }
+    } else {
+        ESP_LOGW(TAG, "failed to allocate decode pipeline resources — falling back to synchronous decode");
     }
 
     load_config();
@@ -773,6 +874,7 @@ esp_err_t pd_content_play(const char *path)
 
     /* stop current playback immediately so tick() won't block us */
     content_playing = false;
+    content_invalidate_prefetch();
 
     /* Handle special system paths */
     if (strcmp(path, "system/default") == 0) {
@@ -850,6 +952,12 @@ esp_err_t pd_content_play(const char *path)
 
     /* now safe to enable playback - everything is ready */
     content_playing = true;
+
+    /* get the decode pipeline a head start on frame 2 so it's more likely
+     * to already be ready by the time the first tick needs it */
+    if (content_is_seq && content_total_frames > 1) {
+        content_request_prefetch(content_frame_start + 1);
+    }
     return ESP_OK;
 }
 
@@ -878,6 +986,7 @@ esp_err_t pd_content_play_with_transition(const char *path, const char *transiti
 
     /* stop current playback so tick() won't interfere */
     content_playing = false;
+    content_invalidate_prefetch();
 
     /* set up playback state (applies per-item bg/overlay) */
     esp_err_t err = content_setup_playback(path, full);
@@ -898,12 +1007,17 @@ esp_err_t pd_content_play_with_transition(const char *path, const char *transiti
 
     /* now safe to enable playback - everything is ready */
     content_playing = true;
+
+    if (content_is_seq && content_total_frames > 1) {
+        content_request_prefetch(content_frame_start + 1);
+    }
     return ESP_OK;
 }
 
 esp_err_t pd_content_stop(void)
 {
     content_playing = false;
+    content_invalidate_prefetch();
     content_current[0] = '\0';
     pd_display_clear();
     ESP_LOGI(TAG, "playback stopped");
@@ -1043,26 +1157,62 @@ void pd_content_tick(void)
         }
     }
 
-    char frame_path[PD_CONTENT_MAX_PATH];
-    snprintf(frame_path, sizeof(frame_path), "%s/", content_current);
-    size_t base_len = strlen(frame_path);
-    snprintf(frame_path + base_len, sizeof(frame_path) - base_len, content_frame_pattern, next);
+    bool displayed = false;
 
-    unsigned w, h;
-    uint8_t *rgb = decode_png_file(frame_path, &w, &h);
-    if (rgb) {
-        /* re-check after decode — play handler may have interrupted us */
-        if (!content_playing) {
-            free(rgb);
-            return;
+    /* figure out the frame after `next` up front so we can kick off its
+     * decode *before* the (blocking) render call below — that's what
+     * actually gets decode(next+1) running on the other core concurrently
+     * with render(next) on this one, instead of the two running back to
+     * back. Requesting after render would just move the wait, not remove
+     * it. */
+    int lookahead = next + 1;
+    if (lookahead > last_frame) {
+        lookahead = content_loop ? content_frame_start : -1;
+    }
+
+    if (content_prefetch_valid && content_prefetch_frame == next && content_prefetch_fb && content_fb) {
+        /* fast path: the background decode task already prepared this
+         * frame while we were busy rendering the previous one — just copy
+         * it in, no decode needed on this tick at all. */
+        pd_framebuf_copy(content_fb, content_prefetch_fb);
+        content_prefetch_valid = false;
+        if (lookahead >= 0) content_request_prefetch(lookahead);
+        pd_display_render_framebuf(content_fb->data);
+        displayed = true;
+    } else {
+        /* fallback: prefetch wasn't ready in time (e.g. first couple of
+         * frames after play(), or decode ran behind) — decode synchronously
+         * as before so we never skip/stall a frame. */
+        char frame_path[PD_CONTENT_MAX_PATH];
+        snprintf(frame_path, sizeof(frame_path), "%s/", content_current);
+        size_t base_len = strlen(frame_path);
+        snprintf(frame_path + base_len, sizeof(frame_path) - base_len, content_frame_pattern, next);
+
+        unsigned w, h;
+        uint8_t *rgb = decode_png_file(frame_path, &w, &h);
+        if (rgb) {
+            /* re-check after decode — play handler may have interrupted us */
+            if (!content_playing) {
+                free(rgb);
+                return;
+            }
+            if (content_fb) {
+                pd_framebuf_blit_rgb(content_fb, rgb, (int)w, (int)h);
+                free(rgb);
+                if (lookahead >= 0) content_request_prefetch(lookahead);
+                pd_display_render_framebuf(content_fb->data);
+            } else {
+                /* no content_fb means no prefetch buffer either (both come
+                 * from the same display-size allocation) — nothing to
+                 * overlap with, just render directly. */
+                pd_display_render_rgb(rgb, (int)w, (int)h);
+                free(rgb);
+            }
+            displayed = true;
         }
-        if (content_fb) {
-            pd_framebuf_blit_rgb(content_fb, rgb, (int)w, (int)h);
-            pd_display_render_framebuf(content_fb->data);
-        } else {
-            pd_display_render_rgb(rgb, (int)w, (int)h);
-        }
-        free(rgb);
+    }
+
+    if (displayed) {
         content_frame = next;
         pd_content_note_frame_rendered(now);
     }
