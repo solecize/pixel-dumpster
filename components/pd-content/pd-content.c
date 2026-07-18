@@ -937,21 +937,68 @@ static void pd_median_cut_palette(pd_rgba_sample_t *samples, int sample_count,
     *palette_size = box_count;
 }
 
-/* Blit a source RGB buffer into a display-sized RGB buffer (centered). */
-static void content_blit_rgb_centered(uint8_t *dst, int dw, int dh,
-                                      const uint8_t *src, int sw, int sh)
+/* Blit source RGBA into a display-sized RGBA buffer (centered). Outside
+ * the image is fully transparent so background compositing still works. */
+static void content_blit_rgba_centered(uint8_t *dst, int dw, int dh,
+                                       const uint8_t *src, int sw, int sh)
 {
-    memset(dst, 0, (size_t)dw * dh * 3);
+    memset(dst, 0, (size_t)dw * dh * 4);
     int ox = (sw < dw) ? (dw - sw) / 2 : 0;
     int oy = (sh < dh) ? (dh - sh) / 2 : 0;
     int blit_w = (sw < dw) ? sw : dw;
     int blit_h = (sh < dh) ? sh : dh;
     for (int y = 0; y < blit_h; y++) {
-        memcpy(dst + ((oy + y) * dw + ox) * 3, src + y * sw * 3, (size_t)blit_w * 3);
+        memcpy(dst + ((oy + y) * dw + ox) * 4, src + y * sw * 4, (size_t)blit_w * 4);
     }
 }
 
-/* Expand one cached indexed frame into content_fb (RGB888) via the palette. */
+/* Load one sequence frame as display-sized RGBA (no compositing). */
+static uint8_t *content_load_frame_rgba_display(int frame_num, int dw, int dh)
+{
+    char frame_path[PD_CONTENT_MAX_PATH];
+    snprintf(frame_path, sizeof(frame_path), "%s/", content_current);
+    size_t base_len = strlen(frame_path);
+    snprintf(frame_path + base_len, sizeof(frame_path) - base_len, content_frame_pattern, frame_num);
+
+    unsigned w = 0, h = 0;
+    pd_decoded_frame_t decoded;
+    if (!decode_png_indexed_or_rgba(frame_path, &w, &h, &decoded)) {
+        return NULL;
+    }
+
+    uint8_t *src_rgba = NULL;
+    if (decoded.is_indexed && decoded.indices) {
+        src_rgba = malloc((size_t)w * h * 4);
+        if (src_rgba) {
+            for (size_t i = 0; i < (size_t)w * h; i++) {
+                uint8_t pi = decoded.indices[i];
+                if (pi >= (uint8_t)decoded.palette_size) pi = 0;
+                src_rgba[i * 4 + 0] = decoded.palette[pi][0];
+                src_rgba[i * 4 + 1] = decoded.palette[pi][1];
+                src_rgba[i * 4 + 2] = decoded.palette[pi][2];
+                src_rgba[i * 4 + 3] = decoded.palette[pi][3];
+            }
+        }
+    } else {
+        src_rgba = decoded.rgba;
+        decoded.rgba = NULL;
+    }
+    free_decoded_frame(&decoded);
+    if (!src_rgba) return NULL;
+
+    uint8_t *dst = malloc((size_t)dw * dh * 4);
+    if (!dst) {
+        free(src_rgba);
+        return NULL;
+    }
+    content_blit_rgba_centered(dst, dw, dh, src_rgba, (int)w, (int)h);
+    free(src_rgba);
+    return dst;
+}
+
+/* Expand one cached indexed frame through the palette, then run the normal
+ * compositing path (bg/overlay) into content_fb. Caching content-only
+ * indices (not pre-composited RGB) keeps animated overlays correct. */
 static void content_seq_cache_expand_to_fb(int frame_number)
 {
     if (!content_seq_cache.live || !content_fb || !content_seq_cache.indices) return;
@@ -963,15 +1010,23 @@ static void content_seq_cache_expand_to_fb(int frame_number)
     int dh = content_seq_cache.height;
     size_t pixels = (size_t)dw * (size_t)dh;
     const uint8_t *src = content_seq_cache.indices + (size_t)idx * pixels;
-    uint8_t *dst = content_fb->data;
 
+    uint8_t *rgba = malloc(pixels * 4);
+    if (!rgba) return;
     for (size_t i = 0; i < pixels; i++) {
         uint8_t pi = src[i];
         if (pi >= (uint8_t)content_seq_cache.palette_size) pi = 0;
-        dst[i * 3 + 0] = content_seq_cache.palette[pi][0];
-        dst[i * 3 + 1] = content_seq_cache.palette[pi][1];
-        dst[i * 3 + 2] = content_seq_cache.palette[pi][2];
+        rgba[i * 4 + 0] = content_seq_cache.palette[pi][0];
+        rgba[i * 4 + 1] = content_seq_cache.palette[pi][1];
+        rgba[i * 4 + 2] = content_seq_cache.palette[pi][2];
+        rgba[i * 4 + 3] = content_seq_cache.palette[pi][3];
     }
+
+    uint8_t *rgb = composite_frame(rgba, dw, dh);
+    free(rgba);
+    if (!rgb) return;
+    memcpy(content_fb->data, rgb, pixels * 3);
+    free(rgb);
 }
 
 /* Build the PSRAM indexed cache for the currently-configured sequence.
@@ -1006,13 +1061,10 @@ static bool content_seq_cache_build(void)
         return false;
     }
 
-    uint8_t *frame_rgb = malloc(pixels * 3);
     pd_rgba_sample_t *samples = heap_caps_malloc(sizeof(pd_rgba_sample_t) * PD_QUANT_SAMPLES_MAX,
                                                    MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    if (!frame_rgb || !samples) {
-        ESP_LOGW(TAG, "palette cache: working buffer alloc failed — falling back");
-        free(frame_rgb);
-        heap_caps_free(samples);
+    if (!samples) {
+        ESP_LOGW(TAG, "palette cache: sample buffer alloc failed — falling back");
         heap_caps_free(slab);
         return false;
     }
@@ -1028,72 +1080,50 @@ static bool content_seq_cache_build(void)
     bool used_source_palette = false;
     int64_t t0 = esp_timer_get_time();
 
-    /* Pass 1: sample colors (and adopt a shared PNG palette when possible). */
+    /* Pass 1: sample content colors (adopt PNG palette when already ≤64). */
     for (int f = 0; f < content_total_frames; f++) {
         int frame_num = content_frame_start + f;
-        char frame_path[PD_CONTENT_MAX_PATH];
-        snprintf(frame_path, sizeof(frame_path), "%s/", content_current);
-        size_t base_len = strlen(frame_path);
-        snprintf(frame_path + base_len, sizeof(frame_path) - base_len, content_frame_pattern, frame_num);
 
-        unsigned w = 0, h = 0;
-        pd_decoded_frame_t decoded;
-        if (!decode_png_indexed_or_rgba(frame_path, &w, &h, &decoded)) {
-            continue;
-        }
-
-        if (f == 0 && decoded.is_indexed && decoded.palette_size > 0 &&
-            decoded.palette_size <= PD_PALETTE_MAX) {
-            content_seq_cache.palette_size = decoded.palette_size;
-            memcpy(content_seq_cache.palette, decoded.palette,
-                   (size_t)decoded.palette_size * 4);
-            used_source_palette = true;
-        }
-
-        /* Expand to RGBA at source size, then composite + center into display RGB
-         * so the cache matches what the legacy path would show (including bg). */
-        uint8_t *rgba = NULL;
-        if (decoded.is_indexed && decoded.indices) {
-            rgba = malloc((size_t)w * h * 4);
-            if (rgba) {
-                for (size_t i = 0; i < (size_t)w * h; i++) {
-                    uint8_t pi = decoded.indices[i];
-                    if (pi >= (uint8_t)decoded.palette_size) pi = 0;
-                    rgba[i * 4 + 0] = decoded.palette[pi][0];
-                    rgba[i * 4 + 1] = decoded.palette[pi][1];
-                    rgba[i * 4 + 2] = decoded.palette[pi][2];
-                    rgba[i * 4 + 3] = decoded.palette[pi][3];
+        if (f == 0 && !used_source_palette) {
+            char frame_path[PD_CONTENT_MAX_PATH];
+            snprintf(frame_path, sizeof(frame_path), "%s/", content_current);
+            size_t base_len = strlen(frame_path);
+            snprintf(frame_path + base_len, sizeof(frame_path) - base_len,
+                     content_frame_pattern, frame_num);
+            unsigned w = 0, h = 0;
+            pd_decoded_frame_t decoded;
+            if (decode_png_indexed_or_rgba(frame_path, &w, &h, &decoded)) {
+                if (decoded.is_indexed && decoded.palette_size > 0 &&
+                    decoded.palette_size <= PD_PALETTE_MAX) {
+                    content_seq_cache.palette_size = decoded.palette_size;
+                    memcpy(content_seq_cache.palette, decoded.palette,
+                           (size_t)decoded.palette_size * 4);
+                    used_source_palette = true;
                 }
+                free_decoded_frame(&decoded);
             }
-        } else {
-            rgba = decoded.rgba;
-            decoded.rgba = NULL;  /* ownership transferred */
         }
-        free_decoded_frame(&decoded);
-
-        if (!rgba) continue;
-
-        uint8_t *rgb = composite_frame(rgba, (int)w, (int)h);
-        free(rgba);
-        if (!rgb) continue;
-
-        content_blit_rgb_centered(frame_rgb, dw, dh, rgb, (int)w, (int)h);
-        free(rgb);
 
         if (!used_source_palette) {
-            /* Subsample display pixels into the sample pool. */
-            size_t step = pixels / PD_QUANT_SAMPLES_MAX;
-            if (step < 1) step = 1;
-            for (size_t i = 0; i < pixels && sample_count < PD_QUANT_SAMPLES_MAX; i += step) {
-                samples[sample_count].r = frame_rgb[i * 3 + 0];
-                samples[sample_count].g = frame_rgb[i * 3 + 1];
-                samples[sample_count].b = frame_rgb[i * 3 + 2];
-                samples[sample_count].a = 255;
-                sample_count++;
+            uint8_t *rgba = content_load_frame_rgba_display(frame_num, dw, dh);
+            if (rgba) {
+                size_t step = pixels / PD_QUANT_SAMPLES_MAX;
+                if (step < 1) step = 1;
+                for (size_t i = 0; i < pixels && sample_count < PD_QUANT_SAMPLES_MAX; i += step) {
+                    /* Skip fully transparent samples — they shouldn't consume palette slots. */
+                    if (rgba[i * 4 + 3] == 0) continue;
+                    samples[sample_count].r = rgba[i * 4 + 0];
+                    samples[sample_count].g = rgba[i * 4 + 1];
+                    samples[sample_count].b = rgba[i * 4 + 2];
+                    samples[sample_count].a = rgba[i * 4 + 3];
+                    sample_count++;
+                }
+                free(rgba);
             }
+        } else {
+            break;  /* shared source palette adopted — no more sampling needed */
         }
 
-        /* Yield so WiFi/HTTP stay responsive during long builds. */
         if ((f & 7) == 7) vTaskDelay(1);
     }
 
@@ -1104,37 +1134,47 @@ static bool content_seq_cache_build(void)
     if (content_seq_cache.palette_size <= 0) {
         content_seq_cache.palette_size = 1;
         content_seq_cache.palette[0][0] = content_seq_cache.palette[0][1] =
-            content_seq_cache.palette[0][2] = 0;
-        content_seq_cache.palette[0][3] = 255;
+            content_seq_cache.palette[0][2] = content_seq_cache.palette[0][3] = 0;
     }
+    /* Ensure a fully-transparent palette entry exists for letterboxed regions. */
+    int transparent_idx = -1;
+    for (int i = 0; i < content_seq_cache.palette_size; i++) {
+        if (content_seq_cache.palette[i][3] == 0) {
+            transparent_idx = i;
+            break;
+        }
+    }
+    if (transparent_idx < 0 && content_seq_cache.palette_size < PD_PALETTE_MAX) {
+        transparent_idx = content_seq_cache.palette_size++;
+        content_seq_cache.palette[transparent_idx][0] = 0;
+        content_seq_cache.palette[transparent_idx][1] = 0;
+        content_seq_cache.palette[transparent_idx][2] = 0;
+        content_seq_cache.palette[transparent_idx][3] = 0;
+    }
+    if (transparent_idx < 0) transparent_idx = 0;
 
-    /* Pass 2: remap every frame into the index slab. */
+    /* Pass 2: remap every frame's content into the index slab. */
     for (int f = 0; f < content_total_frames; f++) {
         int frame_num = content_frame_start + f;
-        char frame_path[PD_CONTENT_MAX_PATH];
-        snprintf(frame_path, sizeof(frame_path), "%s/", content_current);
-        size_t base_len = strlen(frame_path);
-        snprintf(frame_path + base_len, sizeof(frame_path) - base_len, content_frame_pattern, frame_num);
-
-        unsigned w = 0, h = 0;
-        uint8_t *rgb = decode_png_file(frame_path, &w, &h);
+        uint8_t *rgba = content_load_frame_rgba_display(frame_num, dw, dh);
         uint8_t *dst = slab + (size_t)f * pixels;
-        if (!rgb) {
-            memset(dst, 0, pixels);
+        if (!rgba) {
+            memset(dst, (uint8_t)transparent_idx, pixels);
             continue;
         }
-        content_blit_rgb_centered(frame_rgb, dw, dh, rgb, (int)w, (int)h);
-        free(rgb);
-
         for (size_t i = 0; i < pixels; i++) {
-            dst[i] = content_nearest_palette_index(frame_rgb[i * 3 + 0],
-                                                   frame_rgb[i * 3 + 1],
-                                                   frame_rgb[i * 3 + 2], 255);
+            uint8_t a = rgba[i * 4 + 3];
+            if (a == 0) {
+                dst[i] = (uint8_t)transparent_idx;
+                continue;
+            }
+            dst[i] = content_nearest_palette_index(rgba[i * 4 + 0], rgba[i * 4 + 1],
+                                                   rgba[i * 4 + 2], a);
         }
+        free(rgba);
         if ((f & 7) == 7) vTaskDelay(1);
     }
 
-    free(frame_rgb);
     heap_caps_free(samples);
 
     content_seq_cache.live = true;
