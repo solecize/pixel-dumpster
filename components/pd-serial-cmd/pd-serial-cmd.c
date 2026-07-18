@@ -38,7 +38,34 @@ static const char *TAG = "pd-serial-cmd";
 static void serial_write(const char *data, size_t len)
 {
 #if SOC_USB_SERIAL_JTAG_SUPPORTED
-    usb_serial_jtag_write_bytes(data, len, pdMS_TO_TICKS(100));
+    /* usb_serial_jtag_write_bytes() silently drops the whole request (no
+     * partial write) whenever len doesn't fit in the driver's internal TX
+     * buffer in one call — it does not chunk large writes itself. Responses
+     * like "list" (content directory) or a multi-item "status" routinely
+     * exceed that buffer, so they were vanishing before reaching the
+     * CLI/app. Same fix as wiz_serial_write() in pd-wizard.c: chunk into
+     * pieces guaranteed to fit and retry each chunk until it flushes. */
+    #define PD_SERIAL_CMD_CHUNK 32
+    size_t sent = 0;
+    while (sent < len) {
+        size_t remaining = len - sent;
+        size_t chunk_len = remaining < PD_SERIAL_CMD_CHUNK ? remaining : PD_SERIAL_CMD_CHUNK;
+        size_t chunk_sent = 0;
+        int stalls = 0;
+        while (chunk_sent < chunk_len && stalls < 20) {
+            int n = usb_serial_jtag_write_bytes(data + sent + chunk_sent,
+                                                 chunk_len - chunk_sent,
+                                                 pdMS_TO_TICKS(50));
+            if (n > 0) {
+                chunk_sent += (size_t)n;
+                stalls = 0;
+            } else {
+                stalls++;
+            }
+        }
+        if (chunk_sent == 0) break;  /* truly stuck — give up rather than loop forever */
+        sent += chunk_sent;
+    }
 #else
     (void)data; (void)len;
 #endif
@@ -126,8 +153,10 @@ static void handle_status(void)
 
 static void handle_list(void)
 {
+    ESP_LOGI(TAG, "handle_list: begin");
     pd_content_entry_t entries[PD_CONTENT_MAX_LIST];
     int count = pd_content_list_images(entries, PD_CONTENT_MAX_LIST);
+    ESP_LOGI(TAG, "handle_list: got %d entries", count);
 
     cJSON *resp = cJSON_CreateObject();
     cJSON_AddStringToObject(resp, "type", "list");
@@ -143,7 +172,9 @@ static void handle_list(void)
         }
         cJSON_AddItemToArray(arr, item);
     }
+    ESP_LOGI(TAG, "handle_list: sending response");
     serial_send_json(resp);
+    ESP_LOGI(TAG, "handle_list: response sent");
 }
 
 /* ---------- command dispatch (called by wizard callback) ---------- */

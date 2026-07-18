@@ -6,6 +6,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <unistd.h>
 
 #include "cJSON.h"
 #include "esp_log.h"
@@ -498,18 +499,31 @@ static uint8_t *composite_frame(uint8_t *content_rgba, int width, int height)
         memset(rgb, 0, pixels * 3);
     }
 
-    /* layer 2: content with alpha blending */
+    /* layer 2: content with alpha blending.
+     * Fast path: fully-opaque content (the overwhelming common case for
+     * sprite/marquee art) needs no blend math at all — just copy. This and
+     * the >>8 shift below (instead of /255) avoid a per-pixel integer
+     * divide, which was the dominant cost of compositing every animation
+     * frame and made playback noticeably slower than the configured fps. */
     for (size_t i = 0; i < pixels; i++) {
+        uint8_t ca = content_rgba[i * 4 + 3];
+        if (ca == 255) {
+            rgb[i * 3 + 0] = content_rgba[i * 4 + 0];
+            rgb[i * 3 + 1] = content_rgba[i * 4 + 1];
+            rgb[i * 3 + 2] = content_rgba[i * 4 + 2];
+            continue;
+        }
+        if (ca == 0) continue;  /* fully transparent — background already in place */
         uint8_t cr = content_rgba[i * 4 + 0];
         uint8_t cg = content_rgba[i * 4 + 1];
         uint8_t cb = content_rgba[i * 4 + 2];
-        uint8_t ca = content_rgba[i * 4 + 3];
         uint8_t br = rgb[i * 3 + 0];
         uint8_t bg = rgb[i * 3 + 1];
         uint8_t bb = rgb[i * 3 + 2];
-        rgb[i * 3 + 0] = (cr * ca + br * (255 - ca)) / 255;
-        rgb[i * 3 + 1] = (cg * ca + bg * (255 - ca)) / 255;
-        rgb[i * 3 + 2] = (cb * ca + bb * (255 - ca)) / 255;
+        uint8_t inv = 255 - ca;
+        rgb[i * 3 + 0] = (uint8_t)((cr * ca + br * inv) >> 8);
+        rgb[i * 3 + 1] = (uint8_t)((cg * ca + bg * inv) >> 8);
+        rgb[i * 3 + 2] = (uint8_t)((cb * ca + bb * inv) >> 8);
     }
 
     /* layer 3: overlay with alpha blending */
@@ -533,16 +547,24 @@ static uint8_t *composite_frame(uint8_t *content_rgba, int width, int height)
 
     if (overlay_rgba) {
         for (size_t i = 0; i < pixels; i++) {
+            uint8_t oa = overlay_rgba[i * 4 + 3];
+            if (oa == 0) continue;
+            if (oa == 255) {
+                rgb[i * 3 + 0] = overlay_rgba[i * 4 + 0];
+                rgb[i * 3 + 1] = overlay_rgba[i * 4 + 1];
+                rgb[i * 3 + 2] = overlay_rgba[i * 4 + 2];
+                continue;
+            }
             uint8_t or_ = overlay_rgba[i * 4 + 0];
             uint8_t og = overlay_rgba[i * 4 + 1];
             uint8_t ob = overlay_rgba[i * 4 + 2];
-            uint8_t oa = overlay_rgba[i * 4 + 3];
             uint8_t br = rgb[i * 3 + 0];
             uint8_t bg = rgb[i * 3 + 1];
             uint8_t bb = rgb[i * 3 + 2];
-            rgb[i * 3 + 0] = (or_ * oa + br * (255 - oa)) / 255;
-            rgb[i * 3 + 1] = (og * oa + bg * (255 - oa)) / 255;
-            rgb[i * 3 + 2] = (ob * oa + bb * (255 - oa)) / 255;
+            uint8_t inv = 255 - oa;
+            rgb[i * 3 + 0] = (uint8_t)((or_ * oa + br * inv) >> 8);
+            rgb[i * 3 + 1] = (uint8_t)((og * oa + bg * inv) >> 8);
+            rgb[i * 3 + 2] = (uint8_t)((ob * oa + bb * inv) >> 8);
         }
         /* free if we loaded it dynamically (not the cached static one) */
         if (overlay_rgba != cached_overlay_rgba) {
@@ -902,6 +924,29 @@ pd_content_status_t pd_content_get_status(void)
     return s;
 }
 
+/* Lightweight achieved-FPS diagnostic: logs actual rendered frame rate once
+ * per second while a sequence is playing, so playback performance can be
+ * verified on-device without extra tooling. Negligible overhead (one
+ * counter increment per frame, one log per second). */
+static void pd_content_note_frame_rendered(int64_t now_us)
+{
+    static int frames_since_log = 0;
+    static int64_t fps_window_start_us = 0;
+
+    if (fps_window_start_us == 0) {
+        fps_window_start_us = now_us;
+    }
+    frames_since_log++;
+
+    int64_t elapsed = now_us - fps_window_start_us;
+    if (elapsed >= 1000000) {
+        double achieved_fps = frames_since_log * 1000000.0 / (double)elapsed;
+        ESP_LOGI(TAG, "playback: achieved %.1f fps (target %d fps)", achieved_fps, content_fps);
+        frames_since_log = 0;
+        fps_window_start_us = now_us;
+    }
+}
+
 void pd_content_tick(void)
 {
     int64_t now = esp_timer_get_time();
@@ -1019,6 +1064,7 @@ void pd_content_tick(void)
         }
         free(rgb);
         content_frame = next;
+        pd_content_note_frame_rendered(now);
     }
 }
 
@@ -1058,17 +1104,66 @@ esp_err_t pd_content_store_file(const char *rel_path, const uint8_t *data, size_
     return ESP_OK;
 }
 
+/* Recursively remove all files/subdirectories under `dir_path`, then the
+ * directory itself. Used for deleting sequence content (a directory of
+ * numbered frames + meta.json) from a single delete call. */
+static esp_err_t remove_dir_recursive(const char *dir_path)
+{
+    DIR *d = opendir(dir_path);
+    if (!d) {
+        ESP_LOGW(TAG, "cannot open dir %s: %s", dir_path, strerror(errno));
+        return ESP_FAIL;
+    }
+
+    struct dirent *ent;
+    esp_err_t result = ESP_OK;
+    while ((ent = readdir(d)) != NULL) {
+        if (ent->d_name[0] == '.') continue;
+
+        char child[PD_CONTENT_MAX_PATH];
+        snprintf(child, sizeof(child), "%s/%s", dir_path, ent->d_name);
+
+        if (path_is_dir(child)) {
+            if (remove_dir_recursive(child) != ESP_OK) result = ESP_FAIL;
+        } else if (remove(child) != 0) {
+            ESP_LOGW(TAG, "cannot delete %s: %s", child, strerror(errno));
+            result = ESP_FAIL;
+        }
+    }
+    closedir(d);
+
+    if (rmdir(dir_path) != 0) {
+        ESP_LOGW(TAG, "cannot rmdir %s: %s", dir_path, strerror(errno));
+        result = ESP_FAIL;
+    }
+    return result;
+}
+
 esp_err_t pd_content_delete_file(const char *rel_path)
 {
     char full[PD_CONTENT_MAX_PATH];
     snprintf(full, sizeof(full), "%s/%s", content_base, rel_path);
 
-    if (remove(full) != 0) {
-        ESP_LOGW(TAG, "cannot delete %s: %s", full, strerror(errno));
-        return ESP_FAIL;
+    /* if this is the content currently playing, stop first so we don't
+     * leave a dangling reference to a path that's about to disappear */
+    if (content_current[0] && strcmp(content_current, full) == 0) {
+        pd_content_stop();
     }
-    ESP_LOGI(TAG, "deleted %s", rel_path);
-    return ESP_OK;
+
+    esp_err_t err;
+    if (path_is_dir(full)) {
+        err = remove_dir_recursive(full);
+    } else {
+        err = (remove(full) == 0) ? ESP_OK : ESP_FAIL;
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "cannot delete %s: %s", full, strerror(errno));
+        }
+    }
+
+    if (err == ESP_OK) {
+        ESP_LOGI(TAG, "deleted %s", rel_path);
+    }
+    return err;
 }
 
 /* ---- HTTP handlers ---- */
@@ -1455,6 +1550,31 @@ static esp_err_t http_content_upload(httpd_req_t *req)
     return ESP_OK;
 }
 
+static esp_err_t http_content_delete(httpd_req_t *req)
+{
+    /* path comes from query string: ?path=images/foo.png or images/some-seq */
+    char query[256] = "";
+    char rel_path[PD_CONTENT_MAX_PATH] = "";
+
+    if (httpd_req_get_url_query_str(req, query, sizeof(query)) == ESP_OK) {
+        httpd_query_key_value(query, "path", rel_path, sizeof(rel_path));
+    }
+
+    if (rel_path[0] == '\0') {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "missing ?path=");
+        return ESP_FAIL;
+    }
+
+    if (pd_content_delete_file(rel_path) != ESP_OK) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "delete failed");
+        return ESP_FAIL;
+    }
+
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, "{\"ok\":true}", HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+}
+
 static esp_err_t http_layout_get(httpd_req_t *req)
 {
     cJSON *root = cJSON_CreateObject();
@@ -1737,6 +1857,11 @@ esp_err_t pd_content_register_http(httpd_handle_t server)
         .method = HTTP_POST,
         .handler = http_content_upload
     };
+    httpd_uri_t delete_uri = {
+        .uri = "/api/content",
+        .method = HTTP_DELETE,
+        .handler = http_content_delete
+    };
     httpd_uri_t config_get_uri = {
         .uri = "/api/config",
         .method = HTTP_GET,
@@ -1784,6 +1909,7 @@ esp_err_t pd_content_register_http(httpd_handle_t server)
     httpd_register_uri_handler(server, &status_uri);
     httpd_register_uri_handler(server, &status_show_uri);
     httpd_register_uri_handler(server, &upload_uri);
+    httpd_register_uri_handler(server, &delete_uri);
     httpd_register_uri_handler(server, &config_get_uri);
     httpd_register_uri_handler(server, &config_set_uri);
     httpd_register_uri_handler(server, &layout_get_uri);

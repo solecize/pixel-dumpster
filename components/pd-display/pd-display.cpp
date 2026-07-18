@@ -50,6 +50,67 @@ static void pd_display_map_color(uint8_t lr, uint8_t lg, uint8_t lb,
     }
 }
 
+/* Scratch buffer used only for GRB/BRG wiring, which Hub75ColorOrder can't
+ * express natively (it only has RGB/BGR). Grown on demand, never shrunk. */
+static uint8_t *pd_display_swap_scratch = nullptr;
+static size_t pd_display_swap_scratch_len = 0;
+
+static uint8_t *pd_display_get_swap_scratch(size_t needed)
+{
+    if (pd_display_swap_scratch_len < needed) {
+        uint8_t *grown = (uint8_t *)realloc(pd_display_swap_scratch, needed);
+        if (!grown) return nullptr;
+        pd_display_swap_scratch = grown;
+        pd_display_swap_scratch_len = needed;
+    }
+    return pd_display_swap_scratch;
+}
+
+/* Draw a tightly-packed w*h RGB888 buffer in one shot via the driver's bulk
+ * draw_pixels() API instead of calling set_pixel() per pixel. set_pixel() is
+ * documented by the driver itself as a convenience wrapper *around*
+ * draw_pixels() for single pixels — calling it in a loop pays that per-call
+ * overhead (coordinate/rotation mapping, etc.) once per pixel instead of
+ * once per frame, which was the dominant cost of animation playback.
+ *
+ * Hub75ColorOrder only has RGB/BGR, so GRB/BRG wiring needs one cheap
+ * pre-pass to swap channels into RGB order before the bulk call. */
+static void pd_display_draw_bulk_rgb888(int x, int y, int w, int h, const uint8_t *rgb)
+{
+    if (!pd_display_driver || w <= 0 || h <= 0) return;
+
+    switch (pd_display_current_color_order) {
+        case 1:  /* BGR — native */
+            pd_display_driver->draw_pixels((uint16_t)x, (uint16_t)y, (uint16_t)w, (uint16_t)h,
+                                            rgb, Hub75PixelFormat::RGB888, Hub75ColorOrder::BGR);
+            return;
+        case 2:  /* GRB — needs pre-swap */
+        case 3: { /* BRG — needs pre-swap */
+            size_t pixels = (size_t)w * (size_t)h;
+            uint8_t *scratch = pd_display_get_swap_scratch(pixels * 3);
+            if (!scratch) return;  /* out of memory — drop the frame rather than crash */
+            bool grb = (pd_display_current_color_order == 2);
+            for (size_t i = 0; i < pixels; i++) {
+                uint8_t lr = rgb[i * 3 + 0];
+                uint8_t lg = rgb[i * 3 + 1];
+                uint8_t lb = rgb[i * 3 + 2];
+                if (grb) {
+                    scratch[i * 3 + 0] = lg; scratch[i * 3 + 1] = lr; scratch[i * 3 + 2] = lb;
+                } else {
+                    scratch[i * 3 + 0] = lb; scratch[i * 3 + 1] = lr; scratch[i * 3 + 2] = lg;
+                }
+            }
+            pd_display_driver->draw_pixels((uint16_t)x, (uint16_t)y, (uint16_t)w, (uint16_t)h,
+                                            scratch, Hub75PixelFormat::RGB888, Hub75ColorOrder::RGB);
+            return;
+        }
+        default:  /* RGB — native */
+            pd_display_driver->draw_pixels((uint16_t)x, (uint16_t)y, (uint16_t)w, (uint16_t)h,
+                                            rgb, Hub75PixelFormat::RGB888, Hub75ColorOrder::RGB);
+            return;
+    }
+}
+
 #define PD_FONT_W 5
 #define PD_FONT_H 7
 #define PD_CELL_W 6
@@ -476,15 +537,19 @@ extern "C" void pd_display_render_rgb(const uint8_t *rgb, int img_w, int img_h)
     /* blit image pixels (no clear — overwrite in place to avoid flicker) */
     int blit_w = (img_w < dw) ? img_w : dw;
     int blit_h = (img_h < dh) ? img_h : dh;
-    for (int y = 0; y < blit_h; y++) {
-        for (int x = 0; x < blit_w; x++) {
-            int src_idx = (y * img_w + x) * 3;
-            uint8_t lr = rgb[src_idx];
-            uint8_t lg = rgb[src_idx + 1];
-            uint8_t lb = rgb[src_idx + 2];
-            uint8_t mr, mg, mb;
-            pd_display_map_color(lr, lg, lb, &mr, &mg, &mb);
-            pd_display_driver->set_pixel(ox + x, oy + y, mr, mg, mb);
+
+    if (blit_w == img_w) {
+        /* common case: no horizontal cropping, so the source is already
+         * tightly packed at blit_w — one bulk call for the whole image. */
+        pd_display_draw_bulk_rgb888(ox, oy, blit_w, blit_h, rgb);
+    } else {
+        /* image wider than display: source row stride (img_w) doesn't match
+         * the drawn width (blit_w), so draw_pixels()'s "tightly packed"
+         * assumption doesn't hold for the whole buffer at once — bulk-draw
+         * one row at a time instead (still blit_h calls instead of
+         * blit_w*blit_h). */
+        for (int y = 0; y < blit_h; y++) {
+            pd_display_draw_bulk_rgb888(ox, oy + y, blit_w, 1, rgb + (size_t)y * img_w * 3);
         }
     }
 }
@@ -494,17 +559,10 @@ extern "C" void pd_display_render_framebuf(const uint8_t *rgb)
     if (!pd_display_driver || !rgb) return;
     int dw = pd_display_current_width;
     int dh = pd_display_current_height;
-    for (int y = 0; y < dh; y++) {
-        for (int x = 0; x < dw; x++) {
-            int idx = (y * dw + x) * 3;
-            uint8_t lr = rgb[idx];
-            uint8_t lg = rgb[idx + 1];
-            uint8_t lb = rgb[idx + 2];
-            uint8_t mr, mg, mb;
-            pd_display_map_color(lr, lg, lb, &mr, &mg, &mb);
-            pd_display_driver->set_pixel(x, y, mr, mg, mb);
-        }
-    }
+    /* content_fb->data is always a tightly-packed dw*dh RGB888 buffer, so
+     * the whole frame can go out in a single bulk draw_pixels() call
+     * instead of dw*dh individual set_pixel() calls. */
+    pd_display_draw_bulk_rgb888(0, 0, dw, dh, rgb);
 }
 
 extern "C" void pd_display_draw_rect(uint16_t x, uint16_t y, uint16_t w, uint16_t h, pd_display_color_t color)
