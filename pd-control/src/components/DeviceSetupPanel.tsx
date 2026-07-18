@@ -7,6 +7,8 @@ import {
   addManualDevice,
   getDeviceWizardConfig,
   setDeviceWizardConfig,
+  getDeviceConfig,
+  setDeviceConfig,
   startTestPattern,
   stopTestPattern,
 } from "../lib/api";
@@ -74,6 +76,9 @@ export function DeviceSetupPanel({
   const [deviceInfoSaved, setDeviceInfoSaved] = useState<string | null>(null);
   const [manualIp, setManualIp] = useState("");
   const [manualPort, setManualPort] = useState("8088");
+  const [autoQuantizePalette, setAutoQuantizePalette] = useState(false);
+  const [autoQuantizeSaving, setAutoQuantizeSaving] = useState(false);
+  const [autoQuantizeSaved, setAutoQuantizeSaved] = useState<string | null>(null);
 
   const device = selected;
 
@@ -128,10 +133,25 @@ export function DeviceSetupPanel({
     }
   }, [device]);
 
+  const refreshContentConfig = useCallback(async () => {
+    if (!device) return;
+    try {
+      const cfg = (await getDeviceConfig(device.ip, device.port)) as {
+        display?: { auto_quantize_palette?: boolean };
+      };
+      setAutoQuantizePalette(Boolean(cfg?.display?.auto_quantize_palette));
+      setAutoQuantizeSaved(null);
+    } catch (err) {
+      /* Non-fatal — older firmware may not expose the field yet. */
+      console.warn("Content config load error:", err);
+    }
+  }, [device]);
+
   useEffect(() => {
     refreshLayout();
     refreshWizardConfig();
-  }, [refreshLayout, refreshWizardConfig]);
+    refreshContentConfig();
+  }, [refreshLayout, refreshWizardConfig, refreshContentConfig]);
 
   const handleAddManual = async () => {
     if (!manualIp) return;
@@ -514,6 +534,55 @@ export function DeviceSetupPanel({
               </button>
             </div>
           </div>
+        )}
+      </div>
+
+      {/* Playback */}
+      <div className="bg-pd-panel rounded-lg p-4 border border-pd-border">
+        <h3 className="font-semibold mb-3">Playback</h3>
+        <label className="flex items-start gap-3 cursor-pointer">
+          <input
+            type="checkbox"
+            className="mt-1"
+            checked={autoQuantizePalette}
+            disabled={autoQuantizeSaving}
+            onChange={async (e) => {
+              if (!device) return;
+              const next = e.target.checked;
+              setAutoQuantizePalette(next);
+              setAutoQuantizeSaving(true);
+              setAutoQuantizeSaved(null);
+              try {
+                await setDeviceConfig(device.ip, device.port, {
+                  display: { auto_quantize_palette: next },
+                  save: true,
+                });
+                setAutoQuantizeSaved(
+                  next
+                    ? "On — sequences will use a 64-color PSRAM cache on next play."
+                    : "Off — full-color decoding (slower)."
+                );
+              } catch (err) {
+                setAutoQuantizePalette(!next);
+                setAutoQuantizeSaved(`Error: ${String(err)}`);
+              } finally {
+                setAutoQuantizeSaving(false);
+              }
+            }}
+          />
+          <span>
+            <span className="text-sm text-gray-200">
+              Auto-quantize animations to 64 colors (faster playback)
+            </span>
+            <span className="block text-xs text-gray-500 mt-1">
+              When on, each sequence is converted to a shared 64-color palette and
+              cached in PSRAM for smoother playback. When off, full-color decoding
+              is used (slower) with no palette overhead.
+            </span>
+          </span>
+        </label>
+        {autoQuantizeSaved && (
+          <div className="text-xs text-pd-green mt-2">{autoQuantizeSaved}</div>
         )}
       </div>
 

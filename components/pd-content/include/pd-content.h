@@ -57,6 +57,11 @@ typedef struct {
     char attract_path[PD_CONTENT_MAX_PATH];
     bool attract_shuffle;
     int  attract_idle_timeout_ms;
+
+    /* When true, sequences are quantized to a shared 64-color palette and
+     * cached in PSRAM for smoother playback. When false (default), the
+     * existing truecolor decode path is used with no palette overhead. */
+    bool auto_quantize_palette;
 } pd_content_config_t;
 
 const pd_content_config_t *pd_content_get_config(void);

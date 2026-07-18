@@ -2,6 +2,7 @@
 
 #include <dirent.h>
 #include <errno.h>
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -9,6 +10,7 @@
 #include <unistd.h>
 
 #include "cJSON.h"
+#include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
@@ -20,6 +22,9 @@
 #include "pd-network.h"
 #include "pd-discovery.h"
 #include "pd-config.h"
+
+#define PD_PALETTE_MAX 64
+#define PD_QUANT_SAMPLES_MAX 8192
 
 static const char *TAG = "pd-content";
 
@@ -76,7 +81,26 @@ static pd_content_config_t content_config = {
     .attract_path = "images/",
     .attract_shuffle = true,
     .attract_idle_timeout_ms = 0,
+    .auto_quantize_palette = false,
 };
+
+/* ---- per-sequence 64-color PSRAM frame cache ----
+ * When auto_quantize_palette is on, play() builds a shared palette and an
+ * indexed copy of every frame in PSRAM. Tick then expands indices → RGB
+ * instead of re-decoding PNGs from flash. Soft-falls back to the legacy
+ * path if the sequence does not fit remaining PSRAM. */
+typedef struct {
+    bool     live;
+    int      width;
+    int      height;
+    int      frame_count;
+    int      frame_start;
+    int      palette_size;
+    uint8_t  palette[PD_PALETTE_MAX][4];  /* RGBA */
+    uint8_t *indices;                     /* frame_count * width * height, SPIRAM */
+} pd_seq_cache_t;
+
+static pd_seq_cache_t content_seq_cache = {0};
 
 /* ---- compositing state ---- */
 static uint8_t *cached_background_rgb = NULL;  /* cached background image (RGB) */
@@ -274,6 +298,9 @@ static void load_config(void)
         if (cJSON_IsString(ov))
             strlcpy(content_config.overlay, ov->valuestring,
                     sizeof(content_config.overlay));
+        cJSON *aq = cJSON_GetObjectItem(disp, "auto_quantize_palette");
+        if (cJSON_IsBool(aq))
+            content_config.auto_quantize_palette = cJSON_IsTrue(aq);
     }
 
     /* attract section */
@@ -300,9 +327,9 @@ static void load_config(void)
     strlcpy(saved_background, content_config.background, sizeof(saved_background));
     strlcpy(saved_overlay, content_config.overlay, sizeof(saved_overlay));
 
-    ESP_LOGI(TAG, "config loaded: mode=%d baseline=%s dur=%d",
+    ESP_LOGI(TAG, "config loaded: mode=%d baseline=%s dur=%d auto_quantize=%d",
              content_config.trans_mode, content_config.trans_baseline,
-             content_config.trans_duration_ms);
+             content_config.trans_duration_ms, (int)content_config.auto_quantize_palette);
 }
 
 const pd_content_config_t *pd_content_get_config(void)
@@ -352,6 +379,7 @@ esp_err_t pd_content_save_config(void)
     cJSON_AddBoolToObject(disp, "loop_sequences", content_config.loop_sequences);
     cJSON_AddStringToObject(disp, "background", content_config.background);
     cJSON_AddStringToObject(disp, "overlay", content_config.overlay);
+    cJSON_AddBoolToObject(disp, "auto_quantize_palette", content_config.auto_quantize_palette);
 
     cJSON *attr = cJSON_AddObjectToObject(root, "attract");
     cJSON_AddBoolToObject(attr, "enabled", content_config.attract_enabled);
@@ -752,6 +780,372 @@ static void content_invalidate_prefetch(void)
     content_prefetch_frame = -1;
 }
 
+/* ---- per-sequence palette cache helpers ---- */
+
+static void content_seq_cache_free(void)
+{
+    if (content_seq_cache.indices) {
+        heap_caps_free(content_seq_cache.indices);
+        content_seq_cache.indices = NULL;
+    }
+    content_seq_cache.live = false;
+    content_seq_cache.frame_count = 0;
+    content_seq_cache.palette_size = 0;
+    content_seq_cache.width = 0;
+    content_seq_cache.height = 0;
+}
+
+static uint8_t content_nearest_palette_index(uint8_t r, uint8_t g, uint8_t b, uint8_t a)
+{
+    int best = 0;
+    int best_d = INT_MAX;
+    for (int i = 0; i < content_seq_cache.palette_size; i++) {
+        int dr = (int)r - (int)content_seq_cache.palette[i][0];
+        int dg = (int)g - (int)content_seq_cache.palette[i][1];
+        int db = (int)b - (int)content_seq_cache.palette[i][2];
+        int da = (int)a - (int)content_seq_cache.palette[i][3];
+        int d = dr * dr + dg * dg + db * db + da * da;
+        if (d < best_d) {
+            best_d = d;
+            best = i;
+            if (d == 0) break;
+        }
+    }
+    return (uint8_t)best;
+}
+
+/* Simple median-cut over a sampled RGBA color list → up to PD_PALETTE_MAX. */
+typedef struct {
+    uint8_t r, g, b, a;
+} pd_rgba_sample_t;
+
+static int pd_sample_channel_range(const pd_rgba_sample_t *s, int n, int ch,
+                                   uint8_t *out_min, uint8_t *out_max)
+{
+    uint8_t lo = 255, hi = 0;
+    for (int i = 0; i < n; i++) {
+        uint8_t v = (ch == 0) ? s[i].r : (ch == 1) ? s[i].g : (ch == 2) ? s[i].b : s[i].a;
+        if (v < lo) lo = v;
+        if (v > hi) hi = v;
+    }
+    *out_min = lo;
+    *out_max = hi;
+    return (int)hi - (int)lo;
+}
+
+static int pd_sample_cmp_channel;
+static int pd_sample_cmp(const void *a, const void *b)
+{
+    const pd_rgba_sample_t *sa = a;
+    const pd_rgba_sample_t *sb = b;
+    uint8_t va = (pd_sample_cmp_channel == 0) ? sa->r :
+                 (pd_sample_cmp_channel == 1) ? sa->g :
+                 (pd_sample_cmp_channel == 2) ? sa->b : sa->a;
+    uint8_t vb = (pd_sample_cmp_channel == 0) ? sb->r :
+                 (pd_sample_cmp_channel == 1) ? sb->g :
+                 (pd_sample_cmp_channel == 2) ? sb->b : sb->a;
+    return (int)va - (int)vb;
+}
+
+typedef struct {
+    pd_rgba_sample_t *samples;
+    int count;
+} pd_mc_box_t;
+
+static void pd_median_cut_palette(pd_rgba_sample_t *samples, int sample_count,
+                                  uint8_t palette[][4], int *palette_size)
+{
+    if (sample_count <= 0) {
+        *palette_size = 1;
+        palette[0][0] = palette[0][1] = palette[0][2] = 0;
+        palette[0][3] = 255;
+        return;
+    }
+    if (sample_count <= PD_PALETTE_MAX) {
+        /* Deduplicate by exact RGBA match while copying. */
+        int n = 0;
+        for (int i = 0; i < sample_count && n < PD_PALETTE_MAX; i++) {
+            bool found = false;
+            for (int j = 0; j < n; j++) {
+                if (palette[j][0] == samples[i].r && palette[j][1] == samples[i].g &&
+                    palette[j][2] == samples[i].b && palette[j][3] == samples[i].a) {
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) {
+                palette[n][0] = samples[i].r;
+                palette[n][1] = samples[i].g;
+                palette[n][2] = samples[i].b;
+                palette[n][3] = samples[i].a;
+                n++;
+            }
+        }
+        *palette_size = n > 0 ? n : 1;
+        return;
+    }
+
+    pd_mc_box_t boxes[PD_PALETTE_MAX];
+    boxes[0].samples = samples;
+    boxes[0].count = sample_count;
+    int box_count = 1;
+
+    while (box_count < PD_PALETTE_MAX) {
+        int best = -1;
+        int best_range = -1;
+        int best_ch = 0;
+        for (int i = 0; i < box_count; i++) {
+            if (boxes[i].count < 2) continue;
+            for (int ch = 0; ch < 4; ch++) {
+                uint8_t lo, hi;
+                int range = pd_sample_channel_range(boxes[i].samples, boxes[i].count, ch, &lo, &hi);
+                if (range > best_range) {
+                    best_range = range;
+                    best = i;
+                    best_ch = ch;
+                }
+            }
+        }
+        if (best < 0 || best_range <= 0) break;
+
+        pd_sample_cmp_channel = best_ch;
+        qsort(boxes[best].samples, (size_t)boxes[best].count, sizeof(pd_rgba_sample_t), pd_sample_cmp);
+        int mid = boxes[best].count / 2;
+        if (mid <= 0) mid = 1;
+        if (mid >= boxes[best].count) mid = boxes[best].count - 1;
+
+        boxes[box_count].samples = boxes[best].samples + mid;
+        boxes[box_count].count = boxes[best].count - mid;
+        boxes[best].count = mid;
+        box_count++;
+    }
+
+    for (int i = 0; i < box_count; i++) {
+        uint32_t sr = 0, sg = 0, sb = 0, sa = 0;
+        for (int j = 0; j < boxes[i].count; j++) {
+            sr += boxes[i].samples[j].r;
+            sg += boxes[i].samples[j].g;
+            sb += boxes[i].samples[j].b;
+            sa += boxes[i].samples[j].a;
+        }
+        int n = boxes[i].count > 0 ? boxes[i].count : 1;
+        palette[i][0] = (uint8_t)(sr / (uint32_t)n);
+        palette[i][1] = (uint8_t)(sg / (uint32_t)n);
+        palette[i][2] = (uint8_t)(sb / (uint32_t)n);
+        palette[i][3] = (uint8_t)(sa / (uint32_t)n);
+    }
+    *palette_size = box_count;
+}
+
+/* Blit a source RGB buffer into a display-sized RGB buffer (centered). */
+static void content_blit_rgb_centered(uint8_t *dst, int dw, int dh,
+                                      const uint8_t *src, int sw, int sh)
+{
+    memset(dst, 0, (size_t)dw * dh * 3);
+    int ox = (sw < dw) ? (dw - sw) / 2 : 0;
+    int oy = (sh < dh) ? (dh - sh) / 2 : 0;
+    int blit_w = (sw < dw) ? sw : dw;
+    int blit_h = (sh < dh) ? sh : dh;
+    for (int y = 0; y < blit_h; y++) {
+        memcpy(dst + ((oy + y) * dw + ox) * 3, src + y * sw * 3, (size_t)blit_w * 3);
+    }
+}
+
+/* Expand one cached indexed frame into content_fb (RGB888) via the palette. */
+static void content_seq_cache_expand_to_fb(int frame_number)
+{
+    if (!content_seq_cache.live || !content_fb || !content_seq_cache.indices) return;
+
+    int idx = frame_number - content_seq_cache.frame_start;
+    if (idx < 0 || idx >= content_seq_cache.frame_count) return;
+
+    int dw = content_seq_cache.width;
+    int dh = content_seq_cache.height;
+    size_t pixels = (size_t)dw * (size_t)dh;
+    const uint8_t *src = content_seq_cache.indices + (size_t)idx * pixels;
+    uint8_t *dst = content_fb->data;
+
+    for (size_t i = 0; i < pixels; i++) {
+        uint8_t pi = src[i];
+        if (pi >= (uint8_t)content_seq_cache.palette_size) pi = 0;
+        dst[i * 3 + 0] = content_seq_cache.palette[pi][0];
+        dst[i * 3 + 1] = content_seq_cache.palette[pi][1];
+        dst[i * 3 + 2] = content_seq_cache.palette[pi][2];
+    }
+}
+
+/* Build the PSRAM indexed cache for the currently-configured sequence.
+ * Returns true if the cache is live and ready for tick fast-path. Soft
+ * failure (false) leaves the legacy decode path in place. */
+static bool content_seq_cache_build(void)
+{
+    content_seq_cache_free();
+
+    if (!content_config.auto_quantize_palette || !content_is_seq ||
+        content_total_frames <= 0 || !content_fb) {
+        return false;
+    }
+
+    int dw = pd_display_get_width();
+    int dh = pd_display_get_height();
+    if (dw <= 0 || dh <= 0) return false;
+
+    size_t pixels = (size_t)dw * (size_t)dh;
+    size_t slab_bytes = pixels * (size_t)content_total_frames;
+    size_t free_spiram = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+    /* Leave some headroom for WiFi/other SPIRAM users. */
+    if (slab_bytes + 65536 > free_spiram) {
+        ESP_LOGW(TAG, "palette cache: need %u bytes SPIRAM, only %u free — falling back to truecolor",
+                 (unsigned)slab_bytes, (unsigned)free_spiram);
+        return false;
+    }
+
+    uint8_t *slab = heap_caps_malloc(slab_bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!slab) {
+        ESP_LOGW(TAG, "palette cache: SPIRAM alloc of %u failed — falling back", (unsigned)slab_bytes);
+        return false;
+    }
+
+    uint8_t *frame_rgb = malloc(pixels * 3);
+    pd_rgba_sample_t *samples = heap_caps_malloc(sizeof(pd_rgba_sample_t) * PD_QUANT_SAMPLES_MAX,
+                                                   MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!frame_rgb || !samples) {
+        ESP_LOGW(TAG, "palette cache: working buffer alloc failed — falling back");
+        free(frame_rgb);
+        heap_caps_free(samples);
+        heap_caps_free(slab);
+        return false;
+    }
+
+    content_seq_cache.indices = slab;
+    content_seq_cache.width = dw;
+    content_seq_cache.height = dh;
+    content_seq_cache.frame_count = content_total_frames;
+    content_seq_cache.frame_start = content_frame_start;
+    content_seq_cache.palette_size = 0;
+
+    int sample_count = 0;
+    bool used_source_palette = false;
+    int64_t t0 = esp_timer_get_time();
+
+    /* Pass 1: sample colors (and adopt a shared PNG palette when possible). */
+    for (int f = 0; f < content_total_frames; f++) {
+        int frame_num = content_frame_start + f;
+        char frame_path[PD_CONTENT_MAX_PATH];
+        snprintf(frame_path, sizeof(frame_path), "%s/", content_current);
+        size_t base_len = strlen(frame_path);
+        snprintf(frame_path + base_len, sizeof(frame_path) - base_len, content_frame_pattern, frame_num);
+
+        unsigned w = 0, h = 0;
+        pd_decoded_frame_t decoded;
+        if (!decode_png_indexed_or_rgba(frame_path, &w, &h, &decoded)) {
+            continue;
+        }
+
+        if (f == 0 && decoded.is_indexed && decoded.palette_size > 0 &&
+            decoded.palette_size <= PD_PALETTE_MAX) {
+            content_seq_cache.palette_size = decoded.palette_size;
+            memcpy(content_seq_cache.palette, decoded.palette,
+                   (size_t)decoded.palette_size * 4);
+            used_source_palette = true;
+        }
+
+        /* Expand to RGBA at source size, then composite + center into display RGB
+         * so the cache matches what the legacy path would show (including bg). */
+        uint8_t *rgba = NULL;
+        if (decoded.is_indexed && decoded.indices) {
+            rgba = malloc((size_t)w * h * 4);
+            if (rgba) {
+                for (size_t i = 0; i < (size_t)w * h; i++) {
+                    uint8_t pi = decoded.indices[i];
+                    if (pi >= (uint8_t)decoded.palette_size) pi = 0;
+                    rgba[i * 4 + 0] = decoded.palette[pi][0];
+                    rgba[i * 4 + 1] = decoded.palette[pi][1];
+                    rgba[i * 4 + 2] = decoded.palette[pi][2];
+                    rgba[i * 4 + 3] = decoded.palette[pi][3];
+                }
+            }
+        } else {
+            rgba = decoded.rgba;
+            decoded.rgba = NULL;  /* ownership transferred */
+        }
+        free_decoded_frame(&decoded);
+
+        if (!rgba) continue;
+
+        uint8_t *rgb = composite_frame(rgba, (int)w, (int)h);
+        free(rgba);
+        if (!rgb) continue;
+
+        content_blit_rgb_centered(frame_rgb, dw, dh, rgb, (int)w, (int)h);
+        free(rgb);
+
+        if (!used_source_palette) {
+            /* Subsample display pixels into the sample pool. */
+            size_t step = pixels / PD_QUANT_SAMPLES_MAX;
+            if (step < 1) step = 1;
+            for (size_t i = 0; i < pixels && sample_count < PD_QUANT_SAMPLES_MAX; i += step) {
+                samples[sample_count].r = frame_rgb[i * 3 + 0];
+                samples[sample_count].g = frame_rgb[i * 3 + 1];
+                samples[sample_count].b = frame_rgb[i * 3 + 2];
+                samples[sample_count].a = 255;
+                sample_count++;
+            }
+        }
+
+        /* Yield so WiFi/HTTP stay responsive during long builds. */
+        if ((f & 7) == 7) vTaskDelay(1);
+    }
+
+    if (!used_source_palette) {
+        pd_median_cut_palette(samples, sample_count,
+                              content_seq_cache.palette, &content_seq_cache.palette_size);
+    }
+    if (content_seq_cache.palette_size <= 0) {
+        content_seq_cache.palette_size = 1;
+        content_seq_cache.palette[0][0] = content_seq_cache.palette[0][1] =
+            content_seq_cache.palette[0][2] = 0;
+        content_seq_cache.palette[0][3] = 255;
+    }
+
+    /* Pass 2: remap every frame into the index slab. */
+    for (int f = 0; f < content_total_frames; f++) {
+        int frame_num = content_frame_start + f;
+        char frame_path[PD_CONTENT_MAX_PATH];
+        snprintf(frame_path, sizeof(frame_path), "%s/", content_current);
+        size_t base_len = strlen(frame_path);
+        snprintf(frame_path + base_len, sizeof(frame_path) - base_len, content_frame_pattern, frame_num);
+
+        unsigned w = 0, h = 0;
+        uint8_t *rgb = decode_png_file(frame_path, &w, &h);
+        uint8_t *dst = slab + (size_t)f * pixels;
+        if (!rgb) {
+            memset(dst, 0, pixels);
+            continue;
+        }
+        content_blit_rgb_centered(frame_rgb, dw, dh, rgb, (int)w, (int)h);
+        free(rgb);
+
+        for (size_t i = 0; i < pixels; i++) {
+            dst[i] = content_nearest_palette_index(frame_rgb[i * 3 + 0],
+                                                   frame_rgb[i * 3 + 1],
+                                                   frame_rgb[i * 3 + 2], 255);
+        }
+        if ((f & 7) == 7) vTaskDelay(1);
+    }
+
+    free(frame_rgb);
+    heap_caps_free(samples);
+
+    content_seq_cache.live = true;
+    int64_t ms = (esp_timer_get_time() - t0) / 1000;
+    ESP_LOGI(TAG, "palette cache ready: %d frames %dx%d, %d colors, %u KB SPIRAM, built in %lld ms (%s)",
+             content_total_frames, dw, dh, content_seq_cache.palette_size,
+             (unsigned)(slab_bytes / 1024), (long long)ms,
+             used_source_palette ? "source-palette" : "quantized");
+    return true;
+}
+
 /* ---- public API ---- */
 
 esp_err_t pd_content_init(const char *base_path)
@@ -960,6 +1354,7 @@ esp_err_t pd_content_play(const char *path)
     /* stop current playback immediately so tick() won't block us */
     content_playing = false;
     content_invalidate_prefetch();
+    content_seq_cache_free();
 
     /* Handle special system paths */
     if (strcmp(path, "system/default") == 0) {
@@ -1007,9 +1402,19 @@ esp_err_t pd_content_play(const char *path)
     /* preload compositing cache before first frame */
     update_compositing_cache(pd_display_get_width(), pd_display_get_height());
 
+    /* Optional: build per-sequence 64-color PSRAM cache. Soft-fails to the
+     * legacy truecolor path when the setting is off, content isn't a
+     * sequence, or the sequence does not fit remaining SPIRAM. */
+    bool cache_live = false;
+    if (content_is_seq && content_config.auto_quantize_palette) {
+        cache_live = content_seq_cache_build();
+    }
+
     /* decode first frame into content_fb and display it */
     if (content_fb) {
-        if (!content_decode_first_frame(full, content_fb)) {
+        if (cache_live) {
+            content_seq_cache_expand_to_fb(content_frame_start);
+        } else if (!content_decode_first_frame(full, content_fb)) {
             content_playing = false;
             return ESP_ERR_NOT_FOUND;
         }
@@ -1038,9 +1443,9 @@ esp_err_t pd_content_play(const char *path)
     /* now safe to enable playback - everything is ready */
     content_playing = true;
 
-    /* get the decode pipeline a head start on frame 2 so it's more likely
-     * to already be ready by the time the first tick needs it */
-    if (content_is_seq && content_total_frames > 1) {
+    /* Prefetch only helps the legacy path — when the palette cache is live
+     * every frame is already in PSRAM. */
+    if (!cache_live && content_is_seq && content_total_frames > 1) {
         content_request_prefetch(content_frame_start + 1);
     }
     return ESP_OK;
@@ -1072,6 +1477,7 @@ esp_err_t pd_content_play_with_transition(const char *path, const char *transiti
     /* stop current playback so tick() won't interfere */
     content_playing = false;
     content_invalidate_prefetch();
+    content_seq_cache_free();
 
     /* set up playback state (applies per-item bg/overlay) */
     esp_err_t err = content_setup_playback(path, full);
@@ -1082,8 +1488,16 @@ esp_err_t pd_content_play_with_transition(const char *path, const char *transiti
     /* preload compositing cache for new content */
     update_compositing_cache(pd_display_get_width(), pd_display_get_height());
 
+    bool cache_live = false;
+    if (content_is_seq && content_config.auto_quantize_palette) {
+        cache_live = content_seq_cache_build();
+    }
+
     /* decode new content into "to" */
-    if (!content_decode_first_frame(full, content_transition->to)) {
+    if (cache_live && content_fb) {
+        content_seq_cache_expand_to_fb(content_frame_start);
+        pd_framebuf_copy(content_transition->to, content_fb);
+    } else if (!content_decode_first_frame(full, content_transition->to)) {
         return ESP_ERR_NOT_FOUND;
     }
 
@@ -1093,7 +1507,7 @@ esp_err_t pd_content_play_with_transition(const char *path, const char *transiti
     /* now safe to enable playback - everything is ready */
     content_playing = true;
 
-    if (content_is_seq && content_total_frames > 1) {
+    if (!cache_live && content_is_seq && content_total_frames > 1) {
         content_request_prefetch(content_frame_start + 1);
     }
     return ESP_OK;
@@ -1103,6 +1517,7 @@ esp_err_t pd_content_stop(void)
 {
     content_playing = false;
     content_invalidate_prefetch();
+    content_seq_cache_free();
     content_current[0] = '\0';
     pd_display_clear();
     ESP_LOGI(TAG, "playback stopped");
@@ -1243,6 +1658,16 @@ void pd_content_tick(void)
     }
 
     bool displayed = false;
+
+    /* Palette-cache fast path: expand pre-quantized indices from PSRAM.
+     * No PNG decode, no prefetch — this is the whole point of the setting. */
+    if (content_seq_cache.live && content_fb) {
+        content_seq_cache_expand_to_fb(next);
+        pd_display_render_framebuf(content_fb->data);
+        content_frame = next;
+        pd_content_note_frame_rendered(now);
+        return;
+    }
 
     /* figure out the frame after `next` up front so we can kick off its
      * decode *before* the (blocking) render call below — that's what
@@ -1564,6 +1989,7 @@ static esp_err_t http_config_get(httpd_req_t *req)
     cJSON_AddBoolToObject(disp, "loop_sequences", content_config.loop_sequences);
     cJSON_AddStringToObject(disp, "background", content_config.background);
     cJSON_AddStringToObject(disp, "overlay", content_config.overlay);
+    cJSON_AddBoolToObject(disp, "auto_quantize_palette", content_config.auto_quantize_palette);
 
     cJSON *attr = cJSON_AddObjectToObject(root, "attract");
     cJSON_AddBoolToObject(attr, "enabled", content_config.attract_enabled);
@@ -1636,6 +2062,9 @@ static esp_err_t http_config_set(httpd_req_t *req)
                     sizeof(content_config.overlay));
             strlcpy(saved_overlay, ov->valuestring, sizeof(saved_overlay));
         }
+        cJSON *aq = cJSON_GetObjectItem(disp, "auto_quantize_palette");
+        if (cJSON_IsBool(aq))
+            content_config.auto_quantize_palette = cJSON_IsTrue(aq);
     }
 
     cJSON *attr = cJSON_GetObjectItem(root, "attract");

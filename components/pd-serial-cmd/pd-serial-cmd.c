@@ -16,6 +16,9 @@
  *
  *   -> {"cmd":"list"}
  *   <- {"type":"list","items":[...]}
+ *
+ *   -> {"cmd":"set_playback","auto_quantize_palette":true,"save":true}
+ *   <- {"type":"ack","cmd":"set_playback","ok":true,"auto_quantize_palette":true}
  */
 
 #include "pd-serial-cmd.h"
@@ -200,6 +203,25 @@ static void serial_cmd_handler(const char *json_str)
         handle_status();
     } else if (strcmp(cmd_str, "list") == 0) {
         handle_list();
+    } else if (strcmp(cmd_str, "set_playback") == 0) {
+        /* {"cmd":"set_playback","auto_quantize_palette":true,"save":true} */
+        const pd_content_config_t *cur = pd_content_get_config();
+        pd_content_config_t cfg = *cur;
+        cJSON *aq = cJSON_GetObjectItem(root, "auto_quantize_palette");
+        if (cJSON_IsBool(aq)) {
+            cfg.auto_quantize_palette = cJSON_IsTrue(aq);
+        }
+        pd_content_set_config(&cfg);
+        cJSON *save = cJSON_GetObjectItem(root, "save");
+        if (cJSON_IsTrue(save)) {
+            pd_content_save_config();
+        }
+        cJSON *ack = cJSON_CreateObject();
+        cJSON_AddStringToObject(ack, "type", "ack");
+        cJSON_AddStringToObject(ack, "cmd", "set_playback");
+        cJSON_AddBoolToObject(ack, "ok", true);
+        cJSON_AddBoolToObject(ack, "auto_quantize_palette", cfg.auto_quantize_palette);
+        serial_send_json(ack);
     } else {
         ESP_LOGW(TAG, "unknown command: %s", cmd_str);
     }
