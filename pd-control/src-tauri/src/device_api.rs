@@ -1,13 +1,23 @@
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 
+// Field names below are renamed per-direction to match what the ESP32
+// firmware actually sends on the wire (`sequence`, `frame`, `frames`,
+// `images`) while keeping the existing camelCase-ish contract the
+// frontend already expects (`is_sequence`, `current_frame`, `frame_count`,
+// `items`). Mismatches here previously caused deserialization to either
+// fail outright (non-`Option` fields) or silently come back empty/`None`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeviceStatus {
     pub playing: Option<bool>,
     pub path: Option<String>,
+    #[serde(rename(serialize = "is_sequence", deserialize = "sequence"), default)]
     pub is_sequence: Option<bool>,
+    #[serde(rename(serialize = "current_frame", deserialize = "frame"), default)]
     pub current_frame: Option<u32>,
+    #[serde(default)]
     pub total_frames: Option<u32>,
+    #[serde(default)]
     pub fps: Option<f32>,
 }
 
@@ -15,13 +25,17 @@ pub struct DeviceStatus {
 pub struct ContentEntry {
     pub path: String,
     pub name: String,
+    #[serde(rename(serialize = "is_sequence", deserialize = "sequence"), default)]
     pub is_sequence: Option<bool>,
+    #[serde(rename(serialize = "frame_count", deserialize = "frames"), default)]
     pub frame_count: Option<u32>,
+    #[serde(default)]
     pub fps: Option<f32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ContentList {
+    #[serde(rename(serialize = "items", deserialize = "images"))]
     pub items: Vec<ContentEntry>,
 }
 
@@ -120,6 +134,39 @@ impl DeviceApi {
             .json::<serde_json::Value>()
             .await
             .map_err(|e| e.to_string())
+    }
+
+    /// GET /wizard — device identity/network settings (device_name, hostname,
+    /// timezone, wifi_ssid, static_ip/gateway/netmask). Distinct from
+    /// `/api/config` (transition/display/attract) and `/api/config/layout`
+    /// (panel geometry) — neither of those handlers reads or writes WiFi or
+    /// networking fields at all, so posting WiFi/IP changes to them is a
+    /// silent no-op on the firmware side.
+    pub async fn wizard_config(&self) -> Result<serde_json::Value, String> {
+        self.client
+            .get(format!("{}/wizard", self.base_url))
+            .send()
+            .await
+            .map_err(|e| e.to_string())?
+            .json::<serde_json::Value>()
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    /// POST /wizard — partial merge update of device identity/network
+    /// settings. The firmware responds with an empty 200 body (no reboot),
+    /// so we just surface HTTP-level success/failure rather than parsing JSON.
+    pub async fn wizard_set_config(&self, config: serde_json::Value) -> Result<serde_json::Value, String> {
+        let resp = self.client
+            .post(format!("{}/wizard", self.base_url))
+            .json(&config)
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
+        if !resp.status().is_success() {
+            return Err(format!("device returned HTTP {}", resp.status()));
+        }
+        Ok(serde_json::json!({ "ok": true }))
     }
 
     pub async fn layout(&self) -> Result<serde_json::Value, String> {

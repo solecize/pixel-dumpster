@@ -75,6 +75,21 @@ export async function setDeviceConfig(
   return invoke("device_set_config", { ip, port, config });
 }
 
+export async function getDeviceWizardConfig(
+  ip: string,
+  port: number
+): Promise<unknown> {
+  return invoke("device_wizard_config", { ip, port });
+}
+
+export async function setDeviceWizardConfig(
+  ip: string,
+  port: number,
+  config: Record<string, unknown>
+): Promise<unknown> {
+  return invoke("device_set_wizard_config", { ip, port, config });
+}
+
 export async function getDeviceLayout(
   ip: string,
   port: number

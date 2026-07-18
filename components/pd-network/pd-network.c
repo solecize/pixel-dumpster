@@ -34,6 +34,7 @@ static httpd_handle_t pd_http_server = NULL;
 static bool pd_wifi_connected = false;
 static bool pd_network_suspended = false;
 static bool pd_mdns_started = false;
+static bool pd_mdns_pending = false;
 static int pd_udp_socket = -1;
 static time_t pd_now_mtime = 0;
 
@@ -49,10 +50,12 @@ static void pd_network_handle_wifi_event(void *arg, esp_event_base_t event_base,
 
     if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
         pd_wifi_connected = false;
+        wifi_event_sta_disconnected_t *disc = (wifi_event_sta_disconnected_t *)event_data;
+        uint8_t reason = disc ? disc->reason : 0;
         if (pd_network_suspended) {
-            ESP_LOGW(TAG, "wifi disconnected (suspended, not retrying)");
+            ESP_LOGW(TAG, "wifi disconnected (reason=%d, suspended, not retrying)", reason);
         } else {
-            ESP_LOGW(TAG, "wifi disconnected, retrying");
+            ESP_LOGW(TAG, "wifi disconnected (reason=%d), retrying", reason);
             esp_wifi_connect();
         }
         return;
@@ -61,10 +64,10 @@ static void pd_network_handle_wifi_event(void *arg, esp_event_base_t event_base,
     if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
         pd_wifi_connected = true;
         ESP_LOGI(TAG, "wifi connected");
-        /* Start mDNS now that we have an IP */
+        /* Defer mDNS startup to pd_network_poll() on the main task, which has
+         * a much larger stack than this event handler's sys_evt task. */
         if (!pd_mdns_started) {
-            pd_network_start_mdns();
-            pd_mdns_started = true;
+            pd_mdns_pending = true;
         }
     }
 }
@@ -497,18 +500,22 @@ static void pd_network_start_mdns(void)
     /* add TXT records with device metadata */
     mdns_service_txt_item_set("_pdumpster", "_tcp", "version", "1");
 
-    /* load config for display dimensions */
-    pd_config_t cfg;
-    pd_config_init(&cfg);
-    pd_config_load(&cfg);
+    /* Use the config already loaded once at boot instead of re-reading and
+     * re-parsing config.json from flash here. This handler can run on the
+     * small sys_evt task stack (see pd_network_handle_wifi_event), and a
+     * fresh pd_config_load() + cJSON_Parse() call chain on that stack was
+     * overflowing it and corrupting adjacent heap metadata. */
+    pd_config_t *cfg = pd_config_get_active();
+    int width = cfg ? cfg->matrix_width : 0;
+    int height = cfg ? cfg->matrix_height : 0;
 
     char w_str[8], h_str[8];
-    snprintf(w_str, sizeof(w_str), "%d", cfg.matrix_width);
-    snprintf(h_str, sizeof(h_str), "%d", cfg.matrix_height);
+    snprintf(w_str, sizeof(w_str), "%d", width);
+    snprintf(h_str, sizeof(h_str), "%d", height);
     mdns_service_txt_item_set("_pdumpster", "_tcp", "width", w_str);
     mdns_service_txt_item_set("_pdumpster", "_tcp", "height", h_str);
-    if (cfg.device_name[0])
-        mdns_service_txt_item_set("_pdumpster", "_tcp", "name", cfg.device_name);
+    if (cfg && cfg->device_name[0])
+        mdns_service_txt_item_set("_pdumpster", "_tcp", "name", cfg->device_name);
 
     ESP_LOGI(TAG, "mdns started: %s._pdumpster._tcp port %d",
              hostname, pd_network_config.http_port);
@@ -545,7 +552,18 @@ void pd_network_start(void)
     wifi_config_t wifi_config = {0};
     strncpy((char *)wifi_config.sta.ssid, pd_network_config.wifi_ssid, sizeof(wifi_config.sta.ssid) - 1);
     strncpy((char *)wifi_config.sta.password, pd_network_config.wifi_password, sizeof(wifi_config.sta.password) - 1);
-    wifi_config.sta.threshold.authmode = WIFI_AUTH_WPA2_PSK;
+    /* An unconditional WPA2_PSK minimum meant the ESP32 flat-out refused to
+     * associate with genuinely open networks (e.g. open SSID + browser-based
+     * captive portal login, common in hotels/managed housing) even with an
+     * empty password configured. Only require WPA2+ when a password is
+     * actually set; otherwise allow open auth. */
+    wifi_config.sta.threshold.authmode =
+        (pd_network_config.wifi_password[0] != '\0') ? WIFI_AUTH_WPA2_PSK : WIFI_AUTH_OPEN;
+    /* NOTE: owe_enabled deliberately left false/default. Setting it true
+     * tells the driver "we specifically want an OWE-encrypted AP", which
+     * makes it reject genuinely plain-open APs with debug reason "Open AP,
+     * but we want an encrypted AP, ignore" (disconnect reason 210). Plain
+     * open networks need threshold=OPEN with owe_enabled left off. */
 
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
@@ -582,13 +600,19 @@ void pd_network_start(void)
     ESP_LOGI(TAG, "wifi init started");
     pd_network_start_http();
     pd_network_start_udp();
-    /* mDNS will be started after WiFi connects (in GOT_IP handler) */
+    /* mDNS will be started after WiFi connects, from pd_network_poll() on
+     * the main task (flagged by the GOT_IP handler via pd_mdns_pending). */
 }
 
 void pd_network_poll(void)
 {
     pd_network_check_udp();
     pd_network_poll_now_json();
+    if (pd_mdns_pending && !pd_mdns_started) {
+        pd_network_start_mdns();
+        pd_mdns_started = true;
+        pd_mdns_pending = false;
+    }
     if (!pd_http_server && pd_wifi_connected) {
         pd_network_start_http();
     }

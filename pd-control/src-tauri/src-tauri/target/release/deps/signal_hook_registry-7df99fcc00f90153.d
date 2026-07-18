@@ -1,0 +1,9 @@
+/Users/jdfrey/Documents/pixel-dumpster/CascadeProjects/windsurf-project/pd-control/src-tauri/src-tauri/target/release/deps/signal_hook_registry-7df99fcc00f90153.d: /Users/jdfrey/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/signal-hook-registry-1.4.8/src/lib.rs /Users/jdfrey/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/signal-hook-registry-1.4.8/src/half_lock.rs /Users/jdfrey/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/signal-hook-registry-1.4.8/src/vec_map.rs
+
+/Users/jdfrey/Documents/pixel-dumpster/CascadeProjects/windsurf-project/pd-control/src-tauri/src-tauri/target/release/deps/libsignal_hook_registry-7df99fcc00f90153.rlib: /Users/jdfrey/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/signal-hook-registry-1.4.8/src/lib.rs /Users/jdfrey/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/signal-hook-registry-1.4.8/src/half_lock.rs /Users/jdfrey/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/signal-hook-registry-1.4.8/src/vec_map.rs
+
+/Users/jdfrey/Documents/pixel-dumpster/CascadeProjects/windsurf-project/pd-control/src-tauri/src-tauri/target/release/deps/libsignal_hook_registry-7df99fcc00f90153.rmeta: /Users/jdfrey/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/signal-hook-registry-1.4.8/src/lib.rs /Users/jdfrey/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/signal-hook-registry-1.4.8/src/half_lock.rs /Users/jdfrey/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/signal-hook-registry-1.4.8/src/vec_map.rs
+
+/Users/jdfrey/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/signal-hook-registry-1.4.8/src/lib.rs:
+/Users/jdfrey/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/signal-hook-registry-1.4.8/src/half_lock.rs:
+/Users/jdfrey/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/signal-hook-registry-1.4.8/src/vec_map.rs:

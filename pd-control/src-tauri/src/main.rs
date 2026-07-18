@@ -25,6 +25,8 @@ fn main() {
             commands::device_list_content,
             commands::device_config,
             commands::device_set_config,
+            commands::device_wizard_config,
+            commands::device_set_wizard_config,
             commands::device_layout,
             commands::device_set_layout,
             commands::device_preview_layout,

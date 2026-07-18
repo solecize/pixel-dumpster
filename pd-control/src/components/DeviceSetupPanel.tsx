@@ -5,7 +5,8 @@ import {
   setDeviceLayout,
   previewDeviceLayout,
   addManualDevice,
-  setDeviceConfig,
+  getDeviceWizardConfig,
+  setDeviceWizardConfig,
   startTestPattern,
   stopTestPattern,
 } from "../lib/api";
@@ -57,11 +58,17 @@ export function DeviceSetupPanel({
   const [testBusy, setTestBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [showManual, setShowManual] = useState(false);
+  const [wizardConfig, setWizardConfig] = useState<Record<string, unknown> | null>(null);
   const [editDeviceInfo, setEditDeviceInfo] = useState(false);
   const [deviceInfoForm, setDeviceInfoForm] = useState({
     device_name: "",
+    hostname: "",
+    timezone: "",
     wifi_ssid: "",
     wifi_password: "",
+    static_ip: "",
+    static_gateway: "",
+    static_netmask: "",
   });
   const [deviceInfoSaving, setDeviceInfoSaving] = useState(false);
   const [deviceInfoSaved, setDeviceInfoSaved] = useState<string | null>(null);
@@ -111,9 +118,20 @@ export function DeviceSetupPanel({
     }
   }, [device]);
 
+  const refreshWizardConfig = useCallback(async () => {
+    if (!device) return;
+    try {
+      const w = (await getDeviceWizardConfig(device.ip, device.port)) as Record<string, unknown>;
+      setWizardConfig(w);
+    } catch (err) {
+      setError(`Device settings load error: ${String(err)}`);
+    }
+  }, [device]);
+
   useEffect(() => {
     refreshLayout();
-  }, [refreshLayout]);
+    refreshWizardConfig();
+  }, [refreshLayout, refreshWizardConfig]);
 
   const handleAddManual = async () => {
     if (!manualIp) return;
@@ -293,11 +311,17 @@ export function DeviceSetupPanel({
             onClick={() => {
               setEditDeviceInfo(!editDeviceInfo);
               setDeviceInfoSaved(null);
-              if (!editDeviceInfo && layout) {
+              if (!editDeviceInfo) {
+                const w = (wizardConfig || {}) as Record<string, string>;
                 setDeviceInfoForm({
-                  device_name: String((layout as Record<string, string>).device_name || device.name),
-                  wifi_ssid: String((layout as Record<string, string>).wifi_ssid || ""),
+                  device_name: String(w.device_name || device.name),
+                  hostname: String(w.hostname || ""),
+                  timezone: String(w.timezone || ""),
+                  wifi_ssid: String(w.wifi_ssid || ""),
                   wifi_password: "",
+                  static_ip: String(w.static_ip || ""),
+                  static_gateway: String(w.static_gateway || ""),
+                  static_netmask: String(w.static_netmask || ""),
                 });
               }
             }}
@@ -321,10 +345,21 @@ export function DeviceSetupPanel({
                 <div>
                   {String(layout.panel_cols)}x{String(layout.panel_rows)} ({String(layout.panel_width)}x{String(layout.panel_height)} each)
                 </div>
+              </>
+            )}
+            {wizardConfig && (
+              <>
                 <div className="text-gray-500">WiFi</div>
-                <div>{String((layout as Record<string, string>).wifi_ssid || "—")}</div>
+                <div>{String((wizardConfig as Record<string, string>).wifi_ssid || "—")}</div>
                 <div className="text-gray-500">Hostname</div>
-                <div>{String((layout as Record<string, string>).hostname || "—")}</div>
+                <div>{String((wizardConfig as Record<string, string>).hostname || "—")}</div>
+                <div className="text-gray-500">Timezone</div>
+                <div>{String((wizardConfig as Record<string, string>).timezone || "—")}</div>
+                <div className="text-gray-500">IP address</div>
+                <div>
+                  {String((wizardConfig as Record<string, string>).static_ip || "") ||
+                    "DHCP (auto)"}
+                </div>
               </>
             )}
           </div>
@@ -357,9 +392,87 @@ export function DeviceSetupPanel({
                 value={deviceInfoForm.wifi_password}
                 onChange={(e) => setDeviceInfoForm((f) => ({ ...f, wifi_password: e.target.value }))}
                 className="w-full bg-pd-bg border border-pd-border rounded px-2 py-1.5 text-sm text-white focus:border-purple-500 focus:outline-none"
-                placeholder="Leave blank for open network"
+                placeholder="Leave blank to keep the current password, or type a new one"
+              />
+              <p className="text-xs text-gray-600 mt-1">
+                Only scanning for nearby networks and testing a password before saving
+                requires a USB connection — use{" "}
+                <button
+                  type="button"
+                  onClick={() => setShowWizard(true)}
+                  className="text-purple-400 hover:underline"
+                >
+                  Launch Wizard
+                </button>{" "}
+                for that. Editing here saves directly over the network but can't
+                verify the password works until the device reboots.
+              </p>
+            </div>
+            <div className="grid grid-cols-2 gap-3">
+              <div>
+                <label className="text-xs text-gray-500 block mb-1">Hostname</label>
+                <input
+                  type="text"
+                  value={deviceInfoForm.hostname}
+                  onChange={(e) => setDeviceInfoForm((f) => ({ ...f, hostname: e.target.value }))}
+                  className="w-full bg-pd-bg border border-pd-border rounded px-2 py-1.5 text-sm text-white focus:border-purple-500 focus:outline-none"
+                />
+              </div>
+              <div>
+                <label className="text-xs text-gray-500 block mb-1">Timezone</label>
+                <input
+                  type="text"
+                  value={deviceInfoForm.timezone}
+                  onChange={(e) => setDeviceInfoForm((f) => ({ ...f, timezone: e.target.value }))}
+                  placeholder="e.g. CST6CDT"
+                  className="w-full bg-pd-bg border border-pd-border rounded px-2 py-1.5 text-sm text-white focus:border-purple-500 focus:outline-none"
+                />
+              </div>
+            </div>
+            <div>
+              <label className="text-xs text-gray-500 block mb-1">
+                IP address <span className="text-gray-600">(blank = DHCP / automatic)</span>
+              </label>
+              <input
+                type="text"
+                value={deviceInfoForm.static_ip}
+                onChange={(e) =>
+                  setDeviceInfoForm((f) => ({
+                    ...f,
+                    static_ip: e.target.value,
+                    ...(e.target.value === ""
+                      ? { static_gateway: "", static_netmask: "" }
+                      : {}),
+                  }))
+                }
+                placeholder="192.168.1.50"
+                className="w-full bg-pd-bg border border-pd-border rounded px-2 py-1.5 text-sm text-white focus:border-purple-500 focus:outline-none"
               />
             </div>
+            {deviceInfoForm.static_ip !== "" && (
+              <div className="grid grid-cols-2 gap-3">
+                <div>
+                  <label className="text-xs text-gray-500 block mb-1">Gateway</label>
+                  <input
+                    type="text"
+                    value={deviceInfoForm.static_gateway}
+                    onChange={(e) => setDeviceInfoForm((f) => ({ ...f, static_gateway: e.target.value }))}
+                    placeholder="192.168.1.1"
+                    className="w-full bg-pd-bg border border-pd-border rounded px-2 py-1.5 text-sm text-white focus:border-purple-500 focus:outline-none"
+                  />
+                </div>
+                <div>
+                  <label className="text-xs text-gray-500 block mb-1">Netmask</label>
+                  <input
+                    type="text"
+                    value={deviceInfoForm.static_netmask}
+                    onChange={(e) => setDeviceInfoForm((f) => ({ ...f, static_netmask: e.target.value }))}
+                    placeholder="255.255.255.0"
+                    className="w-full bg-pd-bg border border-pd-border rounded px-2 py-1.5 text-sm text-white focus:border-purple-500 focus:outline-none"
+                  />
+                </div>
+              </div>
+            )}
             {deviceInfoSaved && (
               <div className="text-xs text-pd-green">{deviceInfoSaved}</div>
             )}
@@ -370,14 +483,24 @@ export function DeviceSetupPanel({
                   if (!device) return;
                   setDeviceInfoSaving(true);
                   try {
-                    await setDeviceConfig(device.ip, device.port, {
+                    const payload: Record<string, unknown> = {
                       device_name: deviceInfoForm.device_name,
+                      hostname: deviceInfoForm.hostname,
+                      timezone: deviceInfoForm.timezone,
                       wifi_ssid: deviceInfoForm.wifi_ssid,
-                      wifi_password: deviceInfoForm.wifi_password,
-                    });
-                    setDeviceInfoSaved("Saved. Reboot to apply WiFi changes.");
+                      static_ip: deviceInfoForm.static_ip,
+                      static_gateway: deviceInfoForm.static_gateway,
+                      static_netmask: deviceInfoForm.static_netmask,
+                    };
+                    // Don't overwrite the saved password with an empty string
+                    // just because the field was left blank for editing.
+                    if (deviceInfoForm.wifi_password !== "") {
+                      payload.wifi_password = deviceInfoForm.wifi_password;
+                    }
+                    await setDeviceWizardConfig(device.ip, device.port, payload);
+                    setDeviceInfoSaved("Saved. Reboot the device to apply WiFi/network changes.");
                     setEditDeviceInfo(false);
-                    setTimeout(refreshLayout, 2000);
+                    setTimeout(refreshWizardConfig, 500);
                   } catch (err) {
                     setDeviceInfoSaved(`Error: ${String(err)}`);
                   } finally {

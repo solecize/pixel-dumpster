@@ -408,6 +408,91 @@ static uint8_t *decode_png_rgba(const char *path, unsigned *w, unsigned *h)
     return rgba;
 }
 
+/* Decoded pixel data in whichever form is cheapest for the source PNG.
+ * Paletted (indexed-color, PNG color type 3) sources decode to 1 byte/pixel
+ * plus a small (<=256 entry) palette instead of being expanded to full
+ * RGBA — cheaper to decode (smaller file on flash, less zlib inflate work)
+ * and cheaper to composite (palette lookup instead of always-blend math).
+ * Non-indexed PNGs (existing truecolor content) fall back to the RGBA path
+ * unchanged, so nothing needs to be re-exported for this to keep working. */
+typedef struct {
+    bool     is_indexed;
+    uint8_t *indices;          /* w*h bytes, only valid if is_indexed */
+    uint8_t  palette[256][4];  /* RGBA per index, only valid if is_indexed */
+    int      palette_size;
+    uint8_t *rgba;             /* w*h*4 bytes, only valid if !is_indexed */
+} pd_decoded_frame_t;
+
+static void free_decoded_frame(pd_decoded_frame_t *f)
+{
+    if (!f) return;
+    free(f->indices);
+    free(f->rgba);
+    f->indices = NULL;
+    f->rgba = NULL;
+}
+
+static bool decode_png_indexed_or_rgba(const char *path, unsigned *w, unsigned *h,
+                                        pd_decoded_frame_t *out)
+{
+    memset(out, 0, sizeof(*out));
+
+    FILE *f = fopen(path, "rb");
+    if (!f) {
+        ESP_LOGE(TAG, "cannot open %s", path);
+        return false;
+    }
+    fseek(f, 0, SEEK_END);
+    long sz = ftell(f);
+    rewind(f);
+    if (sz <= 0) { fclose(f); return false; }
+
+    unsigned char *png_data = malloc(sz);
+    if (!png_data) { fclose(f); return false; }
+    fread(png_data, 1, sz, f);
+    fclose(f);
+
+    LodePNGState state;
+    lodepng_state_init(&state);
+
+    unsigned iw, ih;
+    unsigned err = lodepng_inspect(&iw, &ih, &state, png_data, sz);
+    bool source_is_palette = (!err && state.info_png.color.colortype == LCT_PALETTE);
+
+    if (source_is_palette) {
+        state.info_raw.colortype = LCT_PALETTE;
+        state.info_raw.bitdepth = 8;
+        unsigned char *raw = NULL;
+        err = lodepng_decode(&raw, w, h, &state, png_data, sz);
+        if (!err && raw) {
+            int n = (int)state.info_png.color.palettesize;
+            if (n > 256) n = 256;
+            out->is_indexed = true;
+            out->indices = raw;
+            out->palette_size = n;
+            memcpy(out->palette, state.info_png.color.palette, (size_t)n * 4);
+            lodepng_state_cleanup(&state);
+            free(png_data);
+            return true;
+        }
+        free(raw);  /* no-op if NULL — defensive against a partial alloc on error */
+    }
+    lodepng_state_cleanup(&state);
+
+    /* fallback: not a paletted PNG (or the indexed decode failed for some
+     * reason) — decode straight to RGBA exactly as before. */
+    unsigned char *rgba = NULL;
+    err = lodepng_decode32(&rgba, w, h, png_data, sz);
+    free(png_data);
+    if (err || !rgba) {
+        ESP_LOGE(TAG, "lodepng error %u: %s", err, lodepng_error_text(err));
+        return false;
+    }
+    out->is_indexed = false;
+    out->rgba = rgba;
+    return true;
+}
+
 static bool parse_hex_color(const char *str, uint8_t *r, uint8_t *g, uint8_t *b)
 {
     if (!str || str[0] != '#' || strlen(str) != 7) return false;

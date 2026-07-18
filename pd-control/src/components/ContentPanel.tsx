@@ -6,7 +6,9 @@ import {
   devicePlay,
   deviceStop,
   addManualDevice,
+  uploadContentToDevice,
 } from "../lib/api";
+import { testContent } from "../lib/testContent";
 
 interface ContentPanelProps {
   devices: DiscoveredDevice[];
@@ -31,6 +33,7 @@ export function ContentPanel({
   const [showManual, setShowManual] = useState(false);
   const [manualIp, setManualIp] = useState("");
   const [manualPort, setManualPort] = useState("8088");
+  const [uploadingTest, setUploadingTest] = useState<string | null>(null);
 
   const device = selected;
 
@@ -79,6 +82,31 @@ export function ContentPanel({
       setTimeout(refreshStatus, 500);
     } catch (err) {
       setError(String(err));
+    }
+  };
+
+  const handlePlayTest = async (testPath: string) => {
+    if (!device) return;
+    setUploadingTest(testPath);
+    try {
+      if (testPath.startsWith("system/")) {
+        await devicePlay(device.ip, device.port, testPath, "fade", 800);
+      } else {
+        // First try to play - if the device doesn't have it yet, upload then play
+        try {
+          await devicePlay(device.ip, device.port, testPath, "fade", 800);
+        } catch {
+          await uploadContentToDevice(device.ip, device.port, testPath);
+          await new Promise((resolve) => setTimeout(resolve, 500));
+          await devicePlay(device.ip, device.port, testPath, "fade", 800);
+        }
+      }
+      setTimeout(refreshStatus, 500);
+      setError(null);
+    } catch (err) {
+      setError(String(err));
+    } finally {
+      setUploadingTest(null);
     }
   };
 
@@ -300,6 +328,44 @@ export function ContentPanel({
             No content found on device.
           </p>
         )}
+      </div>
+
+      {/* Test Content — built-in samples for trying out animations/transitions */}
+      <div>
+        <div className="flex items-center justify-between mb-3">
+          <h3 className="font-semibold">Test Content</h3>
+          <span className="text-xs text-gray-600">Built-in samples</span>
+        </div>
+        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
+          {testContent.map((item) => (
+            <button
+              key={item.path}
+              onClick={() => handlePlayTest(item.path)}
+              disabled={uploadingTest === item.path}
+              className="bg-pd-panel/50 border border-pd-border/50 rounded-lg p-3 text-left hover:border-purple-500/50 transition disabled:opacity-50 disabled:cursor-wait"
+            >
+              <div className="flex items-start justify-between mb-1">
+                <div className="text-sm font-medium truncate flex-1">
+                  {item.name}
+                </div>
+                <span className="text-xs px-1.5 py-0.5 rounded bg-purple-600/20 text-purple-400 ml-2 flex-shrink-0">
+                  {item.category}
+                </span>
+              </div>
+              <div className="text-xs text-gray-500 mb-1">
+                {item.description}
+              </div>
+              <div className="text-xs text-gray-600">
+                {item.path}
+              </div>
+              {uploadingTest === item.path && (
+                <div className="text-xs text-purple-400 mt-1">
+                  Uploading...
+                </div>
+              )}
+            </button>
+          ))}
+        </div>
       </div>
     </div>
   );

@@ -15,3 +15,10 @@ CONFIG_PARTITION_TABLE_CUSTOM=y
 CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
 CONFIG_TINYUSB_HOST=y
 CONFIG_TINYUSB_HOST_HID=y
+
+# The main task runs the app's primary loop (display rendering, content
+# playback, network polling, wizard/serial command handling) and makes
+# deep calls into LittleFS/esp_flash (e.g. opendir() when listing content).
+# The IDF default of 3584 bytes is too small for that call depth and was
+# causing a stack-overflow crash whenever content listing was triggered.
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192

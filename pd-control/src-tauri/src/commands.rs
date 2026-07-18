@@ -5,7 +5,7 @@ use crate::flasher::{self, FlashConfig, FlashProgress, SerialPortInfo};
 use crate::pi_installer::{self, PiInstallConfig, PiInstallProgress, SshConfig};
 use crate::serial_wizard;
 use std::sync::Mutex;
-use tauri::{Emitter, State};
+use tauri::{Emitter, Manager, State};
 
 pub struct AppState {
     pub discovery: Mutex<DiscoveryState>,
@@ -106,6 +106,22 @@ pub async fn device_set_config(
 ) -> Result<serde_json::Value, String> {
     let api = DeviceApi::new(&ip, port);
     api.set_config(config).await
+}
+
+#[tauri::command]
+pub async fn device_wizard_config(ip: String, port: u16) -> Result<serde_json::Value, String> {
+    let api = DeviceApi::new(&ip, port);
+    api.wizard_config().await
+}
+
+#[tauri::command]
+pub async fn device_set_wizard_config(
+    ip: String,
+    port: u16,
+    config: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    let api = DeviceApi::new(&ip, port);
+    api.wizard_set_config(config).await
 }
 
 #[tauri::command]
@@ -467,21 +483,39 @@ pub async fn wizard_poll(
 
 // --- Content Upload ---
 
+/// Locate the directory that holds the bundled sample/test content.
+///
+/// In a packaged build this is the `content/` resource bundled alongside
+/// the app (see `bundle.resources` in tauri.conf.json) — the app's current
+/// working directory at runtime is *not* the project checkout, so a path
+/// relative to it (as this used to assume) never resolves once installed.
+/// In dev mode (`npm run tauri dev`), fall back to the repo-relative
+/// `../content` folder next to `pd-control/`, since no bundled resource
+/// exists yet.
+fn resolve_content_dir(app: &tauri::AppHandle) -> Result<std::path::PathBuf, String> {
+    if let Ok(resource_path) = app.path().resolve("content", tauri::path::BaseDirectory::Resource) {
+        if resource_path.exists() {
+            return Ok(resource_path);
+        }
+    }
+
+    let mut dev_path = std::env::current_dir().map_err(|e| e.to_string())?;
+    dev_path.push("..");
+    dev_path.push("content");
+    dev_path
+        .canonicalize()
+        .map_err(|e| format!("Failed to resolve content directory (checked bundled resources and dev path): {}", e))
+}
+
 #[tauri::command]
 pub async fn upload_content_to_device(
+    app: tauri::AppHandle,
     device_ip: String,
     device_port: u16,
     content_path: String,
 ) -> Result<(), String> {
-    // Find the project content directory (go up from pd-control to project root)
-    let mut content_dir = std::env::current_dir().map_err(|e| e.to_string())?;
-    content_dir.push("..");
-    content_dir.push("content");
-    
-    // Canonicalize to resolve .. and symlinks
-    let content_dir = content_dir.canonicalize()
-        .map_err(|e| format!("Failed to resolve content directory: {}", e))?;
-    
+    let content_dir = resolve_content_dir(&app)?;
+
     // Build full path to content file/directory
     let full_path = content_dir.join(&content_path);
     
