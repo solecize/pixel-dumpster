@@ -46,3 +46,11 @@ CONFIG_BT_NIMBLE_TRANSPORT_EVT_COUNT=20
 # stack") and pd-control never discovers the device over WiFi.
 CONFIG_MDNS_TASK_CREATE_FROM_SPIRAM=y
 CONFIG_MDNS_MEMORY_ALLOC_SPIRAM=y
+
+# HUB75 BCM bit depth: 6-bit preferred for low-color sprite headroom (fewer
+# planes → more CPU for multi-rect dirty present). Logos stay readable; full
+# gradient art may show mild banding vs 8-bit. A/B notes in
+# tools/draw-mode-bench/README.md — flip to CONFIG_HUB75_BIT_DEPTH_8=y to compare.
+CONFIG_HUB75_BIT_DEPTH_6=y
+# CONFIG_HUB75_BIT_DEPTH_8 is not set
+CONFIG_HUB75_BIT_DEPTH=6

@@ -5,3 +5,8 @@ CONFIG_PARTITION_TABLE_CUSTOM=y
 CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="../../partitions.csv"
 CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192
 CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
+
+# Match production default (sprite-block headroom). A/B: rebuild with
+# CONFIG_HUB75_BIT_DEPTH_8=y or _4=y and compare RESULT fps + visual banding.
+CONFIG_HUB75_BIT_DEPTH_6=y
+CONFIG_HUB75_BIT_DEPTH=6

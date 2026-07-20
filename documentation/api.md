@@ -4,7 +4,7 @@ This document describes the ESP32 firmware's HTTP API, as actually implemented i
 `components/pd-content/pd-content.c` and `components/pd-network/pd-network.c`.
 
 > Related Documentation:
-> [readme.md](../readme.md) | [development.md](development.md) | [transitions.md](transitions.md) | [wizard-protocol.md](wizard-protocol.md) | [dumpster-diver.md](dumpster-diver.md) | [pd-control/README.md](../pd-control/README.md)
+> [readme.md](../readme.md) | [development.md](development.md) | [transitions.md](transitions.md) | [wizard-protocol.md](wizard-protocol.md) | [ble-transport.md](ble-transport.md) | [dumpster-diver.md](dumpster-diver.md) | [pd-control/README.md](../pd-control/README.md)
 
 ## Overview
 
@@ -14,10 +14,12 @@ matrix.
 
 | Family | Prefix | Registered by | Drives the display? |
 |--------|--------|----------------|----------------------|
-| **Content API** (current) | `/api/*` | `pd_content_register_http()` in `pd-content.c` | **Yes** — this is what `pd-control` and `dumpster-diver` use |
+| **Content API** (current) | `/api/*` | `pd_content_register_http()` in `pd-content.c` | **Yes** — primary path for `pd-control` and `dumpster-diver` over WiFi |
 | **Legacy artifact API** | bare paths (`/reload`, `/state`, `/list`, `/upload`, `/wizard`) | `pd_network_start_http()` in `pd-network.c` | **No** — kept for backward compatibility; see [Legacy Artifact API](#legacy-artifact-api-does-not-drive-the-display) below |
 
-If you're integrating a new client, use the **Content API**.
+If you're integrating a new client over WiFi, use the **Content API**. The same
+playback/list/upload operations are also available over BLE and USB as
+newline-delimited JSON — see [Alternate transports](#alternate-transports).
 
 ### Base URL
 
@@ -62,6 +64,37 @@ List playable content. Scans the device's content root (`/pd/content/`, see
 curl http://pixel-dumpster.local:8088/api/content
 ```
 
+### POST /api/content/delete
+
+Deletes a file or sequence directory under the content root.
+
+**Request:**
+```json
+{ "path": "images/zaxxon.png" }
+```
+
+Prefer this JSON POST over `DELETE /api/content?path=…`. Query-encoded paths
+with `%2F` are not reliably decoded by ESP-IDF's httpd helper (false 404s).
+
+**Response:** `{"ok":true}`, or `404` if missing.
+
+```bash
+curl -X POST http://pixel-dumpster.local:8088/api/content/delete \
+  -H 'Content-Type: application/json' \
+  -d '{"path":"images/zaxxon.png"}'
+```
+
+### POST /api/content/rename
+
+**Request:** `{ "from": "images/a.png", "to": "images/b.png" }`
+
+### POST /api/content/meta
+
+Updates sequence `meta.json` fields. Currently supports `fps` (1–120). If that
+sequence is playing, live playback timing updates immediately.
+
+**Request:** `{ "path": "images/lizard-sprite", "fps": 8 }`
+
 ### POST /api/play
 
 Plays a static image or an animated sequence, with an optional transition.
@@ -70,17 +103,19 @@ Plays a static image or an animated sequence, with an optional transition.
 ```json
 {
   "path": "fire",
-  "transition": "wipe_left",
+  "transition": "wipe-left",
   "duration_ms": 800
 }
 ```
 
 - `path` (required) — relative to the content root. A directory plays as a PNG
   sequence (using its `meta.json`); a file plays as a static image.
-- `transition` (optional) — name of any transition from
-  [transitions.md](transitions.md). If omitted, the transition is chosen from the
-  device's configured transition mode (`baseline`/`random`/`per-item`, see
-  `GET /api/config` below).
+- `transition` (optional) — kebab-case name from
+  [transitions.md](transitions.md) (e.g. `wipe-left`, `fade`). If omitted, the
+  transition is chosen from the device's configured transition mode
+  (`baseline`/`random`/`per-item`, see `GET /api/config` below). Use `"none"`
+  (or omit duration) for an instant swap — preferred for rapid static PNG A/B
+  testing.
 - `duration_ms` (optional) — overrides the configured transition duration.
 - Two special paths are handled outside the normal content root:
   `system/default` (renders the built-in default marquee) and `system/idle`
@@ -95,7 +130,9 @@ curl -X POST http://pixel-dumpster.local:8088/api/play \
 
 > Note: per-transition parameters described in [transitions.md](transitions.md)
 > (e.g. `zoom_vanish`, `bounce_*`, `block_size`) are **not** read from this
-> request — those values are currently hardcoded in `pd-transition.c`.
+> request — those values are currently hardcoded in `pd-transition.c`. A newer
+> play request supersedes an in-flight present/fade so rapid swaps stay
+> responsive.
 
 ### POST /api/stop
 
@@ -115,6 +152,7 @@ Returns current playback status.
 ```json
 {
   "playing": true,
+  "cache": "live",
   "path": "fire",
   "sequence": true,
   "frame": 12,
@@ -123,7 +161,17 @@ Returns current playback status.
 }
 ```
 
-**Response (idle):** `{"playing": false}`
+**Response (idle):** `{"playing": false, "cache": "off"}`
+
+`cache` reports the sequence **palette-cache** state when
+`display.auto_quantize_palette` is enabled:
+
+| Value | Meaning |
+|-------|---------|
+| `off` | Auto-quantize off, or not playing a sequence |
+| `building` | Palette cache is being built in the background |
+| `live` | Sequence is playing from the quantized PSRAM cache |
+| `fallback` | Quantize/cache failed; truecolor decode path in use |
 
 ```bash
 curl http://pixel-dumpster.local:8088/api/status
@@ -207,7 +255,8 @@ Returns the current transition/display/attract configuration.
     "hold_ms": 5000,
     "loop_sequences": true,
     "background": "#000000",
-    "overlay": ""
+    "overlay": "",
+    "auto_quantize_palette": false
   },
   "attract": {
     "enabled": false,
@@ -217,6 +266,12 @@ Returns the current transition/display/attract configuration.
   }
 }
 ```
+
+- `display.auto_quantize_palette` (bool, default `false`) — when `true`,
+  **animated sequences** are quantized to a shared 64-color palette and cached
+  in PSRAM for smoother playback. Static PNGs are unaffected (they use a
+  separate 2-slot decoded-RGB still cache). Also settable over BLE/USB via
+  `set_playback` — see [ble-transport.md](ble-transport.md).
 
 > `mode` can be `baseline` (always use `baseline` transition), `random`, or
 > `per-item` — but `per-item` currently falls back to the baseline transition in
@@ -321,6 +376,34 @@ The Content API operates on `/pd/content/` on the device's LittleFS partition
 the `/pd/system/`, `/pd/game/`, `/pd/assets/` layout described for the legacy API
 below. See [docs/content-system.md](../docs/content-system.md) for the
 `meta.json` sequence-metadata format.
+
+---
+
+## Alternate transports
+
+When WiFi/HTTP is unavailable, the same content operations run over
+newline-delimited JSON on BLE (Nordic UART Service) or USB serial. Commands:
+`list`, `play`, `stop`, `status`, `set_playback`, and streaming
+`upload_begin` / `upload_chunk` / `upload_end` / `upload_abort`.
+
+| Transport | When to use | Docs |
+|-----------|-------------|------|
+| WiFi HTTP `:8088` | Device on LAN (preferred) | this document |
+| BLE NUS NDJSON | Offline / no mDNS | [ble-transport.md](ble-transport.md) |
+| USB serial NDJSON | Wired setup / panel wizard | [wizard-protocol.md](wizard-protocol.md), [dumpster-diver.md](dumpster-diver.md) |
+
+`pd-control` picks a control path with an explicit **Control via** preference
+when that link is up; otherwise **WiFi → BLE → USB**. SoftAP and HTTP-over-BLE
+tunneling are deferred.
+
+### Playback internals (brief)
+
+- **Static stills:** two PSRAM slots hold decoded RGB for recently played PNGs so
+  A/B swaps avoid a full decode on every play.
+- **Sequences + auto-quantize:** optional 64-color palette cache in PSRAM
+  (`auto_quantize_palette`); status `cache` field reports build/live/fallback.
+- **Supersede:** enqueueing a new play bumps a generation counter; in-flight
+  present/fade work for the old generation is dropped.
 
 ---
 
@@ -439,8 +522,9 @@ in the current firmware.
 
 ## Related clients
 
-- `pd-control/` (Tauri desktop app) calls the Content API exclusively — see
-  `pd-control/src-tauri/src/device_api.rs` and [pd-control/README.md](../pd-control/README.md).
+- `pd-control/` (Tauri desktop app) uses WiFi HTTP (`device_api.rs`), BLE
+  (`ble_link.rs`), and USB wizard NDJSON, routed by
+  `pd-control/src/lib/deviceControl.ts` — see [pd-control/README.md](../pd-control/README.md).
 - `tools/dumpster-diver.c` (RetroPie daemon) pushes artwork via
-  `POST /api/play` over WiFi, or via the serial JSON protocol (see
-  `pd-serial-cmd` and [dumpster-diver.md](dumpster-diver.md)).
+  `POST /api/play` over WiFi, USB serial NDJSON, or BLE via `pd-ble-bridge`
+  (see `pd-serial-cmd` and [dumpster-diver.md](dumpster-diver.md)).

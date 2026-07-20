@@ -70,6 +70,12 @@ void pd_display_set_pixel(uint16_t x, uint16_t y, pd_display_color_t color);
 void pd_display_render_rgb(const uint8_t *rgb, int img_w, int img_h);
 /* Positioned blit of tightly-packed RGB888; clips to the canvas. */
 void pd_display_render_rgb_at(int x, int y, const uint8_t *rgb, int img_w, int img_h);
+/* Indexed (palette) rect: expand indices→RGB row-by-row into a scratch
+ * buffer and draw — skips a full source RGB888 framebuffer. palette is
+ * RGBA (4 bytes/entry); alpha is ignored (opaque present). */
+void pd_display_render_indexed_at(int x, int y,
+                                  const uint8_t *indices, int img_w, int img_h,
+                                  const uint8_t palette[][4], int palette_size);
 void pd_display_render_framebuf(const uint8_t *rgb);
 
 void pd_display_wizard_menu(const char *title, const char **options, int count, int selected);

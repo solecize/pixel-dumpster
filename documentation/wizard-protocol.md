@@ -2,37 +2,45 @@
 
 ## Overview
 
-The setup wizard uses a **thin-client architecture**: the CLI running on the
-host machine is a dumb terminal that sends user input to the ESP32 device over
-serial (USB-CDC / USB-Serial-JTAG). The device owns all state, performs
+The setup wizard uses a **thin-client architecture**: the host sends user input
+to the ESP32 over USB serial or BLE NUS; the device owns all state, performs
 hardware operations (Wi-Fi scan, config save), and drives both:
 
-1. **Serial responses** — JSON lines sent back to the CLI for rendering in the
-   terminal.
+1. **NDJSON responses** — JSON lines sent back to the host for UI rendering.
 2. **HUB75 display** — the same wizard state mirrored on the LED matrix in
    real time.
 
+Primary host today is **pd-control** (`WizardPanel`, opened from Settings →
+Layout → “Configure panels over USB/BLE”). A standalone `wizard-cli` / serial
+terminal still works with the same framing.
+
 ```
-┌──────────────┐   serial (USB)   ┌──────────────────────┐
-│  wizard-cli  │ ───────────────► │  ESP32 (pd-wizard)   │
-│  (host)      │ ◄─────────────── │                      │
-│  ncurses UI  │   JSON lines     │  state machine       │
-└──────────────┘                  │  ├─ serial responder  │
-                                  │  └─ HUB75 renderer    │
-                                  └──────────────────────┘
+┌──────────────────┐  USB or BLE NUS   ┌──────────────────────┐
+│  pd-control /    │ ────────────────► │  ESP32 (pd-wizard)   │
+│  wizard-cli      │ ◄──────────────── │                      │
+│  (host)          │   JSON lines      │  state machine       │
+└──────────────────┘                   │  ├─ NDJSON responder  │
+                                       │  └─ HUB75 renderer    │
+                                       └──────────────────────┘
 ```
+
+After setup completes, the same NDJSON pipe carries content commands from
+`pd-serial-cmd` (`list` / `play` / `stop` / `status` / `set_playback` /
+`upload_*`) — see [dumpster-diver.md](dumpster-diver.md) and
+[ble-transport.md](ble-transport.md).
 
 ## Transport
 
-- **Physical**: USB cable to MatrixPortal S3 (USB-Serial-JTAG or USB-CDC)
-- **Baud**: 115200 (default ESP-IDF monitor rate)
+- **Physical**: USB (USB-Serial-JTAG or USB-CDC), or BLE Nordic UART Service
+  (same line framing — [ble-transport.md](ble-transport.md))
+- **Baud** (USB): 115200 (default ESP-IDF monitor rate)
 - **Framing**: newline-delimited JSON (`\n`-terminated lines)
 - **Direction**:
-  - **CLI → Device**: single-line JSON commands
-  - **Device → CLI**: single-line JSON responses/events
+  - **Host → Device**: single-line JSON commands
+  - **Device → Host**: single-line JSON responses/events
 
 Non-JSON lines from the device (e.g. ESP_LOG output) must be ignored by the
-CLI. The CLI should filter for lines starting with `{`.
+host. Filter for lines starting with `{`.
 
 ## Default Display Assumptions
 
@@ -246,23 +254,32 @@ restarted at the new size. Informational only.
 
 ## Wizard Steps
 
-| Index | Step ID            | Mode | Notes                                           |
-|------:|--------------------|------|-------------------------------------------------|
-|     0 | `matrix_size`      | menu | Options: 16×16, 32×32, 64×64, 128×128, other   |
-|     1 | `matrix_custom`    | text | Only if "other" selected; e.g. "128x64"         |
-|     2 | `orientation`      | menu | Options: 0, 90, 180, 270                        |
-|     3 | `wifi_ssid`        | menu | Options from device Wi-Fi scan + manual entry    |
-|     4 | `wifi_ssid_manual` | text | Only if manual entry selected                    |
-|     5 | `wifi_password`    | text | Masked input; blank = open network               |
-|     6 | `device_name`      | text | Free text                                        |
-|     7 | `hostname`         | text | Free text (kebab-case recommended)               |
-|     8 | `timezone`         | text | POSIX TZ string (e.g. CST6CDT, UTC0)            |
-|     9 | `static_ip`        | text | Blank = DHCP                                     |
-|    10 | `static_gateway`   | text | Only if static_ip is set                         |
-|    11 | `static_netmask`   | text | Only if static_ip is set                         |
+Step IDs and order match `pd_step_defs` in `components/pd-wizard/pd-wizard.c`.
+Conditional steps (custom sizes, multi-panel chain, static IP, etc.) are skipped
+when inactive. `step_index` / `step_count` in state messages count only
+*active* steps.
 
-Conditional steps are skipped automatically. The `step_index` and
-`step_count` in state messages reflect only the *active* steps.
+| Step ID | Mode | Notes |
+|---------|------|-------|
+| `multi_panel` | menu | Single panel vs multi-panel chain |
+| `matrix_size` | menu | Presets (e.g. 16×16 … 128×128) + other / reztest |
+| `matrix_custom` | text | Custom matrix size when "other" selected |
+| `panel_res` | menu | Per-panel resolution (multi-panel path) |
+| `panel_res_custom` | text | Custom panel size |
+| `panel_rows` / `panel_cols` | text | Chain grid |
+| `chain_pattern` | menu | How panels are chained |
+| `panel_rotation` | menu | Per-panel rotation |
+| `panel_layout` | menu | Layout test pattern helper |
+| `orientation` | menu | 0 / 90 / 180 / 270 |
+| `scan_wiring` | menu | Scan mode / wiring |
+| `color_order` | menu | RGB / colour order |
+| `demo_patterns` | menu | On-device demo patterns |
+| `wifi_ssid` | menu | Scan results + manual entry |
+| `wifi_ssid_manual` | text | Manual SSID |
+| `wifi_password` | text | Masked; blank = open |
+| `device_name` / `hostname` | text | Identity |
+| `timezone` | text | POSIX TZ (e.g. CST6CDT) |
+| `static_ip` / `static_gateway` / `static_netmask` | text | Blank IP = DHCP |
 
 ## HUB75 Display Rendering
 

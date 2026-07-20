@@ -17,9 +17,9 @@ const ITEMS: {
   label: string;
   Icon: typeof Bluetooth;
 }[] = [
+  { kind: "wifi", label: "WiFi", Icon: Wifi },
   { kind: "bluetooth", label: "Bluetooth", Icon: Bluetooth },
   { kind: "usb", label: "USB serial", Icon: Usb },
-  { kind: "wifi", label: "WiFi", Icon: Wifi },
 ];
 
 export function TransportDock({

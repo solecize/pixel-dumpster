@@ -39,6 +39,18 @@ On the user’s matrix with 115 pac-ghost frames (64×64) from LittleFS:
 
 So for sparse content, panel update size dominates — bounds-limited draws are a clear win, and sliding with erase of `old∖new` stays nearly as fast.
 
+## Bit-depth A/B (sprite headroom)
+
+Production defaults to **6-bit** BCM (`CONFIG_HUB75_BIT_DEPTH_6`) for fewer planes and more CPU budget on multi-sprite dirty-rect motion. Low-color logos/sprites rarely need 8-bit gray.
+
+To compare on hardware:
+
+1. Edit this app’s `sdkconfig.defaults` (or `idf.py menuconfig` → HUB75 bit depth) to `_8`, `_6`, or `_4`.
+2. Full rebuild (LUT regenerates): `idf.py fullclean && idf.py build flash monitor`.
+3. Record `RESULT` fps for full / bounds / slide and note banding or ghosting on pac-ghost + a sparse slide.
+
+Expected direction: lower bit depth → higher refresh headroom; 4-bit may band gradients; 6-bit is the shipping compromise.
+
 ## Restore production firmware
 
 ```bash

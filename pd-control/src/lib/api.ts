@@ -19,6 +19,33 @@ export async function stopDiscovery(): Promise<void> {
   return invoke("stop_discovery");
 }
 
+export async function setHttpTraceEnabled(enabled: boolean): Promise<void> {
+  return invoke("set_http_trace_enabled", { enabled });
+}
+
+export async function getHttpTraceEnabled(): Promise<boolean> {
+  return invoke("get_http_trace_enabled");
+}
+
+export async function appendTraceEvent(event: Record<string, unknown>): Promise<void> {
+  return invoke("append_trace_event", { event });
+}
+
+export async function revealControlEventLog(): Promise<string> {
+  return invoke("reveal_control_event_log");
+}
+
+export async function controlEventLogPath(): Promise<string> {
+  return invoke("control_event_log_path");
+}
+
+export async function getDeviceLog(
+  ip: string,
+  port: number
+): Promise<{ lines?: string[]; cache_reason?: string }> {
+  return invoke("device_log", { ip, port });
+}
+
 export async function addManualDevice(
   ip: string,
   port: number,
@@ -58,6 +85,32 @@ export async function getDeviceContent(
   port: number
 ): Promise<ContentList> {
   return invoke("device_list_content", { ip, port });
+}
+
+export async function deviceDeleteContent(
+  ip: string,
+  port: number,
+  path: string
+): Promise<unknown> {
+  return invoke("device_delete_content", { ip, port, path });
+}
+
+export async function deviceRenameContent(
+  ip: string,
+  port: number,
+  from: string,
+  to: string
+): Promise<unknown> {
+  return invoke("device_rename_content", { ip, port, from, to });
+}
+
+export async function deviceSetContentMeta(
+  ip: string,
+  port: number,
+  path: string,
+  fps: number
+): Promise<unknown> {
+  return invoke("device_set_content_meta", { ip, port, path, fps });
 }
 
 export async function getDeviceConfig(
@@ -396,6 +449,25 @@ export async function uploadLocalFileToDevice(
     devicePort,
     localPath,
     remotePath: remotePath ?? null,
+    via: via ?? null,
+  });
+}
+
+/** Upload a local folder of numbered PNGs as an image sequence. */
+export async function uploadLocalSequenceToDevice(
+  deviceIp: string,
+  devicePort: number,
+  localDir: string,
+  fps: number,
+  remoteName?: string,
+  via?: "wifi" | "bluetooth" | "usb"
+): Promise<string> {
+  return invoke("upload_local_sequence_to_device", {
+    deviceIp,
+    devicePort,
+    localDir,
+    fps,
+    remoteName: remoteName ?? null,
     via: via ?? null,
   });
 }

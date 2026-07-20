@@ -133,15 +133,17 @@ export default function App() {
 
   const handleConfigureTransport = (
     device: DiscoveredDevice | null,
-    kind: TransportKind
+    kind: TransportKind,
+    opts?: { forceSettings?: boolean }
   ) => {
     if (device) {
       setSelected(device);
       saveLastDevice(device);
     }
 
-    // Already connected: choose it as the control path (don't force Settings).
-    if (links[kind]) {
+    // Already connected: choose it as the control path (don't force Settings),
+    // unless the caller explicitly wants the Settings card (chevron → Edit).
+    if (links[kind] && !opts?.forceSettings) {
       setControlVia(kind);
       return;
     }

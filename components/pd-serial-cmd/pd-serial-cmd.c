@@ -68,6 +68,9 @@ static bool cmd_is_heavy(const char *cmd_str)
 {
     return strcmp(cmd_str, "list") == 0
         || strcmp(cmd_str, "stop") == 0
+        || strcmp(cmd_str, "delete") == 0
+        || strcmp(cmd_str, "rename") == 0
+        || strcmp(cmd_str, "set_meta") == 0
         || strcmp(cmd_str, "upload_begin") == 0
         || strcmp(cmd_str, "upload_chunk") == 0
         || strcmp(cmd_str, "upload_end") == 0
@@ -150,7 +153,12 @@ static void handle_status(void)
     cJSON_AddBoolToObject(resp, "is_sequence", st.is_sequence);
     cJSON_AddNumberToObject(resp, "current_frame", st.current_frame);
     cJSON_AddNumberToObject(resp, "total_frames", st.total_frames);
-    cJSON_AddNumberToObject(resp, "fps", st.fps);
+    if (st.is_sequence) {
+        cJSON_AddNumberToObject(resp, "fps", st.fps);
+        if (st.achieved_fps > 0.05f) {
+            cJSON_AddNumberToObject(resp, "achieved_fps", st.achieved_fps);
+        }
+    }
     serial_send_json(resp);
 }
 
@@ -290,6 +298,50 @@ static void handle_upload_abort(void)
     send_ack("upload_abort", true, NULL);
 }
 
+static void handle_delete(cJSON *root)
+{
+    cJSON *path = cJSON_GetObjectItem(root, "path");
+    if (!cJSON_IsString(path) || !path->valuestring[0]) {
+        send_ack("delete", false, "missing path");
+        return;
+    }
+    esp_err_t err = pd_content_delete_file(path->valuestring);
+    send_ack("delete", err == ESP_OK, err == ESP_OK ? NULL : esp_err_to_name(err));
+}
+
+static void handle_rename(cJSON *root)
+{
+    cJSON *from = cJSON_GetObjectItem(root, "from");
+    cJSON *to = cJSON_GetObjectItem(root, "to");
+    if (!cJSON_IsString(from) || !cJSON_IsString(to)) {
+        send_ack("rename", false, "missing from/to");
+        return;
+    }
+    esp_err_t err = pd_content_rename(from->valuestring, to->valuestring);
+    send_ack("rename", err == ESP_OK, err == ESP_OK ? NULL : esp_err_to_name(err));
+}
+
+static void handle_set_meta(cJSON *root)
+{
+    cJSON *path = cJSON_GetObjectItem(root, "path");
+    cJSON *fps = cJSON_GetObjectItem(root, "fps");
+    if (!cJSON_IsString(path) || !cJSON_IsNumber(fps)) {
+        send_ack("set_meta", false, "missing path/fps");
+        return;
+    }
+    esp_err_t err = pd_content_set_sequence_fps(path->valuestring, fps->valueint);
+    cJSON *ack = cJSON_CreateObject();
+    cJSON_AddStringToObject(ack, "type", "ack");
+    cJSON_AddStringToObject(ack, "cmd", "set_meta");
+    cJSON_AddBoolToObject(ack, "ok", err == ESP_OK);
+    if (err == ESP_OK) {
+        cJSON_AddNumberToObject(ack, "fps", fps->valueint);
+    } else {
+        cJSON_AddStringToObject(ack, "error", esp_err_to_name(err));
+    }
+    serial_send_json(ack);
+}
+
 /* ---------- command dispatch ---------- */
 
 static void serial_cmd_dispatch(cJSON *root, const char *cmd_str)
@@ -302,12 +354,22 @@ static void serial_cmd_dispatch(cJSON *root, const char *cmd_str)
         handle_status();
     } else if (strcmp(cmd_str, "list") == 0) {
         handle_list();
+    } else if (strcmp(cmd_str, "delete") == 0) {
+        handle_delete(root);
+    } else if (strcmp(cmd_str, "rename") == 0) {
+        handle_rename(root);
+    } else if (strcmp(cmd_str, "set_meta") == 0) {
+        handle_set_meta(root);
     } else if (strcmp(cmd_str, "set_playback") == 0) {
         const pd_content_config_t *cur = pd_content_get_config();
         pd_content_config_t cfg = *cur;
         cJSON *aq = cJSON_GetObjectItem(root, "auto_quantize_palette");
         if (cJSON_IsBool(aq)) {
             cfg.auto_quantize_palette = cJSON_IsTrue(aq);
+        }
+        cJSON *sfc = cJSON_GetObjectItem(root, "show_fps_counter");
+        if (cJSON_IsBool(sfc)) {
+            cfg.show_fps_counter = cJSON_IsTrue(sfc);
         }
         pd_content_set_config(&cfg);
         cJSON *save = cJSON_GetObjectItem(root, "save");
@@ -319,6 +381,7 @@ static void serial_cmd_dispatch(cJSON *root, const char *cmd_str)
         cJSON_AddStringToObject(ack, "cmd", "set_playback");
         cJSON_AddBoolToObject(ack, "ok", true);
         cJSON_AddBoolToObject(ack, "auto_quantize_palette", cfg.auto_quantize_palette);
+        cJSON_AddBoolToObject(ack, "show_fps_counter", cfg.show_fps_counter);
         serial_send_json(ack);
     } else if (strcmp(cmd_str, "upload_begin") == 0) {
         handle_upload_begin(root);

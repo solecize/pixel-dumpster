@@ -225,6 +225,18 @@ void app_main(void)
             );
         }
 
-        vTaskDelay(pdMS_TO_TICKS(10));
+        /* While a sequence is playing, sleep only the leftover frame budget
+         * (0..10 ms) so a ~40 ms present is not padded with a flat 10 ms
+         * delay (~19–21 fps). Idle / non-sequence keeps the 10 ms yield. */
+        int delay_ms = 10;
+        int until = pd_content_ms_until_next_frame();
+        if (until >= 0) {
+            delay_ms = until;
+        }
+        if (delay_ms > 0) {
+            vTaskDelay(pdMS_TO_TICKS(delay_ms));
+        } else {
+            taskYIELD();
+        }
     }
 }

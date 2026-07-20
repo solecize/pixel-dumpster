@@ -24,6 +24,41 @@ impl Default for AppState {
     }
 }
 
+// --- Event tracing ---
+
+#[tauri::command]
+pub fn set_http_trace_enabled(enabled: bool) -> Result<(), String> {
+    crate::http_trace::set_enabled(enabled);
+    log::info!("HTTP wire tracing {}", if enabled { "enabled" } else { "disabled" });
+    Ok(())
+}
+
+#[tauri::command]
+pub fn get_http_trace_enabled() -> Result<bool, String> {
+    Ok(crate::http_trace::is_enabled())
+}
+
+#[tauri::command]
+pub fn append_trace_event(event: serde_json::Value) -> Result<(), String> {
+    crate::trace_file::append_event(event)
+}
+
+#[tauri::command]
+pub fn reveal_control_event_log() -> Result<String, String> {
+    crate::trace_file::reveal_in_finder()
+}
+
+#[tauri::command]
+pub fn control_event_log_path() -> Result<String, String> {
+    crate::trace_file::log_path().map(|p| p.to_string_lossy().to_string())
+}
+
+#[tauri::command]
+pub async fn device_log(ip: String, port: u16) -> Result<serde_json::Value, String> {
+    let api = DeviceApi::new(&ip, port);
+    api.device_log().await
+}
+
 // --- Discovery commands ---
 
 #[tauri::command]
@@ -93,6 +128,38 @@ pub async fn device_list_content(ip: String, port: u16) -> Result<serde_json::Va
     let api = DeviceApi::new(&ip, port);
     let list = api.list_content().await?;
     serde_json::to_value(list).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn device_delete_content(
+    ip: String,
+    port: u16,
+    path: String,
+) -> Result<serde_json::Value, String> {
+    let api = DeviceApi::new(&ip, port);
+    api.delete_content(&path).await
+}
+
+#[tauri::command]
+pub async fn device_rename_content(
+    ip: String,
+    port: u16,
+    from: String,
+    to: String,
+) -> Result<serde_json::Value, String> {
+    let api = DeviceApi::new(&ip, port);
+    api.rename_content(&from, &to).await
+}
+
+#[tauri::command]
+pub async fn device_set_content_meta(
+    ip: String,
+    port: u16,
+    path: String,
+    fps: u32,
+) -> Result<serde_json::Value, String> {
+    let api = DeviceApi::new(&ip, port);
+    api.set_content_meta(&path, fps).await
 }
 
 #[tauri::command]
@@ -627,13 +694,27 @@ async fn resolve_upload_mode(
 
 async fn http_upload(ip: &str, port: u16, remote: &str, data: Vec<u8>) -> Result<(), String> {
     let client = reqwest::Client::new();
+    /* Keep '/' unencoded in the query — reqwest's .query() turns it into %2F
+     * which ESP httpd does not decode (upload/meta would land on a wrong path). */
     let url = format!("http://{}:{}/api/upload?path={}", ip, port, remote);
-    client
+    let resp = client
         .post(&url)
         .body(data)
         .send()
         .await
         .map_err(|e| format!("Upload failed: {e}"))?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        return Err(format!(
+            "Upload failed for '{remote}': HTTP {status}{}",
+            if body.is_empty() {
+                String::new()
+            } else {
+                format!(" ({body})")
+            }
+        ));
+    }
     Ok(())
 }
 
@@ -765,4 +846,309 @@ pub async fn upload_local_file_to_device(
     let mode = resolve_upload_mode(&state, &device_ip, via.as_deref()).await?;
     upload_one(&state, mode, &device_ip, device_port, &local, &remote).await?;
     Ok(remote)
+}
+
+fn sanitize_content_name(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    for ch in name.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+            out.push(ch);
+        } else if ch == ' ' {
+            out.push('-');
+        }
+    }
+    while out.starts_with('.') {
+        out.remove(0);
+    }
+    if out.is_empty() {
+        "sequence".into()
+    } else {
+        out
+    }
+}
+
+/// Detect `prefix%0Nd.png` + start index from sorted frame file names.
+fn detect_frame_pattern(file_names: &[String]) -> Result<(String, i32, usize), String> {
+    if file_names.is_empty() {
+        return Err("No PNG frames found in folder".into());
+    }
+
+    let mut parsed: Vec<(String, usize, i32)> = Vec::new();
+    for name in file_names {
+        let stem = name
+            .strip_suffix(".png")
+            .or_else(|| name.strip_suffix(".PNG"))
+            .unwrap_or(name);
+        let digit_count = stem.chars().rev().take_while(|c| c.is_ascii_digit()).count();
+        if digit_count == 0 {
+            return Err(format!(
+                "Frame '{name}' has no trailing frame number (expected e.g. frame0001.png)"
+            ));
+        }
+        let split = stem.len() - digit_count;
+        let prefix = stem[..split].to_string();
+        let num: i32 = stem[split..]
+            .parse()
+            .map_err(|_| format!("Invalid frame number in '{name}'"))?;
+        parsed.push((prefix, digit_count, num));
+    }
+
+    let (prefix0, width0, start) = &parsed[0];
+    for (i, (prefix, width, num)) in parsed.iter().enumerate() {
+        if prefix != prefix0 || width != width0 {
+            return Err(
+                "Frames must share one naming pattern (same prefix and digit width)".into(),
+            );
+        }
+        if *num != start + i as i32 {
+            return Err(format!(
+                "Frame numbers must be contiguous (gap before frame {})",
+                start + i as i32
+            ));
+        }
+    }
+
+    let pattern = format!("{prefix0}%0{width0}d.png");
+    Ok((pattern, *start, parsed.len()))
+}
+
+fn collect_top_level_pngs(dir: &std::path::Path) -> Result<Vec<std::path::PathBuf>, String> {
+    let mut frames = Vec::new();
+    let entries = std::fs::read_dir(dir).map_err(|e| format!("Failed to read folder: {e}"))?;
+    for entry in entries {
+        let entry = entry.map_err(|e| e.to_string())?;
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("")
+            .to_string();
+        if name.eq_ignore_ascii_case("meta.json") {
+            continue;
+        }
+        if name.to_ascii_lowercase().ends_with(".png") {
+            frames.push(path);
+        }
+    }
+    frames.sort_by(|a, b| {
+        a.file_name()
+            .unwrap_or_default()
+            .cmp(b.file_name().unwrap_or_default())
+    });
+    Ok(frames)
+}
+
+async fn upload_bytes_one(
+    state: &AppState,
+    mode: &str,
+    device_ip: &str,
+    device_port: u16,
+    remote: &str,
+    data: Vec<u8>,
+) -> Result<(), String> {
+    match mode {
+        "bluetooth" => ble_link::upload_bytes(&state.ble, remote, &data).await,
+        "usb" => {
+            let wizard_state = state.wizard.clone();
+            let remote_c = remote.to_string();
+            tokio::task::spawn_blocking(move || {
+                serial_wizard::upload_bytes(&wizard_state, &remote_c, &data)
+            })
+            .await
+            .map_err(|e| format!("Task error: {e}"))?
+        }
+        _ => http_upload(device_ip, device_port, remote, data).await,
+    }
+}
+
+/// Upload a local folder of numbered PNGs as `images/<name>/` with generated meta.json.
+///
+/// Optional conventions in the source folder:
+/// - `overlay/` — PNG sequence uploaded to `overlays/<name>` and linked in meta
+/// - `background.png` — uploaded to `backgrounds/<name>-bg.png` and linked in meta
+#[tauri::command]
+pub async fn upload_local_sequence_to_device(
+    state: State<'_, AppState>,
+    device_ip: String,
+    device_port: u16,
+    local_dir: String,
+    fps: u32,
+    remote_name: Option<String>,
+    via: Option<String>,
+) -> Result<String, String> {
+    if !(1..=120).contains(&fps) {
+        return Err("FPS must be between 1 and 120".into());
+    }
+
+    let dir = std::path::PathBuf::from(&local_dir);
+    if !dir.is_dir() {
+        return Err(format!("Not a folder: {local_dir}"));
+    }
+
+    let folder_name = dir
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("sequence");
+    let seq_name = sanitize_content_name(
+        remote_name
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or(folder_name),
+    );
+
+    let frames = collect_top_level_pngs(&dir)?;
+    if frames.is_empty() {
+        return Err("Folder has no PNG frames (put frames in the folder root)".into());
+    }
+
+    let names: Vec<String> = frames
+        .iter()
+        .map(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("")
+                .to_string()
+        })
+        .collect();
+    let (pattern, start, frame_count) = detect_frame_pattern(&names)?;
+
+    for path in &frames {
+        let meta = std::fs::metadata(path).map_err(|e| format!("stat failed: {e}"))?;
+        if meta.len() > UPLOAD_MAX_BYTES {
+            return Err(format!(
+                "Frame {} is too large ({} bytes); max is {} bytes",
+                path.display(),
+                meta.len(),
+                UPLOAD_MAX_BYTES
+            ));
+        }
+    }
+
+    let mode = resolve_upload_mode(&state, &device_ip, via.as_deref()).await?;
+    let remote_root = format!("images/{seq_name}");
+
+    for path in &frames {
+        let file_name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .ok_or("Invalid frame name")?;
+        let remote = format!("{remote_root}/{file_name}");
+        upload_one(
+            &state,
+            mode,
+            &device_ip,
+            device_port,
+            path,
+            &remote,
+        )
+        .await?;
+    }
+
+    let mut background: Option<String> = None;
+    let bg_path = dir.join("background.png");
+    if bg_path.is_file() {
+        let remote_bg = format!("backgrounds/{seq_name}-bg.png");
+        upload_one(
+            &state,
+            mode,
+            &device_ip,
+            device_port,
+            &bg_path,
+            &remote_bg,
+        )
+        .await?;
+        background = Some(remote_bg);
+    }
+
+    let mut overlay: Option<String> = None;
+    let overlay_dir = dir.join("overlay");
+    if overlay_dir.is_dir() {
+        let ov_frames = collect_top_level_pngs(&overlay_dir)?;
+        if !ov_frames.is_empty() {
+            let ov_names: Vec<String> = ov_frames
+                .iter()
+                .map(|p| {
+                    p.file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("")
+                        .to_string()
+                })
+                .collect();
+            let (ov_pattern, ov_start, ov_count) = detect_frame_pattern(&ov_names)?;
+            let ov_remote_root = format!("overlays/{seq_name}");
+            for path in &ov_frames {
+                let file_name = path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .ok_or("Invalid overlay frame name")?;
+                let remote = format!("{ov_remote_root}/{file_name}");
+                upload_one(
+                    &state,
+                    mode,
+                    &device_ip,
+                    device_port,
+                    path,
+                    &remote,
+                )
+                .await?;
+            }
+            let ov_meta = serde_json::json!({
+                "name": format!("{seq_name} overlay"),
+                "fps": fps,
+                "loop": true,
+                "frames": ov_count,
+                "pattern": ov_pattern,
+                "start": ov_start,
+            });
+            let ov_meta_bytes = serde_json::to_vec(&ov_meta)
+                .map_err(|e| format!("Failed to encode overlay meta: {e}"))?;
+            upload_bytes_one(
+                &state,
+                mode,
+                &device_ip,
+                device_port,
+                &format!("{ov_remote_root}/meta.json"),
+                ov_meta_bytes,
+            )
+            .await?;
+            overlay = Some(ov_remote_root);
+        }
+    }
+
+    let mut meta = serde_json::json!({
+        "name": seq_name,
+        "fps": fps,
+        "loop": true,
+        "frames": frame_count,
+        "pattern": pattern,
+        "start": start,
+    });
+    if let Some(bg) = background {
+        meta.as_object_mut()
+            .unwrap()
+            .insert("background".into(), serde_json::Value::String(bg));
+    }
+    if let Some(ov) = overlay {
+        meta.as_object_mut()
+            .unwrap()
+            .insert("overlay".into(), serde_json::Value::String(ov));
+    }
+
+    let meta_bytes =
+        serde_json::to_vec(&meta).map_err(|e| format!("Failed to encode meta.json: {e}"))?;
+    upload_bytes_one(
+        &state,
+        mode,
+        &device_ip,
+        device_port,
+        &format!("{remote_root}/meta.json"),
+        meta_bytes,
+    )
+    .await?;
+
+    Ok(remote_root)
 }

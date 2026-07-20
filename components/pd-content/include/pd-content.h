@@ -29,7 +29,8 @@ typedef struct {
     bool is_sequence;
     int  current_frame;
     int  total_frames;
-    int  fps;
+    int  fps;              /* target fps from meta.json / set_meta */
+    float achieved_fps;    /* measured present rate (0 if unknown) */
     /* Palette-cache state for the current sequence when auto_quantize is on:
      * "off" | "building" | "live" | "fallback" */
     char cache[16];
@@ -65,6 +66,10 @@ typedef struct {
      * cached in PSRAM for smoother playback. When false (default), the
      * existing truecolor decode path is used with no palette overhead. */
     bool auto_quantize_palette;
+
+    /* When true, draw a tiny target→achieved FPS HUD on the LED panel while
+     * content is presenting. Off by default (diagnostic). */
+    bool show_fps_counter;
 } pd_content_config_t;
 
 const pd_content_config_t *pd_content_get_config(void);
@@ -87,10 +92,20 @@ pd_content_status_t pd_content_get_status(void);
 
 void pd_content_tick(void);
 
+/* Milliseconds until the next sequence frame is due while playing.
+ * Returns -1 when the main loop should keep its default idle delay
+ * (not playing a sequence). Returns 0..10 when playing (already-due
+ * frames return 0). */
+int pd_content_ms_until_next_frame(void);
+
 esp_err_t pd_content_register_http(httpd_handle_t server);
 
 esp_err_t pd_content_store_file(const char *rel_path, const uint8_t *data, size_t len);
 esp_err_t pd_content_delete_file(const char *rel_path);
+/* Rename a file or sequence directory under the content root. */
+esp_err_t pd_content_rename(const char *from_rel, const char *to_rel);
+/* Update (or create) meta.json fps for a sequence directory. */
+esp_err_t pd_content_set_sequence_fps(const char *rel_path, int fps);
 
 /* Streaming upload (BLE / serial NDJSON). Max size matches HTTP /api/upload. */
 #define PD_CONTENT_UPLOAD_MAX_BYTES (2 * 1024 * 1024)

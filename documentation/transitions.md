@@ -209,6 +209,7 @@ Lives at `/content/config.json`. Controls default behavior for transitions, disp
 |-------|------|-------------|
 | `hold_ms` | int | Default hold time for static images in attract mode (0 = hold forever) |
 | `loop_sequences` | bool | Whether sequences loop by default (can be overridden per-item) |
+| `auto_quantize_palette` | bool | When `true`, **sequences** use a 64-color PSRAM palette cache for smoother playback (default `false`). Static PNGs are unaffected. |
 
 ### `attract` — Auto-cycle / screensaver mode
 
@@ -219,7 +220,8 @@ Lives at `/content/config.json`. Controls default behavior for transitions, disp
 | `shuffle` | bool | Randomize order vs. alphabetical |
 | `idle_timeout_ms` | int | Resume attract mode after this much idle time (0 = never auto-resume) |
 
-Attract mode is interrupted by any `/api/play` command. If `idle_timeout_ms > 0`, it resumes after that duration of no commands.
+> The `attract` block is **configuration only** today — there is no attract
+> scheduler and no `/api/attract/*` endpoints. See [api.md](api.md).
 
 ### Priority Chain
 
@@ -314,9 +316,22 @@ PNG file → lodepng decode → RGB888 buffer → framebuf_blit → display_rend
                                         (from + to → out)
 ```
 
+### Caches & supersede
+
+- **Static still cache:** two PSRAM slots hold decoded RGB for recently played
+  static PNGs so rapid A/B swaps skip a full decode. Prefer
+  `transition: "none"` / `duration_ms: 0` for instant swaps.
+- **Sequence palette cache:** when `display.auto_quantize_palette` is on,
+  sequences build a shared 64-color cache; `GET /api/status` reports
+  `cache` as `off` | `building` | `live` | `fallback`.
+- **Play supersede:** a newer play enqueue drops in-flight present/fade for the
+  previous generation so back-to-back plays stay responsive (especially over BLE).
+
 ---
 
 ## HTTP API
+
+Canonical request/response shapes live in [api.md](api.md). Summary:
 
 ### Play with transition
 
@@ -327,25 +342,16 @@ Content-Type: application/json
 {
   "path": "images/zaxxon.png",
   "transition": "zoom-in",
-  "duration_ms": 1500,
-  "params": {
-    "zoom_vanish": 4.0
-  }
+  "duration_ms": 1500
 }
 ```
 
-- `path` (required): content path relative to `/content/`
-- `transition` (optional): transition type name. Omit to use config mode logic
+- `path` (required): content path relative to the content root
+- `transition` (optional): kebab-case name; omit to use config mode logic
 - `duration_ms` (optional): transition duration, default from config
-- `params` (optional): transition parameter overrides
 
-### Attract Mode Control
-
-```
-POST /api/attract/start
-POST /api/attract/stop
-GET /api/attract/status
-```
+> Per-transition `params` in metadata / older examples are **not** read from
+> the HTTP play body today — values are hardcoded in `pd-transition.c`.
 
 ### Configuration
 
@@ -355,13 +361,13 @@ POST /api/config
 Content-Type: application/json
 
 {
-  "transition": {
-    "mode": "random"
-  }
+  "transition": { "mode": "random" },
+  "display": { "auto_quantize_palette": true }
 }
 ```
 
-Partial updates are merged with existing config.
+Partial updates are merged with existing config. Attract fields may be stored
+but have no runtime endpoints yet.
 
 ---
 

@@ -128,3 +128,41 @@ export function saveAutoQuantizePref(
     /* ignore */
   }
 }
+
+const FPS_HUD_KEY = "pd.showFpsCounter";
+
+function fpsHudMap(): Record<string, boolean> {
+  try {
+    const raw = localStorage.getItem(FPS_HUD_KEY);
+    if (!raw) return {};
+    const parsed = JSON.parse(raw) as Record<string, boolean>;
+    return parsed && typeof parsed === "object" ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+export function loadShowFpsCounterPref(
+  device: { name?: string; ip?: string } | null
+): boolean | null {
+  const map = fpsHudMap();
+  const key = aqKeyFor(device);
+  if (typeof map[key] === "boolean") return map[key];
+  if (typeof map.default === "boolean") return map.default;
+  return null;
+}
+
+export function saveShowFpsCounterPref(
+  device: { name?: string; ip?: string } | null,
+  enabled: boolean
+): void {
+  try {
+    const map = fpsHudMap();
+    const key = aqKeyFor(device);
+    map[key] = enabled;
+    map.default = enabled;
+    localStorage.setItem(FPS_HUD_KEY, JSON.stringify(map));
+  } catch {
+    /* ignore */
+  }
+}

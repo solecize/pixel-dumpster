@@ -1,6 +1,6 @@
 # dumpster-diver
 
-EmulationStation bridge daemon for pixel-dumpster. Uses native ES scripting hooks to receive events via a named pipe (FIFO), parses `gamelist.xml` for marquee metadata, and sends content commands to the device via HTTP API or USB serial.
+EmulationStation bridge daemon for pixel-dumpster. Uses native ES scripting hooks to receive events via a named pipe (FIFO), parses `gamelist.xml` for marquee metadata, and sends content commands to the device via HTTP API, USB serial, or BLE (via `pd-ble-bridge`).
 
 ## Features
 
@@ -8,7 +8,7 @@ EmulationStation bridge daemon for pixel-dumpster. Uses native ES scripting hook
 - **FIFO event pipe** — Zero-latency, no disk I/O event delivery from ES to daemon
 - **gamelist.xml parsing** — Reads `<marquee>`, `<image>`, `<name>`, `<path>` tags to resolve display names to ROM filenames
 - **6-level content lookup** — Config match → ROM name match → marquee convention → system game path → system art → fallback
-- **Dual transport** — WiFi (HTTP POST) or USB serial (JSON over UART/JTAG)
+- **Triple transport** — WiFi (HTTP POST), USB serial (NDJSON), or BLE via `pd-ble-bridge`
 - **Multiple event types** — System select, game select, game launch, game end
 - **Configurable** — JSON config for device, events, systems, game mappings, ES paths, and marquee settings
 - **Log watcher fallback** — kqueue (macOS) / inotify (Linux) for dev/testing without ES
@@ -97,9 +97,10 @@ Create `~/.config/dumpster-diver/config.json`:
 
 | Field | Description |
 |-------|-------------|
-| `transport` | `"wifi"` (HTTP) or `"serial"` (USB) |
+| `transport` | `"wifi"` (HTTP), `"serial"` (USB), or `"ble"` (bridge) |
 | `serial.device` | Serial port path (e.g. `/dev/ttyACM0`) |
 | `serial.baud` | Baud rate (default `115200`) |
+| `ble.bridge` | Host:port of `pd-ble-bridge` (e.g. `127.0.0.1:9877`) |
 | `fifo` | FIFO path for ES events (default `/tmp/dumpster-diver.fifo`) |
 | `es.gamelists_path` | Where ES stores `gamelist.xml` per system |
 | `es.roms_path` | Where ROMs are stored per system |
@@ -162,10 +163,14 @@ Commands sent from host to ESP32:
 | Stop playback | `{"cmd":"stop"}` | `{"type":"ack","cmd":"stop","ok":true}` |
 | Get status | `{"cmd":"status"}` | `{"type":"status","playing":true,"path":"..."}` |
 | List content | `{"cmd":"list"}` | `{"type":"list","items":[...]}` |
+| Set playback | `{"cmd":"set_playback","auto_quantize_palette":true,"save":true}` | `{"type":"ack","cmd":"set_playback","ok":true,"auto_quantize_palette":true}` |
 | Upload begin | `{"cmd":"upload_begin","path":"...","size":N}` | `{"type":"ack","cmd":"upload_begin","ok":true,"size":N}` |
 | Upload chunk | `{"cmd":"upload_chunk","data":"<base64>"}` | `{"type":"ack","cmd":"upload_chunk","ok":true,"received":N}` |
 | Upload end | `{"cmd":"upload_end"}` | `{"type":"ack","cmd":"upload_end","ok":true,"size":N}` |
 | Upload abort | `{"cmd":"upload_abort"}` | `{"type":"ack","cmd":"upload_abort","ok":true}` |
+
+`set_playback` with no fields probes the current `auto_quantize_palette` value.
+Full BLE notes: [ble-transport.md](ble-transport.md).
 
 When `transport` is `serial` or `ble`, marquee auto-upload uses the NDJSON
 upload commands above. WiFi transport still uses `POST /api/upload`. See

@@ -1,11 +1,14 @@
 #include "pd-content.h"
 
+#include <ctype.h>
 #include <dirent.h>
 #include <errno.h>
 #include <limits.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -24,19 +27,33 @@
 #include "pd-network.h"
 #include "pd-discovery.h"
 #include "pd-config.h"
+#include "pd-sprite-scene.h"
 
 #define PD_PALETTE_MAX 64
 #define PD_QUANT_SAMPLES_MAX 8192
+
+/* ARCHIVED: multi-layer background/overlay compositing.
+ * The code paths below are retained, but runtime wiring is off. Independent
+ * overlay vs content frame counts (e.g. 13 vs 19), animated overlay PNG cost,
+ * and too many play-time variables made FPS and timing hard to reason about.
+ * Set to 1 to restore the old behavior. */
+#ifndef PD_CONTENT_COMPOSITING_ENABLED
+#define PD_CONTENT_COMPOSITING_ENABLED 0
+#endif
 
 static const char *TAG = "pd-content";
 
 static char content_base[PD_CONTENT_MAX_PATH] = "";
 static bool content_playing = false;
 static bool content_is_seq = false;
+static bool content_is_sprite_scene = false;
+/* After a classic FB transition into a sprite scene, enter assembled (no bump). */
+static bool content_sprite_pending_assembled = false;
 static char content_current[PD_CONTENT_MAX_PATH] = "";
 static int  content_frame = 0;
 static int  content_total_frames = 0;
 static int  content_fps = 12;
+static float content_achieved_fps = 0.0f;
 static bool content_loop = true;
 static int64_t content_last_frame_us = 0;
 static char content_frame_pattern[64] = "%04d.png";  /* frame filename pattern */
@@ -84,7 +101,30 @@ static pd_content_config_t content_config = {
     .attract_shuffle = true,
     .attract_idle_timeout_ms = 0,
     .auto_quantize_palette = false,
+    .show_fps_counter = false,
 };
+
+/* ---- diagnostic event ring (GET /api/log) ---- */
+#define PD_CONTENT_LOG_LINES 64
+#define PD_CONTENT_LOG_LINE_LEN 160
+static char content_log_lines[PD_CONTENT_LOG_LINES][PD_CONTENT_LOG_LINE_LEN];
+static int content_log_head = 0;
+static int content_log_count = 0;
+static char content_cache_fail_reason[96] = "";
+
+static void content_log_line(const char *fmt, ...)
+{
+    char *slot = content_log_lines[content_log_head];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(slot, PD_CONTENT_LOG_LINE_LEN, fmt, ap);
+    va_end(ap);
+    content_log_head = (content_log_head + 1) % PD_CONTENT_LOG_LINES;
+    if (content_log_count < PD_CONTENT_LOG_LINES) content_log_count++;
+    ESP_LOGI(TAG, "%s", slot);
+}
+
+static void content_reset_achieved_fps(void);
 
 /* ---- per-sequence 64-color PSRAM frame cache ----
  * Indices are stored at SOURCE frame size (e.g. 64x64), not the full matrix,
@@ -92,7 +132,7 @@ static pd_content_config_t content_config = {
  * a background worker builds/loads a cache. Multiple LRU slots keep recent
  * sequences warm across plays; a LittleFS sidecar (.pd_palcache) persists
  * across reboot. */
-#define PD_PAL_CACHE_SLOTS    3
+#define PD_PAL_CACHE_SLOTS    4  /* content + overlay + 2 warm LRU */
 #define PD_PAL_CACHE_MAGIC    0x31434450u  /* 'PDC1' LE */
 #define PD_PAL_CACHE_VERSION  1
 #define PD_PAL_CACHE_FILENAME ".pd_palcache"
@@ -124,13 +164,40 @@ typedef struct __attribute__((packed)) {
     uint8_t  palette[PD_PALETTE_MAX][4];
 } pd_palcache_hdr_t;
 
+typedef enum {
+    PD_PALCACHE_JOB_CONTENT = 0,
+    PD_PALCACHE_JOB_OVERLAY = 1,
+    PD_PALCACHE_JOB_EXPAND  = 2,  /* expand content frame N into back RGB */
+} pd_palcache_job_t;
+
 static pd_seq_cache_slot_t content_pal_slots[PD_PAL_CACHE_SLOTS];
 static pd_seq_cache_slot_t *content_seq_cache_active = NULL;
+static pd_seq_cache_slot_t *content_overlay_cache_active = NULL;
 static uint32_t content_pal_lru_clock = 1;
 static TaskHandle_t content_cache_task = NULL;
 static volatile uint32_t content_cache_req_epoch = 0;
+static volatile pd_palcache_job_t content_cache_job = PD_PALCACHE_JOB_CONTENT;
 static volatile bool content_cache_building = false;
 static volatile bool content_cache_fallback = false;
+static volatile bool content_overlay_cache_building = false;
+static uint32_t content_overlay_pattern_hash = 0;
+
+/* Palette-path expand ping-pong: source-sized RGB in SPIRAM. Front is
+ * presented on the main tick; the cache worker expands lookahead into back. */
+static uint8_t *s_pal_rgb[2] = {NULL, NULL};
+static size_t   s_pal_rgb_cap = 0;
+static int      s_pal_rgb_w = 0;
+static int      s_pal_rgb_h = 0;
+static int      s_pal_front = 0;
+static volatile int  s_pal_ready_frame = -1; /* frame sitting in back buffer */
+static volatile bool s_pal_back_ready = false;
+static volatile int  s_pal_expand_req_frame = -1;
+static uint8_t *s_pal_rgba_scratch = NULL;   /* content expand RGBA */
+static size_t   s_pal_rgba_scratch_cap = 0;
+#if PD_CONTENT_COMPOSITING_ENABLED
+static uint8_t *s_ov_rgba_scratch = NULL;    /* overlay expand RGBA (separate) */
+static size_t   s_ov_rgba_scratch_cap = 0;
+#endif
 
 /* Current sequence source geometry + identity (set in content_setup_playback). */
 static int content_src_w = 0;
@@ -149,13 +216,18 @@ static uint32_t content_fnv1a(const char *s)
     return h;
 }
 
-/* ---- compositing state ---- */
-static uint8_t *cached_background_rgb = NULL;  /* cached background image (RGB) */
-static uint8_t *cached_overlay_rgba = NULL;    /* cached overlay image (RGBA) - only for static */
-static char cached_bg_path[PD_CONTENT_MAX_PATH] = "";
-static char cached_overlay_path[PD_CONTENT_MAX_PATH] = "";
-static int cached_width = 0;
-static int cached_height = 0;
+/* ---- compositing state (archived when PD_CONTENT_COMPOSITING_ENABLED=0) ---- */
+#if !PD_CONTENT_COMPOSITING_ENABLED
+#define PD_COMP_UNUSED __attribute__((unused))
+#else
+#define PD_COMP_UNUSED
+#endif
+static PD_COMP_UNUSED uint8_t *cached_background_rgb = NULL;
+static PD_COMP_UNUSED uint8_t *cached_overlay_rgba = NULL;
+static PD_COMP_UNUSED char cached_bg_path[PD_CONTENT_MAX_PATH] = "";
+static PD_COMP_UNUSED char cached_overlay_path[PD_CONTENT_MAX_PATH] = "";
+static PD_COMP_UNUSED int cached_width = 0;
+static PD_COMP_UNUSED int cached_height = 0;
 
 /* saved global defaults (restored when switching content) */
 static char saved_background[PD_CONTENT_MAX_PATH] = "#000000";
@@ -169,14 +241,14 @@ static bool status_resume_was_playing = false;
 static bool status_overlay_just_expired = false;
 
 /* animated overlay state */
-static bool overlay_is_seq = false;
-static int overlay_fps = 12;
-static int overlay_frame = 0;
-static int overlay_frame_start = 0;
-static int overlay_total_frames = 0;
-static char overlay_frame_pattern[64] = "%04d.png";
-static char overlay_base_path[PD_CONTENT_MAX_PATH] = "";
-static int64_t overlay_last_frame_us = 0;
+static PD_COMP_UNUSED bool overlay_is_seq = false;
+static PD_COMP_UNUSED int overlay_fps = 12;
+static PD_COMP_UNUSED int overlay_frame = 0;
+static PD_COMP_UNUSED int overlay_frame_start = 0;
+static PD_COMP_UNUSED int overlay_total_frames = 0;
+static PD_COMP_UNUSED char overlay_frame_pattern[64] = "%04d.png";
+static PD_COMP_UNUSED char overlay_base_path[PD_CONTENT_MAX_PATH] = "";
+static PD_COMP_UNUSED int64_t overlay_last_frame_us = 0;
 
 /* Dual-path panel push: for sparse content (src < canvas, no overlay /
  * transition) push only the content rect. Tracks the last drawn rect so a
@@ -224,16 +296,123 @@ static void ensure_dir(const char *path)
     }
 }
 
-static int count_sequence_frames(const char *dir_path)
+/* Read a JSON number or numeric string into *out. Returns false if absent/invalid. */
+static bool json_get_int(const cJSON *item, int *out)
 {
+    if (!item || !out) return false;
+    if (cJSON_IsNumber(item)) {
+        double v = item->valuedouble;
+        if (v > (double)INT_MAX) v = (double)INT_MAX;
+        if (v < (double)INT_MIN) v = (double)INT_MIN;
+        *out = (int)v;
+        return true;
+    }
+    if (cJSON_IsString(item) && item->valuestring) {
+        char *end = NULL;
+        long v = strtol(item->valuestring, &end, 10);
+        if (end && end != item->valuestring && *end == '\0') {
+            *out = (int)v;
+            return true;
+        }
+    }
+    return false;
+}
+
+/* Count contiguous frames for a printf pattern (e.g. "%04d.png" or "mai%04d.png"). */
+static int count_sequence_frames_pattern(const char *dir_path, const char *pattern, int start)
+{
+    if (!pattern || !pattern[0]) pattern = "%04d.png";
+    if (start < 0) start = 0;
+
     int count = 0;
     char path[PD_CONTENT_MAX_PATH];
-    for (int i = 1; i <= 9999; i++) {
-        snprintf(path, sizeof(path), "%s/%04d.png", dir_path, i);
+    for (int i = start; i < start + 9999; i++) {
+        int n = snprintf(path, sizeof(path), "%s/", dir_path);
+        if (n < 0 || n >= (int)sizeof(path)) break;
+        int m = snprintf(path + n, sizeof(path) - (size_t)n, pattern, i);
+        if (m < 0 || m >= (int)sizeof(path) - n) break;
         if (!path_exists(path)) break;
-        count = i;
+        count++;
     }
     return count;
+}
+
+/* Legacy helper: plain 0001.png … N.png */
+static int count_sequence_frames(const char *dir_path)
+{
+    return count_sequence_frames_pattern(dir_path, "%04d.png", 1);
+}
+
+/* Discover pattern/start/count from PNGs in a folder when meta.json is absent. */
+static bool discover_sequence_from_dir(const char *dir_path, char *pattern_out, size_t pattern_size,
+                                       int *start_out, int *frame_count_out)
+{
+    DIR *d = opendir(dir_path);
+    if (!d) return false;
+
+    char first_name[64] = "";
+    char prefix[64] = "";
+    int digit_width = 0;
+    int first_num = -1;
+    int file_count = 0;
+
+    struct dirent *ent;
+    while ((ent = readdir(d)) != NULL) {
+        const char *name = ent->d_name;
+        if (name[0] == '.') continue;
+        size_t len = strlen(name);
+        if (len < 5) continue;
+        if (strcasecmp(name + len - 4, ".png") != 0) continue;
+        if (strcasecmp(name, "background.png") == 0) continue;
+
+        file_count++;
+        if (first_name[0] == '\0' || strcmp(name, first_name) < 0) {
+            strlcpy(first_name, name, sizeof(first_name));
+        }
+    }
+    closedir(d);
+
+    if (file_count == 0 || first_name[0] == '\0') return false;
+
+    /* Strip .png and trailing digits → prefix + width + start */
+    size_t stem_len = strlen(first_name);
+    if (stem_len > 4) stem_len -= 4; /* remove .png */
+    size_t digits = 0;
+    while (stem_len > digits && isdigit((unsigned char)first_name[stem_len - 1 - digits])) {
+        digits++;
+    }
+    if (digits == 0 || digits > 8) {
+        /* Fall back to plain %04d.png from 1 or 0 */
+        int c1 = count_sequence_frames_pattern(dir_path, "%04d.png", 1);
+        int c0 = count_sequence_frames_pattern(dir_path, "%04d.png", 0);
+        if (c1 <= 0 && c0 <= 0) return false;
+        if (pattern_out && pattern_size) strlcpy(pattern_out, "%04d.png", pattern_size);
+        if (start_out) *start_out = (c0 > c1) ? 0 : 1;
+        if (frame_count_out) *frame_count_out = (c0 > c1) ? c0 : c1;
+        return true;
+    }
+
+    size_t prefix_len = stem_len - digits;
+    if (prefix_len >= sizeof(prefix)) prefix_len = sizeof(prefix) - 1;
+    memcpy(prefix, first_name, prefix_len);
+    prefix[prefix_len] = '\0';
+    digit_width = (int)digits;
+
+    char numbuf[16];
+    if (digits >= sizeof(numbuf)) return false;
+    memcpy(numbuf, first_name + prefix_len, digits);
+    numbuf[digits] = '\0';
+    first_num = atoi(numbuf);
+
+    char pattern[64];
+    snprintf(pattern, sizeof(pattern), "%s%%0%dd.png", prefix, digit_width);
+    int count = count_sequence_frames_pattern(dir_path, pattern, first_num);
+    if (count <= 0) return false;
+
+    if (pattern_out && pattern_size) strlcpy(pattern_out, pattern, pattern_size);
+    if (start_out) *start_out = first_num;
+    if (frame_count_out) *frame_count_out = count;
+    return true;
 }
 
 static bool load_sequence_meta(const char *dir_path, int *fps, bool *loop_out, int *frame_count,
@@ -271,20 +450,30 @@ static bool load_sequence_meta(const char *dir_path, int *fps, bool *loop_out, i
     cJSON *j_w = cJSON_GetObjectItem(root, "width");
     cJSON *j_h = cJSON_GetObjectItem(root, "height");
 
-    if (fps && cJSON_IsNumber(j_fps)) *fps = j_fps->valueint;
+    int tmp = 0;
+    if (fps && json_get_int(j_fps, &tmp) && tmp > 0) *fps = tmp;
     if (loop_out) *loop_out = cJSON_IsBool(j_loop) ? cJSON_IsTrue(j_loop) : true;
-    if (frame_count) {
-        if (cJSON_IsNumber(j_frames) && j_frames->valueint > 0) {
-            *frame_count = j_frames->valueint;
-        } else {
-            *frame_count = count_sequence_frames(dir_path);
-        }
-    }
-    if (pattern_out && cJSON_IsString(j_pattern)) {
+
+    if (pattern_out && cJSON_IsString(j_pattern) && j_pattern->valuestring) {
         strlcpy(pattern_out, j_pattern->valuestring, pattern_size);
     }
     if (start_out) {
-        *start_out = cJSON_IsNumber(j_start) ? j_start->valueint : 1;
+        if (!json_get_int(j_start, start_out)) {
+            /* keep caller default */
+        }
+    }
+
+    if (frame_count) {
+        if (json_get_int(j_frames, &tmp) && tmp > 0) {
+            *frame_count = tmp;
+        } else {
+            const char *pat = (pattern_out && pattern_out[0]) ? pattern_out : "%04d.png";
+            int start = start_out ? *start_out : 1;
+            *frame_count = count_sequence_frames_pattern(dir_path, pat, start);
+            if (*frame_count <= 0) {
+                *frame_count = count_sequence_frames(dir_path);
+            }
+        }
     }
     if (bg_out && cJSON_IsString(j_bg)) {
         strlcpy(bg_out, j_bg->valuestring, bg_size);
@@ -292,11 +481,11 @@ static bool load_sequence_meta(const char *dir_path, int *fps, bool *loop_out, i
     if (ov_out && cJSON_IsString(j_ov)) {
         strlcpy(ov_out, j_ov->valuestring, ov_size);
     }
-    if (width_out && cJSON_IsNumber(j_w) && j_w->valueint > 0) {
-        *width_out = j_w->valueint;
+    if (width_out && json_get_int(j_w, &tmp) && tmp > 0) {
+        *width_out = tmp;
     }
-    if (height_out && cJSON_IsNumber(j_h) && j_h->valueint > 0) {
-        *height_out = j_h->valueint;
+    if (height_out && json_get_int(j_h, &tmp) && tmp > 0) {
+        *height_out = tmp;
     }
 
     cJSON_Delete(root);
@@ -374,6 +563,9 @@ static void load_config(void)
         cJSON *aq = cJSON_GetObjectItem(disp, "auto_quantize_palette");
         if (cJSON_IsBool(aq))
             content_config.auto_quantize_palette = cJSON_IsTrue(aq);
+        cJSON *sfc = cJSON_GetObjectItem(disp, "show_fps_counter");
+        if (cJSON_IsBool(sfc))
+            content_config.show_fps_counter = cJSON_IsTrue(sfc);
     }
 
     /* attract section */
@@ -400,9 +592,10 @@ static void load_config(void)
     strlcpy(saved_background, content_config.background, sizeof(saved_background));
     strlcpy(saved_overlay, content_config.overlay, sizeof(saved_overlay));
 
-    ESP_LOGI(TAG, "config loaded: mode=%d baseline=%s dur=%d auto_quantize=%d",
+    ESP_LOGI(TAG, "config loaded: mode=%d baseline=%s dur=%d auto_quantize=%d show_fps=%d",
              content_config.trans_mode, content_config.trans_baseline,
-             content_config.trans_duration_ms, (int)content_config.auto_quantize_palette);
+             content_config.trans_duration_ms, (int)content_config.auto_quantize_palette,
+             (int)content_config.show_fps_counter);
 }
 
 const pd_content_config_t *pd_content_get_config(void)
@@ -450,9 +643,12 @@ esp_err_t pd_content_save_config(void)
     cJSON *disp = cJSON_AddObjectToObject(root, "display");
     cJSON_AddNumberToObject(disp, "hold_ms", content_config.hold_ms);
     cJSON_AddBoolToObject(disp, "loop_sequences", content_config.loop_sequences);
-    cJSON_AddStringToObject(disp, "background", content_config.background);
-    cJSON_AddStringToObject(disp, "overlay", content_config.overlay);
+    /* Persist global defaults only — never the per-item play overrides that
+     * temporarily live in content_config while lizard/etc. is playing. */
+    cJSON_AddStringToObject(disp, "background", saved_background);
+    cJSON_AddStringToObject(disp, "overlay", saved_overlay);
     cJSON_AddBoolToObject(disp, "auto_quantize_palette", content_config.auto_quantize_palette);
+    cJSON_AddBoolToObject(disp, "show_fps_counter", content_config.show_fps_counter);
 
     cJSON *attr = cJSON_AddObjectToObject(root, "attract");
     cJSON_AddBoolToObject(attr, "enabled", content_config.attract_enabled);
@@ -594,6 +790,7 @@ static bool decode_png_indexed_or_rgba(const char *path, unsigned *w, unsigned *
     return true;
 }
 
+#if PD_CONTENT_COMPOSITING_ENABLED
 static bool parse_hex_color(const char *str, uint8_t *r, uint8_t *g, uint8_t *b)
 {
     if (!str || str[0] != '#' || strlen(str) != 7) return false;
@@ -604,9 +801,42 @@ static bool parse_hex_color(const char *str, uint8_t *r, uint8_t *g, uint8_t *b)
     *b = val & 0xFF;
     return true;
 }
+#endif
+
+/* Drop decoded bg/overlay caches and animated-overlay playback state. */
+static void content_reset_compositing_state(void)
+{
+    free(cached_background_rgb);
+    cached_background_rgb = NULL;
+    free(cached_overlay_rgba);
+    cached_overlay_rgba = NULL;
+    cached_bg_path[0] = '\0';
+    cached_overlay_path[0] = '\0';
+    overlay_is_seq = false;
+    overlay_total_frames = 0;
+    overlay_frame = 0;
+    overlay_frame_start = 0;
+    overlay_base_path[0] = '\0';
+    overlay_last_frame_us = 0;
+    content_overlay_cache_active = NULL;
+    content_overlay_cache_building = false;
+    content_overlay_pattern_hash = 0;
+    strlcpy(overlay_frame_pattern, "%04d.png", sizeof(overlay_frame_pattern));
+}
+
+#if PD_CONTENT_COMPOSITING_ENABLED
+static void content_request_overlay_cache_build(void);
+static uint8_t *content_ov_ensure_rgba_scratch(size_t pixels);
+#endif
+static void content_request_pal_expand(int frame);
 
 static void update_compositing_cache(int width, int height)
 {
+#if !PD_CONTENT_COMPOSITING_ENABLED
+    (void)width;
+    (void)height;
+    return;
+#else
     /* update background cache if changed */
     const char *bg = content_config.background;
     if (strcmp(bg, cached_bg_path) != 0) {
@@ -672,12 +902,25 @@ static void update_compositing_cache(int width, int height)
                                    overlay_frame_pattern, sizeof(overlay_frame_pattern),
                                    &overlay_frame_start, NULL, 0, NULL, 0, NULL, NULL);
                 if (overlay_total_frames == 0) {
-                    overlay_total_frames = count_sequence_frames(full);
+                    overlay_total_frames = count_sequence_frames_pattern(
+                        full, overlay_frame_pattern, overlay_frame_start);
+                }
+                if (overlay_total_frames == 0) {
+                    int disc_start = 0;
+                    int disc_frames = 0;
+                    if (discover_sequence_from_dir(full, overlay_frame_pattern,
+                                                   sizeof(overlay_frame_pattern),
+                                                   &disc_start, &disc_frames)) {
+                        overlay_frame_start = disc_start;
+                        overlay_total_frames = disc_frames;
+                    }
                 }
                 overlay_frame = overlay_frame_start;
                 overlay_last_frame_us = 0;
+                content_overlay_pattern_hash = content_fnv1a(overlay_frame_pattern);
                 ESP_LOGI(TAG, "animated overlay: %s (%d frames @ %d fps)",
                          ov, overlay_total_frames, overlay_fps);
+                content_request_overlay_cache_build();
             } else {
                 /* static overlay */
                 unsigned w, h;
@@ -693,14 +936,37 @@ static void update_compositing_cache(int width, int height)
 
     cached_width = width;
     cached_height = height;
+#endif /* PD_CONTENT_COMPOSITING_ENABLED */
 }
 
 static bool content_has_active_overlay(void)
 {
+#if !PD_CONTENT_COMPOSITING_ENABLED
+    return false;
+#else
     if (content_config.overlay[0] != '\0') return true;
     if (overlay_is_seq && overlay_total_frames > 0) return true;
     if (cached_overlay_rgba) return true;
     return false;
+#endif
+}
+
+/* True when expand can write RGB directly (no bg/overlay composite). */
+static bool content_compositing_is_trivial(void)
+{
+#if !PD_CONTENT_COMPOSITING_ENABLED
+    return true;
+#else
+    if (content_has_active_overlay()) return false;
+    const char *bg = content_config.background;
+    if (bg[0] == '\0') return true;
+    if (bg[0] == '#') {
+        uint8_t r, g, b;
+        if (parse_hex_color(bg, &r, &g, &b) && r == 0 && g == 0 && b == 0) return true;
+        return false;
+    }
+    return false;
+#endif
 }
 
 /* Bounds-limited draws when content is smaller than the matrix and nothing
@@ -787,32 +1053,98 @@ static void content_present_bounds_at(const uint8_t *src_rgb, int x, int y, int 
     content_sprite_last_valid = true;
 }
 
-/* Panel push only. `src_rgb` is composited source-sized RGB when available. */
+/* Tiny on-panel FPS HUD (ASCII: "24>6.2" or "24>-"). Drawn after present so
+ * it sits on top of the frame; no flip — content path does not flip either. */
+static void content_draw_fps_hud(void)
+{
+    if (!content_config.show_fps_counter || !content_playing || !content_is_seq) {
+        return;
+    }
+    char line[20];
+    if (content_achieved_fps > 0.05f) {
+        snprintf(line, sizeof(line), "%d>%.1f", content_fps, (double)content_achieved_fps);
+    } else {
+        snprintf(line, sizeof(line), "%d>-", content_fps);
+    }
+    /* Dark bar behind glyphs so they stay readable on bright frames. */
+    pd_display_fill(0, 0, (uint16_t)(strlen(line) * 4 + 2), 7, PD_COLOR_BLACK);
+    pd_display_draw_text_tiny(1, 1, line, PD_COLOR_YELLOW);
+}
+
+/* Authoritative on-screen canvas for transition "from" captures.
+ * Always kept in sync on present — never point at caller buffers that may
+ * be free()'d (that made from≈to and zoom looked like B→B). */
+static const uint8_t *content_last_src_rgb = NULL;
+static int content_last_src_w = 0;
+static int content_last_src_h = 0;
+static bool content_fb_in_sync = false;
+
+static void content_sync_fb_from_src(const uint8_t *rgb, int sw, int sh)
+{
+    if (!content_fb || !rgb || sw <= 0 || sh <= 0) return;
+    pd_framebuf_blit_rgb(content_fb, rgb, sw, sh);
+    content_fb_in_sync = true;
+    content_last_src_rgb = content_fb->data;
+    content_last_src_w = content_fb->width;
+    content_last_src_h = content_fb->height;
+}
+
+static void content_ensure_fb_current(void)
+{
+    if (content_fb_in_sync || !content_fb) return;
+    /* Only trust last_src when it aliases content_fb (post-sync present). */
+    if (content_last_src_rgb == content_fb->data &&
+        content_last_src_w > 0 && content_last_src_h > 0) {
+        content_fb_in_sync = true;
+        return;
+    }
+    if (!content_last_src_rgb || content_last_src_w <= 0 || content_last_src_h <= 0) {
+        return;
+    }
+    pd_framebuf_blit_rgb(content_fb, content_last_src_rgb,
+                         content_last_src_w, content_last_src_h);
+    content_last_src_rgb = content_fb->data;
+    content_last_src_w = content_fb->width;
+    content_last_src_h = content_fb->height;
+    content_fb_in_sync = true;
+}
+
+/* Panel push only. `src_rgb` is composited source-sized RGB when available.
+ * When src is provided, keep content_fb in sync for the next transition. */
 static void content_present_panel(const uint8_t *src_rgb, int sw, int sh)
 {
+    if (src_rgb && sw > 0 && sh > 0) {
+        content_sync_fb_from_src(src_rgb, sw, sh);
+    }
+
     if (src_rgb && content_bounds_draw_eligible(sw, sh)) {
         int dw = pd_display_get_width();
         int dh = pd_display_get_height();
         int x = (sw < dw) ? (dw - sw) / 2 : 0;
         int y = (sh < dh) ? (dh - sh) / 2 : 0;
         content_present_bounds_at(src_rgb, x, y, sw, sh);
+        content_draw_fps_hud();
         return;
     }
     content_sprite_invalidate();
-    if (content_fb) {
-        pd_display_render_framebuf(content_fb->data);
-    } else if (src_rgb) {
+    /* Prefer source RGB (avoids requiring a prior full-FB blit). Fall back
+     * to content_fb only when no source was provided. */
+    if (src_rgb) {
         pd_display_render_rgb(src_rgb, sw, sh);
+    } else if (content_fb) {
+        content_fb_in_sync = true;
+        content_last_src_rgb = content_fb->data;
+        content_last_src_w = content_fb->width;
+        content_last_src_h = content_fb->height;
+        pd_display_render_framebuf(content_fb->data);
     }
+    content_draw_fps_hud();
 }
 
-/* Update content_fb (for transition capture) then push to the panel. */
+/* Push to the panel; content_fb is synced inside content_present_panel. */
 static void content_present_source_rgb(const uint8_t *rgb, int sw, int sh)
 {
     if (!rgb || sw <= 0 || sh <= 0) return;
-    if (content_fb) {
-        pd_framebuf_blit_rgb(content_fb, rgb, sw, sh);
-    }
     content_present_panel(rgb, sw, sh);
 }
 
@@ -846,11 +1178,25 @@ static bool content_prefetch_store_src(const uint8_t *rgb, int w, int h)
 
 static uint8_t *composite_frame(uint8_t *content_rgba, int width, int height)
 {
-    update_compositing_cache(width, height);
-
-    size_t pixels = width * height;
+    size_t pixels = (size_t)width * (size_t)height;
     uint8_t *rgb = malloc(pixels * 3);
     if (!rgb) return NULL;
+
+#if !PD_CONTENT_COMPOSITING_ENABLED
+    /* Archived: ignore bg/overlay — flatten content onto black. */
+    for (size_t i = 0; i < pixels; i++) {
+        uint8_t a = content_rgba[i * 4 + 3];
+        if (a == 0) {
+            rgb[i * 3 + 0] = rgb[i * 3 + 1] = rgb[i * 3 + 2] = 0;
+        } else {
+            rgb[i * 3 + 0] = content_rgba[i * 4 + 0];
+            rgb[i * 3 + 1] = content_rgba[i * 4 + 1];
+            rgb[i * 3 + 2] = content_rgba[i * 4 + 2];
+        }
+    }
+    return rgb;
+#else
+    update_compositing_cache(width, height);
 
     /* layer 1: background (or black if none) */
     if (cached_background_rgb) {
@@ -888,8 +1234,31 @@ static uint8_t *composite_frame(uint8_t *content_rgba, int width, int height)
 
     /* layer 3: overlay with alpha blending */
     uint8_t *overlay_rgba = NULL;
-    if (overlay_is_seq && overlay_total_frames > 0) {
-        /* load current frame of animated overlay */
+    bool overlay_owned = false;
+    pd_seq_cache_slot_t *ov_slot = content_overlay_cache_active;
+    if (overlay_is_seq && overlay_total_frames > 0 && ov_slot && ov_slot->live &&
+        ov_slot->indices && ov_slot->width == width && ov_slot->height == height) {
+        int oidx = overlay_frame - ov_slot->frame_start;
+        if (oidx >= 0 && oidx < ov_slot->frame_count) {
+            overlay_rgba = content_ov_ensure_rgba_scratch(pixels);
+            if (overlay_rgba) {
+                const uint8_t *isrc =
+                    ov_slot->indices + (size_t)oidx * pixels;
+                for (size_t i = 0; i < pixels; i++) {
+                    uint8_t pi = isrc[i];
+                    if (pi >= (uint8_t)ov_slot->palette_size) pi = 0;
+                    overlay_rgba[i * 4 + 0] = ov_slot->palette[pi][0];
+                    overlay_rgba[i * 4 + 1] = ov_slot->palette[pi][1];
+                    overlay_rgba[i * 4 + 2] = ov_slot->palette[pi][2];
+                    overlay_rgba[i * 4 + 3] = ov_slot->palette[pi][3];
+                }
+                /* Overlay scratch is reused — not freed below. */
+                overlay_owned = false;
+            }
+        }
+    }
+    if (!overlay_rgba && overlay_is_seq && overlay_total_frames > 0) {
+        /* Fallback: PNG decode until overlay palcache is live. */
         char frame_path[PD_CONTENT_MAX_PATH];
         snprintf(frame_path, sizeof(frame_path), "%s/", overlay_base_path);
         size_t base_len = strlen(frame_path);
@@ -900,8 +1269,10 @@ static uint8_t *composite_frame(uint8_t *content_rgba, int width, int height)
         if (overlay_rgba && ((int)ow != width || (int)oh != height)) {
             free(overlay_rgba);
             overlay_rgba = NULL;
+        } else if (overlay_rgba) {
+            overlay_owned = true;
         }
-    } else if (cached_overlay_rgba) {
+    } else if (!overlay_rgba && cached_overlay_rgba) {
         overlay_rgba = cached_overlay_rgba;
     }
 
@@ -926,13 +1297,13 @@ static uint8_t *composite_frame(uint8_t *content_rgba, int width, int height)
             rgb[i * 3 + 1] = (uint8_t)((og * oa + bg * inv) >> 8);
             rgb[i * 3 + 2] = (uint8_t)((ob * oa + bb * inv) >> 8);
         }
-        /* free if we loaded it dynamically (not the cached static one) */
-        if (overlay_rgba != cached_overlay_rgba) {
+        if (overlay_owned) {
             free(overlay_rgba);
         }
     }
 
     return rgb;
+#endif /* PD_CONTENT_COMPOSITING_ENABLED */
 }
 
 static uint8_t *decode_png_file(const char *path, unsigned *w, unsigned *h)
@@ -1143,6 +1514,14 @@ static void content_seq_cache_deactivate(void)
     content_seq_cache_active = NULL;
     content_cache_building = false;
     content_cache_fallback = false;
+    s_pal_back_ready = false;
+    s_pal_ready_frame = -1;
+    s_pal_expand_req_frame = -1;
+    /* Ping-pong fronts may be freed/reused — drop dangling present ptr. */
+    content_last_src_rgb = NULL;
+    content_last_src_w = 0;
+    content_last_src_h = 0;
+    content_fb_in_sync = false;
 }
 
 static uint8_t content_nearest_palette_index(const uint8_t palette[][4], int palette_size,
@@ -1191,11 +1570,12 @@ static pd_seq_cache_slot_t *content_pal_acquire_slot(void)
             return &content_pal_slots[i];
         }
     }
-    /* Evict least-recently used that is not the active playback slot. */
+    /* Evict least-recently used that is not content or overlay active. */
     pd_seq_cache_slot_t *victim = NULL;
     for (int i = 0; i < PD_PAL_CACHE_SLOTS; i++) {
         pd_seq_cache_slot_t *s = &content_pal_slots[i];
         if (s == content_seq_cache_active) continue;
+        if (s == content_overlay_cache_active) continue;
         if (!victim || s->last_used < victim->last_used) victim = s;
     }
     if (!victim) victim = &content_pal_slots[0];
@@ -1213,6 +1593,17 @@ static void content_pal_activate(pd_seq_cache_slot_t *slot)
     content_cache_fallback = false;
     content_prefetch_valid = false;
     content_prefetch_frame = -1;
+    s_pal_back_ready = false;
+    s_pal_ready_frame = -1;
+    s_pal_expand_req_frame = -1;
+}
+
+static void content_overlay_pal_activate(pd_seq_cache_slot_t *slot)
+{
+    if (!slot) return;
+    slot->last_used = content_pal_lru_clock++;
+    content_overlay_cache_active = slot;
+    content_overlay_cache_building = false;
 }
 
 /* Simple median-cut over a sampled RGBA color list → up to PD_PALETTE_MAX. */
@@ -1339,12 +1730,14 @@ static void pd_median_cut_palette(pd_rgba_sample_t *samples, int sample_count,
 }
 
 /* Load one sequence frame as source-sized RGBA (no compositing, no letterbox). */
-static uint8_t *content_load_frame_rgba_source(int frame_num, int *out_w, int *out_h)
+static uint8_t *content_load_seq_frame_rgba(const char *base_path, const char *pattern,
+                                            int frame_num, int *out_w, int *out_h)
 {
+    if (!base_path || !pattern) return NULL;
     char frame_path[PD_CONTENT_MAX_PATH];
-    snprintf(frame_path, sizeof(frame_path), "%s/", content_current);
+    snprintf(frame_path, sizeof(frame_path), "%s/", base_path);
     size_t base_len = strlen(frame_path);
-    snprintf(frame_path + base_len, sizeof(frame_path) - base_len, content_frame_pattern, frame_num);
+    snprintf(frame_path + base_len, sizeof(frame_path) - base_len, pattern, frame_num);
 
     unsigned w = 0, h = 0;
     pd_decoded_frame_t decoded;
@@ -1376,6 +1769,12 @@ static uint8_t *content_load_frame_rgba_source(int frame_num, int *out_w, int *o
     return src_rgba;
 }
 
+static uint8_t *content_load_frame_rgba_source(int frame_num, int *out_w, int *out_h)
+{
+    return content_load_seq_frame_rgba(content_current, content_frame_pattern,
+                                       frame_num, out_w, out_h);
+}
+
 static bool content_probe_source_size(int *sw, int *sh)
 {
     if (*sw > 0 && *sh > 0) return true;
@@ -1388,23 +1787,97 @@ static bool content_probe_source_size(int *sw, int *sh)
     return w > 0 && h > 0;
 }
 
-/* Expand one cached indexed frame through the palette, composite at source
- * size (bg/overlay), then center-blit onto the display framebuffer. */
-static void content_seq_cache_expand_to_fb(int frame_number)
+static bool content_pal_ensure_rgb_bufs(int sw, int sh)
 {
-    pd_seq_cache_slot_t *slot = content_seq_cache_active;
-    if (!slot || !slot->live || !content_fb || !slot->indices) return;
+    if (sw <= 0 || sh <= 0) return false;
+    size_t need = (size_t)sw * (size_t)sh * 3;
+    if (s_pal_rgb[0] && s_pal_rgb[1] && s_pal_rgb_cap >= need &&
+        s_pal_rgb_w == sw && s_pal_rgb_h == sh) {
+        return true;
+    }
+    for (int i = 0; i < 2; i++) {
+        if (s_pal_rgb[i]) {
+            heap_caps_free(s_pal_rgb[i]);
+            s_pal_rgb[i] = NULL;
+        }
+        s_pal_rgb[i] = heap_caps_malloc(need, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (!s_pal_rgb[i]) {
+            for (int j = 0; j <= i; j++) {
+                heap_caps_free(s_pal_rgb[j]);
+                s_pal_rgb[j] = NULL;
+            }
+            s_pal_rgb_cap = 0;
+            s_pal_rgb_w = s_pal_rgb_h = 0;
+            return false;
+        }
+    }
+    s_pal_rgb_cap = need;
+    s_pal_rgb_w = sw;
+    s_pal_rgb_h = sh;
+    s_pal_front = 0;
+    s_pal_back_ready = false;
+    s_pal_ready_frame = -1;
+    return true;
+}
 
+static uint8_t *content_pal_ensure_scratch(uint8_t **buf, size_t *cap, size_t pixels)
+{
+    size_t need = pixels * 4;
+    if (*buf && *cap >= need) return *buf;
+    uint8_t *n = heap_caps_malloc(need, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!n) return NULL;
+    heap_caps_free(*buf);
+    *buf = n;
+    *cap = need;
+    return *buf;
+}
+
+static uint8_t *content_pal_ensure_rgba_scratch(size_t pixels)
+{
+    return content_pal_ensure_scratch(&s_pal_rgba_scratch, &s_pal_rgba_scratch_cap, pixels);
+}
+
+#if PD_CONTENT_COMPOSITING_ENABLED
+static uint8_t *content_ov_ensure_rgba_scratch(size_t pixels)
+{
+    return content_pal_ensure_scratch(&s_ov_rgba_scratch, &s_ov_rgba_scratch_cap, pixels);
+}
+#endif
+
+/* Expand slot indices for `frame_number` into dst_rgb (source-sized RGB).
+ * Skips composite_frame when bg/overlay are trivial. */
+static bool content_pal_expand_frame_to_rgb(pd_seq_cache_slot_t *slot, int frame_number,
+                                           uint8_t *dst_rgb)
+{
+    if (!slot || !slot->live || !slot->indices || !dst_rgb) return false;
     int idx = frame_number - slot->frame_start;
-    if (idx < 0 || idx >= slot->frame_count) return;
+    if (idx < 0 || idx >= slot->frame_count) return false;
 
     int sw = slot->width;
     int sh = slot->height;
     size_t pixels = (size_t)sw * (size_t)sh;
     const uint8_t *src = slot->indices + (size_t)idx * pixels;
 
-    uint8_t *rgba = malloc(pixels * 4);
-    if (!rgba) return;
+    if (content_compositing_is_trivial()) {
+        for (size_t i = 0; i < pixels; i++) {
+            uint8_t pi = src[i];
+            if (pi >= (uint8_t)slot->palette_size) pi = 0;
+            uint8_t a = slot->palette[pi][3];
+            if (a == 0) {
+                dst_rgb[i * 3 + 0] = 0;
+                dst_rgb[i * 3 + 1] = 0;
+                dst_rgb[i * 3 + 2] = 0;
+            } else {
+                dst_rgb[i * 3 + 0] = slot->palette[pi][0];
+                dst_rgb[i * 3 + 1] = slot->palette[pi][1];
+                dst_rgb[i * 3 + 2] = slot->palette[pi][2];
+            }
+        }
+        return true;
+    }
+
+    uint8_t *rgba = content_pal_ensure_rgba_scratch(pixels);
+    if (!rgba) return false;
     for (size_t i = 0; i < pixels; i++) {
         uint8_t pi = src[i];
         if (pi >= (uint8_t)slot->palette_size) pi = 0;
@@ -1415,22 +1888,55 @@ static void content_seq_cache_expand_to_fb(int frame_number)
     }
 
     uint8_t *rgb = composite_frame(rgba, sw, sh);
-    free(rgba);
-    if (!rgb) return;
-    content_present_source_rgb(rgb, sw, sh);
+    if (!rgb) return false;
+    memcpy(dst_rgb, rgb, pixels * 3);
     free(rgb);
+    return true;
 }
 
-static void content_palcache_sidecar_path(char *out, size_t out_len)
+/* Expand one cached indexed frame and present (sync path / first frame). */
+static void content_seq_cache_expand_to_fb(int frame_number)
 {
-    snprintf(out, out_len, "%s/%s", content_current, PD_PAL_CACHE_FILENAME);
+    pd_seq_cache_slot_t *slot = content_seq_cache_active;
+    if (!slot || !slot->live || !slot->indices) return;
+    if (!content_pal_ensure_rgb_bufs(slot->width, slot->height)) {
+        /* Fallback: one-shot heap path. */
+        int idx = frame_number - slot->frame_start;
+        if (idx < 0 || idx >= slot->frame_count) return;
+        size_t pixels = (size_t)slot->width * (size_t)slot->height;
+        const uint8_t *src = slot->indices + (size_t)idx * pixels;
+        uint8_t *rgba = malloc(pixels * 4);
+        if (!rgba) return;
+        for (size_t i = 0; i < pixels; i++) {
+            uint8_t pi = src[i];
+            if (pi >= (uint8_t)slot->palette_size) pi = 0;
+            rgba[i * 4 + 0] = slot->palette[pi][0];
+            rgba[i * 4 + 1] = slot->palette[pi][1];
+            rgba[i * 4 + 2] = slot->palette[pi][2];
+            rgba[i * 4 + 3] = slot->palette[pi][3];
+        }
+        uint8_t *rgb = composite_frame(rgba, slot->width, slot->height);
+        free(rgba);
+        if (!rgb) return;
+        content_present_source_rgb(rgb, slot->width, slot->height);
+        free(rgb);
+        return;
+    }
+    uint8_t *front = s_pal_rgb[s_pal_front];
+    if (!content_pal_expand_frame_to_rgb(slot, frame_number, front)) return;
+    content_present_source_rgb(front, slot->width, slot->height);
+}
+
+static void content_palcache_sidecar_path_for(const char *seq_dir, char *out, size_t out_len)
+{
+    snprintf(out, out_len, "%s/%s", seq_dir, PD_PAL_CACHE_FILENAME);
 }
 
 static bool content_palcache_write_sidecar(const pd_seq_cache_slot_t *slot)
 {
     if (!slot || !slot->indices || !slot->live) return false;
     char path[PD_CONTENT_MAX_PATH];
-    content_palcache_sidecar_path(path, sizeof(path));
+    content_palcache_sidecar_path_for(slot->seq_path, path, sizeof(path));
 
     pd_palcache_hdr_t hdr = {0};
     hdr.magic = PD_PAL_CACHE_MAGIC;
@@ -1461,13 +1967,12 @@ static bool content_palcache_write_sidecar(const pd_seq_cache_slot_t *slot)
     return true;
 }
 
-static pd_seq_cache_slot_t *content_palcache_try_load_sidecar(void)
+static pd_seq_cache_slot_t *content_palcache_try_load_sidecar_at(
+    const char *seq_path, int sw, int sh, int frames, int start, uint32_t phash)
 {
-    if (content_src_w <= 0 || content_src_h <= 0 || content_total_frames <= 0) {
-        return NULL;
-    }
+    if (!seq_path || sw <= 0 || sh <= 0 || frames <= 0) return NULL;
     char path[PD_CONTENT_MAX_PATH];
-    content_palcache_sidecar_path(path, sizeof(path));
+    content_palcache_sidecar_path_for(seq_path, path, sizeof(path));
     FILE *f = fopen(path, "rb");
     if (!f) return NULL;
 
@@ -1477,10 +1982,10 @@ static pd_seq_cache_slot_t *content_palcache_try_load_sidecar(void)
         return NULL;
     }
     if (hdr.magic != PD_PAL_CACHE_MAGIC || hdr.version != PD_PAL_CACHE_VERSION ||
-        hdr.width != (uint16_t)content_src_w || hdr.height != (uint16_t)content_src_h ||
-        hdr.frame_count != (uint16_t)content_total_frames ||
-        hdr.frame_start != (int16_t)content_frame_start ||
-        hdr.pattern_hash != content_pattern_hash ||
+        hdr.width != (uint16_t)sw || hdr.height != (uint16_t)sh ||
+        hdr.frame_count != (uint16_t)frames ||
+        hdr.frame_start != (int16_t)start ||
+        hdr.pattern_hash != phash ||
         hdr.palette_size == 0 || hdr.palette_size > PD_PALETTE_MAX) {
         fclose(f);
         ESP_LOGI(TAG, "palette cache: sidecar stale/invalid — will rebuild");
@@ -1515,7 +2020,7 @@ static pd_seq_cache_slot_t *content_palcache_try_load_sidecar(void)
         heap_caps_free(indices);
         return NULL;
     }
-    strlcpy(slot->seq_path, content_current, sizeof(slot->seq_path));
+    strlcpy(slot->seq_path, seq_path, sizeof(slot->seq_path));
     slot->pattern_hash = hdr.pattern_hash;
     slot->width = hdr.width;
     slot->height = hdr.height;
@@ -1530,69 +2035,138 @@ static pd_seq_cache_slot_t *content_palcache_try_load_sidecar(void)
     return slot;
 }
 
-/* Build the PSRAM indexed cache at SOURCE size for the current sequence.
- * Publishes into an LRU slot and writes a LittleFS sidecar on success. */
-static bool content_seq_cache_build(uint32_t epoch)
+static pd_seq_cache_slot_t *content_palcache_try_load_sidecar(void)
 {
-    content_cache_building = true;
-    content_cache_fallback = false;
+    return content_palcache_try_load_sidecar_at(
+        content_current, content_src_w, content_src_h,
+        content_total_frames, content_frame_start, content_pattern_hash);
+}
 
-    if (!content_config.auto_quantize_palette || !content_is_seq ||
-        content_total_frames <= 0 || !content_fb) {
-        content_cache_building = false;
-        content_cache_fallback = true;
-        return false;
+/* Build PSRAM indexed cache at SOURCE size for content or overlay sequence. */
+static bool content_seq_cache_build_ex(uint32_t epoch, bool for_overlay)
+{
+    const char *seq_path;
+    const char *pattern;
+    int frame_count;
+    int frame_start;
+    uint32_t phash;
+    int sw, sh;
+
+    if (for_overlay) {
+        content_overlay_cache_building = true;
+        if (!content_config.auto_quantize_palette || !overlay_is_seq ||
+            overlay_total_frames <= 0 || overlay_base_path[0] == '\0') {
+            content_overlay_cache_building = false;
+            return false;
+        }
+        seq_path = overlay_base_path;
+        pattern = overlay_frame_pattern;
+        frame_count = overlay_total_frames;
+        frame_start = overlay_frame_start;
+        phash = content_overlay_pattern_hash;
+        sw = 0;
+        sh = 0;
+        uint8_t *probe = content_load_seq_frame_rgba(seq_path, pattern, frame_start, &sw, &sh);
+        free(probe);
+        if (sw <= 0 || sh <= 0) {
+            content_log_line("overlay cache fallback: probe size failed");
+            content_overlay_cache_building = false;
+            return false;
+        }
+    } else {
+        content_cache_building = true;
+        content_cache_fallback = false;
+        if (!content_config.auto_quantize_palette || !content_is_seq ||
+            content_total_frames <= 0) {
+            snprintf(content_cache_fail_reason, sizeof(content_cache_fail_reason),
+                     "skip aq=%d seq=%d frames=%d",
+                     (int)content_config.auto_quantize_palette, (int)content_is_seq,
+                     content_total_frames);
+            content_log_line("palette cache fallback: %s", content_cache_fail_reason);
+            content_cache_building = false;
+            content_cache_fallback = true;
+            return false;
+        }
+        seq_path = content_current;
+        pattern = content_frame_pattern;
+        frame_count = content_total_frames;
+        frame_start = content_frame_start;
+        phash = content_pattern_hash;
+        sw = content_src_w;
+        sh = content_src_h;
+        if (!content_probe_source_size(&sw, &sh)) {
+            snprintf(content_cache_fail_reason, sizeof(content_cache_fail_reason),
+                     "probe size failed");
+            content_log_line("palette cache fallback: %s for %s", content_cache_fail_reason,
+                             content_rel_path[0] ? content_rel_path : content_current);
+            content_cache_building = false;
+            content_cache_fallback = true;
+            return false;
+        }
+        content_src_w = sw;
+        content_src_h = sh;
     }
+
     if (epoch != content_epoch) {
         content_cache_building = false;
+        content_overlay_cache_building = false;
         return false;
     }
 
-    int sw = content_src_w;
-    int sh = content_src_h;
-    if (!content_probe_source_size(&sw, &sh)) {
-        ESP_LOGW(TAG, "palette cache: cannot probe source size for %s — falling back",
-                 content_rel_path[0] ? content_rel_path : content_current);
-        content_cache_building = false;
-        content_cache_fallback = true;
-        return false;
-    }
-    content_src_w = sw;
-    content_src_h = sh;
-
-    int frame_count = content_total_frames;
-    int frame_start = content_frame_start;
-    uint32_t phash = content_pattern_hash;
     size_t pixels = (size_t)sw * (size_t)sh;
     size_t slab_bytes = pixels * (size_t)frame_count;
     size_t free_spiram = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
     if (slab_bytes + 65536 > free_spiram) {
-        ESP_LOGW(TAG, "palette cache: need %u bytes SPIRAM for %s (%dx%d x %d), only %u free — falling back",
-                 (unsigned)slab_bytes,
-                 content_rel_path[0] ? content_rel_path : content_current,
-                 sw, sh, frame_count, (unsigned)free_spiram);
-        content_cache_building = false;
-        content_cache_fallback = true;
+        for (int i = 0; i < PD_PAL_CACHE_SLOTS; i++) {
+            pd_seq_cache_slot_t *s = &content_pal_slots[i];
+            if (s != content_seq_cache_active && s != content_overlay_cache_active &&
+                s->in_use) {
+                content_pal_slot_clear(s);
+            }
+        }
+        free_spiram = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+    }
+    if (slab_bytes + 65536 > free_spiram) {
+        content_log_line("%s cache fallback: spiram need=%u free=%u %dx%dx%d",
+                         for_overlay ? "overlay" : "palette",
+                         (unsigned)slab_bytes, (unsigned)free_spiram, sw, sh, frame_count);
+        if (!for_overlay) {
+            snprintf(content_cache_fail_reason, sizeof(content_cache_fail_reason),
+                     "spiram need=%u free=%u %dx%dx%d",
+                     (unsigned)slab_bytes, (unsigned)free_spiram, sw, sh, frame_count);
+            content_cache_fallback = true;
+            content_cache_building = false;
+        } else {
+            content_overlay_cache_building = false;
+        }
         return false;
     }
 
     uint8_t *slab = heap_caps_malloc(slab_bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (!slab) {
-        ESP_LOGW(TAG, "palette cache: SPIRAM alloc of %u failed for %s — falling back",
-                 (unsigned)slab_bytes,
-                 content_rel_path[0] ? content_rel_path : content_current);
-        content_cache_building = false;
-        content_cache_fallback = true;
+        content_log_line("%s cache fallback: spiram alloc %u failed",
+                         for_overlay ? "overlay" : "palette", (unsigned)slab_bytes);
+        if (!for_overlay) {
+            content_cache_fallback = true;
+            content_cache_building = false;
+        } else {
+            content_overlay_cache_building = false;
+        }
         return false;
     }
 
     pd_rgba_sample_t *samples = heap_caps_malloc(sizeof(pd_rgba_sample_t) * PD_QUANT_SAMPLES_MAX,
                                                    MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (!samples) {
-        ESP_LOGW(TAG, "palette cache: sample buffer alloc failed — falling back");
         heap_caps_free(slab);
-        content_cache_building = false;
-        content_cache_fallback = true;
+        content_log_line("%s cache fallback: sample buffer alloc failed",
+                         for_overlay ? "overlay" : "palette");
+        if (!for_overlay) {
+            content_cache_fallback = true;
+            content_cache_building = false;
+        } else {
+            content_overlay_cache_building = false;
+        }
         return false;
     }
 
@@ -1602,13 +2176,12 @@ static bool content_seq_cache_build(uint32_t epoch)
     bool used_source_palette = false;
     int64_t t0 = esp_timer_get_time();
 
-    /* Pass 1: sample content colors (adopt PNG palette when already ≤64). */
     for (int f = 0; f < frame_count; f++) {
         if (epoch != content_epoch) {
             heap_caps_free(samples);
             heap_caps_free(slab);
-            ESP_LOGI(TAG, "palette cache build aborted (epoch changed during sample)");
             content_cache_building = false;
+            content_overlay_cache_building = false;
             return false;
         }
 
@@ -1616,10 +2189,10 @@ static bool content_seq_cache_build(uint32_t epoch)
 
         if (f == 0 && !used_source_palette) {
             char frame_path[PD_CONTENT_MAX_PATH];
-            snprintf(frame_path, sizeof(frame_path), "%s/", content_current);
+            snprintf(frame_path, sizeof(frame_path), "%s/", seq_path);
             size_t base_len = strlen(frame_path);
             snprintf(frame_path + base_len, sizeof(frame_path) - base_len,
-                     content_frame_pattern, frame_num);
+                     pattern, frame_num);
             unsigned w = 0, h = 0;
             pd_decoded_frame_t decoded;
             if (decode_png_indexed_or_rgba(frame_path, &w, &h, &decoded)) {
@@ -1635,7 +2208,7 @@ static bool content_seq_cache_build(uint32_t epoch)
 
         if (!used_source_palette) {
             int fw = 0, fh = 0;
-            uint8_t *rgba = content_load_frame_rgba_source(frame_num, &fw, &fh);
+            uint8_t *rgba = content_load_seq_frame_rgba(seq_path, pattern, frame_num, &fw, &fh);
             if (rgba && fw == sw && fh == sh) {
                 size_t step = pixels / PD_QUANT_SAMPLES_MAX;
                 if (step < 1) step = 1;
@@ -1682,18 +2255,17 @@ static bool content_seq_cache_build(uint32_t epoch)
     }
     if (transparent_idx < 0) transparent_idx = 0;
 
-    /* Pass 2: remap every frame into the index slab. */
     for (int f = 0; f < frame_count; f++) {
         if (epoch != content_epoch) {
             heap_caps_free(slab);
-            ESP_LOGI(TAG, "palette cache build aborted (epoch changed during remap)");
             content_cache_building = false;
+            content_overlay_cache_building = false;
             return false;
         }
 
         int frame_num = frame_start + f;
         int fw = 0, fh = 0;
-        uint8_t *rgba = content_load_frame_rgba_source(frame_num, &fw, &fh);
+        uint8_t *rgba = content_load_seq_frame_rgba(seq_path, pattern, frame_num, &fw, &fh);
         uint8_t *dst = slab + (size_t)f * pixels;
         if (!rgba || fw != sw || fh != sh) {
             memset(dst, (uint8_t)transparent_idx, pixels);
@@ -1717,19 +2289,24 @@ static bool content_seq_cache_build(uint32_t epoch)
 
     if (epoch != content_epoch) {
         heap_caps_free(slab);
-        ESP_LOGI(TAG, "palette cache build aborted (epoch changed before publish)");
         content_cache_building = false;
+        content_overlay_cache_building = false;
         return false;
     }
 
     pd_seq_cache_slot_t *slot = content_pal_acquire_slot();
     if (!slot) {
         heap_caps_free(slab);
-        content_cache_building = false;
-        content_cache_fallback = true;
+        content_log_line("%s cache fallback: no LRU slot", for_overlay ? "overlay" : "palette");
+        if (!for_overlay) {
+            content_cache_fallback = true;
+            content_cache_building = false;
+        } else {
+            content_overlay_cache_building = false;
+        }
         return false;
     }
-    strlcpy(slot->seq_path, content_current, sizeof(slot->seq_path));
+    strlcpy(slot->seq_path, seq_path, sizeof(slot->seq_path));
     slot->pattern_hash = phash;
     slot->width = sw;
     slot->height = sh;
@@ -1741,17 +2318,169 @@ static bool content_seq_cache_build(uint32_t epoch)
     slot->live = true;
 
     if (epoch == content_epoch) {
-        content_pal_activate(slot);
+        if (for_overlay) {
+            content_overlay_pal_activate(slot);
+        } else {
+            content_pal_activate(slot);
+        }
         (void)content_palcache_write_sidecar(slot);
     }
 
     int64_t ms = (esp_timer_get_time() - t0) / 1000;
-    ESP_LOGI(TAG, "palette cache ready: %d frames %dx%d, %d colors, %u KB SPIRAM, built in %lld ms (%s)",
-             frame_count, sw, sh, palette_size,
-             (unsigned)(slab_bytes / 1024), (long long)ms,
-             used_source_palette ? "source-palette" : "quantized");
+    if (!for_overlay) content_cache_fail_reason[0] = '\0';
+    content_log_line("%s cache live: %d frames %dx%d %d colors %uKB %lldms",
+                     for_overlay ? "overlay" : "palette",
+                     frame_count, sw, sh, palette_size,
+                     (unsigned)(slab_bytes / 1024), (long long)ms);
     content_cache_building = false;
+    content_overlay_cache_building = false;
     return true;
+}
+
+static bool content_seq_cache_build(uint32_t epoch)
+{
+    return content_seq_cache_build_ex(epoch, false);
+}
+
+static void content_cache_notify(pd_palcache_job_t job)
+{
+    if (!content_cache_task) return;
+    content_cache_job = job;
+    content_cache_req_epoch = content_epoch;
+    xTaskNotifyGive(content_cache_task);
+}
+
+static void content_request_pal_expand(int frame)
+{
+    if (!content_cache_task || !content_seq_cache_active || !content_seq_cache_active->live) {
+        return;
+    }
+    if (frame < 0) return;
+    /* Don't steal the worker while a full content/overlay rebuild is running. */
+    if (content_cache_building || content_overlay_cache_building) return;
+    if (s_pal_expand_req_frame == frame && !s_pal_back_ready) return;
+    s_pal_expand_req_frame = frame;
+    content_cache_notify(PD_PALCACHE_JOB_EXPAND);
+}
+
+static void content_cache_run_expand(uint32_t epoch)
+{
+    int frame = s_pal_expand_req_frame;
+    pd_seq_cache_slot_t *slot = content_seq_cache_active;
+    if (epoch != content_epoch || !slot || !slot->live || frame < 0) return;
+    if (!content_pal_ensure_rgb_bufs(slot->width, slot->height)) return;
+    int back = 1 - s_pal_front;
+    if (!content_pal_expand_frame_to_rgb(slot, frame, s_pal_rgb[back])) return;
+    if (epoch != content_epoch) return;
+    s_pal_ready_frame = frame;
+    s_pal_back_ready = true;
+}
+
+static void content_cache_run_overlay(uint32_t epoch)
+{
+    if (!content_config.auto_quantize_palette || !overlay_is_seq ||
+        overlay_total_frames <= 0 || overlay_base_path[0] == '\0') {
+        content_overlay_cache_building = false;
+        return;
+    }
+    if (epoch != content_epoch) {
+        content_overlay_cache_building = false;
+        return;
+    }
+
+    int sw = 0, sh = 0;
+    uint8_t *probe = content_load_seq_frame_rgba(
+        overlay_base_path, overlay_frame_pattern, overlay_frame_start, &sw, &sh);
+    free(probe);
+    if (sw <= 0 || sh <= 0) {
+        content_overlay_cache_building = false;
+        return;
+    }
+    pd_seq_cache_slot_t *warm = content_pal_find_slot(
+        overlay_base_path, sw, sh,
+        overlay_total_frames, overlay_frame_start,
+        content_overlay_pattern_hash);
+    if (warm) {
+        content_overlay_pal_activate(warm);
+        content_log_line("overlay cache RAM hit (%d frames)", overlay_total_frames);
+        return;
+    }
+    warm = content_palcache_try_load_sidecar_at(
+        overlay_base_path, sw, sh, overlay_total_frames, overlay_frame_start,
+        content_overlay_pattern_hash);
+    if (warm && epoch == content_epoch) {
+        content_overlay_pal_activate(warm);
+        content_log_line("overlay cache sidecar hit (%d frames)", overlay_total_frames);
+        return;
+    }
+
+    content_log_line("overlay cache build start %d frames %dx%d spiram_free=%u",
+                     overlay_total_frames, sw, sh,
+                     (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+    (void)content_seq_cache_build_ex(epoch, true);
+}
+
+static void content_cache_run_content(uint32_t epoch)
+{
+    if (!content_config.auto_quantize_palette || !content_is_seq) {
+        content_cache_building = false;
+        return;
+    }
+    if (epoch != content_epoch) {
+        if (!content_seq_cache_active) {
+            content_cache_building = false;
+        }
+        return;
+    }
+    pd_seq_cache_slot_t *warm = content_pal_find_slot(
+        content_current, content_src_w, content_src_h,
+        content_total_frames, content_frame_start, content_pattern_hash);
+    if (warm) {
+        content_pal_activate(warm);
+        content_cache_fail_reason[0] = '\0';
+        content_log_line("palette cache RAM hit for %s",
+                         content_rel_path[0] ? content_rel_path : content_current);
+#if PD_CONTENT_COMPOSITING_ENABLED
+        if (overlay_is_seq && overlay_total_frames > 0 &&
+            !(content_overlay_cache_active && content_overlay_cache_active->live)) {
+            content_request_overlay_cache_build();
+        }
+#endif
+        return;
+    }
+    warm = content_palcache_try_load_sidecar();
+    if (warm && epoch == content_epoch) {
+        content_pal_activate(warm);
+        content_cache_fail_reason[0] = '\0';
+        content_log_line("palette cache sidecar hit for %s",
+                         content_rel_path[0] ? content_rel_path : content_current);
+#if PD_CONTENT_COMPOSITING_ENABLED
+        if (overlay_is_seq && overlay_total_frames > 0 &&
+            !(content_overlay_cache_active && content_overlay_cache_active->live)) {
+            content_request_overlay_cache_build();
+        }
+#endif
+        return;
+    }
+    content_log_line("palette cache build start epoch=%u %d frames %dx%d spiram_free=%u",
+                     (unsigned)epoch, content_total_frames, content_src_w, content_src_h,
+                     (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+    if (!content_seq_cache_build(epoch) && epoch == content_epoch) {
+        if (!content_cache_fail_reason[0]) {
+            snprintf(content_cache_fail_reason, sizeof(content_cache_fail_reason),
+                     "build failed");
+        }
+        content_log_line("palette cache fallback: %s", content_cache_fail_reason);
+        content_cache_fallback = true;
+        content_cache_building = false;
+        return;
+    }
+#if PD_CONTENT_COMPOSITING_ENABLED
+    if (epoch == content_epoch && overlay_is_seq && overlay_total_frames > 0 &&
+        !(content_overlay_cache_active && content_overlay_cache_active->live)) {
+        content_request_overlay_cache_build();
+    }
+#endif
 }
 
 static void content_cache_task_fn(void *arg)
@@ -1760,36 +2489,13 @@ static void content_cache_task_fn(void *arg)
     for (;;) {
         ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
         uint32_t epoch = content_cache_req_epoch;
-        if (!content_config.auto_quantize_palette || !content_is_seq) {
-            content_cache_building = false;
-            continue;
-        }
-        if (epoch != content_epoch) {
-            continue;
-        }
-        /* Prefer RAM LRU / sidecar before a full rebuild. */
-        pd_seq_cache_slot_t *warm = content_pal_find_slot(
-            content_current, content_src_w, content_src_h,
-            content_total_frames, content_frame_start, content_pattern_hash);
-        if (warm) {
-            content_pal_activate(warm);
-            ESP_LOGI(TAG, "palette cache: RAM hit for %s",
-                     content_rel_path[0] ? content_rel_path : content_current);
-            continue;
-        }
-        warm = content_palcache_try_load_sidecar();
-        if (warm && epoch == content_epoch) {
-            content_pal_activate(warm);
-            continue;
-        }
-        if (warm) {
-            /* Loaded for a stale epoch — leave in LRU but don't activate. */
-        }
-        ESP_LOGI(TAG, "palette cache build starting in background (epoch=%u, %d frames %dx%d)",
-                 (unsigned)epoch, content_total_frames, content_src_w, content_src_h);
-        if (!content_seq_cache_build(epoch) && epoch == content_epoch) {
-            content_cache_fallback = true;
-            content_cache_building = false;
+        pd_palcache_job_t job = content_cache_job;
+        if (job == PD_PALCACHE_JOB_EXPAND) {
+            content_cache_run_expand(epoch);
+        } else if (job == PD_PALCACHE_JOB_OVERLAY) {
+            content_cache_run_overlay(epoch);
+        } else {
+            content_cache_run_content(epoch);
         }
     }
 }
@@ -1805,7 +2511,9 @@ static void content_request_palette_cache_build(void)
     }
 
     if (!content_probe_source_size(&content_src_w, &content_src_h)) {
-        ESP_LOGW(TAG, "palette cache: source size unknown — skipping");
+        snprintf(content_cache_fail_reason, sizeof(content_cache_fail_reason),
+                 "source size unknown");
+        content_log_line("palette cache fallback: %s", content_cache_fail_reason);
         content_cache_fallback = true;
         return;
     }
@@ -1827,19 +2535,76 @@ static void content_request_palette_cache_build(void)
     }
 
     if (content_cache_task == NULL) {
-        BaseType_t ok = xTaskCreatePinnedToCore(
-            content_cache_task_fn, "pd_palcache", 12288, NULL,
-            tskIDLE_PRIORITY + 1, &content_cache_task, 1);
-        if (ok != pdPASS) {
-            ESP_LOGW(TAG, "palette cache task create failed — staying on truecolor path");
-            content_cache_task = NULL;
-            content_cache_fallback = true;
-            return;
-        }
+        /* Must be created in pd_content_init (before BLE). By first play,
+         * internal heap is often <4 KiB and a late create always fails. */
+        snprintf(content_cache_fail_reason, sizeof(content_cache_fail_reason),
+                 "task missing (init failed)");
+        content_log_line("palette cache fallback: %s int_free=%u",
+                         content_cache_fail_reason,
+                         (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
+        content_cache_fallback = true;
+        return;
     }
     content_cache_building = true;
-    content_cache_req_epoch = content_epoch;
-    xTaskNotifyGive(content_cache_task);
+    content_cache_fallback = false;
+    content_cache_notify(PD_PALCACHE_JOB_CONTENT);
+}
+
+#if PD_CONTENT_COMPOSITING_ENABLED
+static void content_request_overlay_cache_build(void)
+{
+    if (!content_config.auto_quantize_palette || !overlay_is_seq ||
+        overlay_total_frames <= 0 || overlay_base_path[0] == '\0') {
+        return;
+    }
+    if (content_overlay_cache_active && content_overlay_cache_active->live &&
+        strcmp(content_overlay_cache_active->seq_path, overlay_base_path) == 0 &&
+        content_overlay_cache_active->frame_count == overlay_total_frames &&
+        content_overlay_cache_active->frame_start == overlay_frame_start &&
+        content_overlay_cache_active->pattern_hash == content_overlay_pattern_hash) {
+        return;
+    }
+    if (content_cache_task == NULL) {
+        content_log_line("overlay cache fallback: task missing");
+        return;
+    }
+    /* Defer if content cache is still building — content_cache_run_content
+     * will re-request when it finishes. */
+    if (content_cache_building) return;
+
+    content_overlay_cache_building = true;
+    content_cache_notify(PD_PALCACHE_JOB_OVERLAY);
+}
+#endif /* PD_CONTENT_COMPOSITING_ENABLED */
+
+/* Static TCB/stack so the worker still exists after WiFi/BLE fragment the
+ * internal heap (late xTaskCreate was failing with int_free≈3 KiB). Stack
+ * stays in internal DRAM — LittleFS/lodepng are not safe on a PSRAM stack. */
+#define PD_PALCACHE_STACK_BYTES 16384
+static StackType_t s_palcache_stack[PD_PALCACHE_STACK_BYTES / sizeof(StackType_t)];
+static StaticTask_t s_palcache_tcb;
+
+static bool content_palcache_ensure_task(void)
+{
+    if (content_cache_task != NULL) {
+        eTaskState st = eTaskGetState(content_cache_task);
+        if (st != eDeleted) {
+            return true;
+        }
+        content_cache_task = NULL;
+    }
+    content_cache_task = xTaskCreateStaticPinnedToCore(
+        content_cache_task_fn, "pd_palcache",
+        PD_PALCACHE_STACK_BYTES / sizeof(StackType_t),
+        NULL, tskIDLE_PRIORITY + 1,
+        s_palcache_stack, &s_palcache_tcb, 1);
+    if (content_cache_task == NULL) {
+        ESP_LOGW(TAG, "palette cache static task create failed");
+        return false;
+    }
+    ESP_LOGI(TAG, "palette cache task ready (static %d bytes stack)",
+             PD_PALCACHE_STACK_BYTES);
+    return true;
 }
 
 /* ---- public API ---- */
@@ -1892,7 +2657,16 @@ esp_err_t pd_content_init(const char *base_path)
         ESP_LOGW(TAG, "play worker unavailable at init — first play may fail under BLE");
     }
 
-    ESP_LOGI(TAG, "content initialized at %s", content_base);
+    /* Same for palette-cache worker: must exist before pd_ble_start(). */
+    if (!content_palcache_ensure_task()) {
+        ESP_LOGW(TAG, "palette cache worker unavailable — sequences stay on truecolor path");
+    }
+
+#if PD_CONTENT_COMPOSITING_ENABLED
+    ESP_LOGI(TAG, "content initialized at %s (compositing on)", content_base);
+#else
+    ESP_LOGI(TAG, "content initialized at %s (compositing archived)", content_base);
+#endif
     return ESP_OK;
 }
 
@@ -1923,8 +2697,15 @@ int pd_content_list_images(pd_content_entry_t *entries, int max_entries)
             e->is_sequence = true;
             e->fps = 12;
             e->frame_count = 0;
-            load_sequence_meta(full, &e->fps, NULL, &e->frame_count, NULL, 0, NULL, NULL, 0, NULL, 0,
-                               NULL, NULL);
+            if (pd_sprite_scene_detect(full)) {
+                e->frame_count = pd_sprite_scene_count_slots(full);
+                e->fps = 24;
+                load_sequence_meta(full, &e->fps, NULL, NULL, NULL, 0, NULL, NULL, 0, NULL, 0,
+                                   NULL, NULL);
+            } else {
+                load_sequence_meta(full, &e->fps, NULL, &e->frame_count, NULL, 0, NULL, NULL, 0, NULL, 0,
+                                   NULL, NULL);
+            }
         } else if (is_png(ent->d_name)) {
             e->is_sequence = false;
             e->fps = 0;
@@ -1979,23 +2760,34 @@ static bool content_decode_first_frame(const char *full_path, pd_framebuf_t *fb)
 /* helper: set up playback state for a content path */
 static esp_err_t content_setup_playback(const char *path, const char *full)
 {
-    /* reset overlay animation state */
-    overlay_last_frame_us = 0;
     /* New content: re-clear margins if we enter bounds mode again. */
     content_sprite_invalidate();
+    content_is_sprite_scene = false;
+    content_sprite_pending_assembled = false;
+    pd_sprite_scene_unload();
 
-    /* restore global defaults before applying per-item settings */
-    if (strcmp(content_config.background, saved_background) != 0) {
-        strlcpy(content_config.background, saved_background, sizeof(content_config.background));
-        cached_bg_path[0] = '\0';  /* force cache refresh */
-    }
-    if (strcmp(content_config.overlay, saved_overlay) != 0) {
-        strlcpy(content_config.overlay, saved_overlay, sizeof(content_config.overlay));
-        cached_overlay_path[0] = '\0';  /* force cache refresh */
-        /* reset overlay sequence state when overlay changes */
-        overlay_is_seq = false;
-        overlay_total_frames = 0;
-        overlay_frame = 0;
+    /* Always start from persisted global defaults, then apply per-item
+     * overrides. Fully reset compositing caches so a previous item's
+     * animated overlay (e.g. lizard leaves) cannot leak onto the next play. */
+    strlcpy(content_config.background, saved_background, sizeof(content_config.background));
+    strlcpy(content_config.overlay, saved_overlay, sizeof(content_config.overlay));
+    content_reset_compositing_state();
+
+    if (path_is_dir(full) && pd_sprite_scene_detect(full)) {
+        strlcpy(content_current, full, sizeof(content_current));
+        content_is_seq = false;
+        content_is_sprite_scene = true;
+        content_fps = pd_sprite_scene_fps();
+        content_reset_achieved_fps();
+        content_loop = true;
+        content_total_frames = 0;
+        content_frame = 0;
+        content_last_frame_us = 0;
+        content_src_w = 0;
+        content_src_h = 0;
+        content_pattern_hash = 0;
+        content_log_line("play sprite-scene %s", path);
+        return ESP_OK;
     }
 
     if (path_is_dir(full)) {
@@ -2007,33 +2799,50 @@ static esp_err_t content_setup_playback(const char *path, const char *full)
         char item_bg[PD_CONTENT_MAX_PATH] = "";
         char item_ov[PD_CONTENT_MAX_PATH] = "";
         int meta_w = 0, meta_h = 0;
-        load_sequence_meta(full, &fps, &loop, &frames, pattern, sizeof(pattern), &start,
-                           item_bg, sizeof(item_bg), item_ov, sizeof(item_ov), &meta_w, &meta_h);
+        bool have_meta = load_sequence_meta(full, &fps, &loop, &frames, pattern, sizeof(pattern),
+                                            &start, item_bg, sizeof(item_bg), item_ov,
+                                            sizeof(item_ov), &meta_w, &meta_h);
+        if (!have_meta || frames <= 0) {
+            /* meta missing/corrupt, or frames omitted — discover from directory */
+            int disc_start = 1;
+            int disc_frames = 0;
+            char disc_pattern[64] = "%04d.png";
+            if (discover_sequence_from_dir(full, disc_pattern, sizeof(disc_pattern),
+                                           &disc_start, &disc_frames) &&
+                disc_frames > 0) {
+                if (!have_meta || pattern[0] == '\0' || strcmp(pattern, "%04d.png") == 0) {
+                    strlcpy(pattern, disc_pattern, sizeof(pattern));
+                    start = disc_start;
+                }
+                if (frames <= 0) frames = disc_frames;
+            }
+        }
 
         if (frames == 0) {
             ESP_LOGW(TAG, "no frames in %s", full);
             return ESP_ERR_NOT_FOUND;
         }
+        if (fps < 1 || fps > 120) fps = 12;
 
-        /* apply per-item background/overlay if specified */
+#if PD_CONTENT_COMPOSITING_ENABLED
+        /* apply per-item background/overlay if specified (play-time only) */
         if (item_bg[0] != '\0') {
             strlcpy(content_config.background, item_bg, sizeof(content_config.background));
-            cached_bg_path[0] = '\0';  /* force cache refresh */
         }
         if (item_ov[0] != '\0') {
             strlcpy(content_config.overlay, item_ov, sizeof(content_config.overlay));
-            cached_overlay_path[0] = '\0';  /* force cache refresh */
-            /* reset overlay sequence state when overlay changes */
-            overlay_is_seq = false;
-            overlay_total_frames = 0;
-            overlay_frame = 0;
         }
+#else
+        (void)item_bg;
+        (void)item_ov;
+#endif
 
         strlcpy(content_current, full, sizeof(content_current));
         strlcpy(content_frame_pattern, pattern, sizeof(content_frame_pattern));
         content_frame_start = start;
         content_is_seq = true;
         content_fps = fps > 0 ? fps : 12;
+        content_reset_achieved_fps();
         content_loop = loop;
         content_total_frames = frames;
         content_frame = start;
@@ -2043,8 +2852,7 @@ static esp_err_t content_setup_playback(const char *path, const char *full)
         content_pattern_hash = content_fnv1a(pattern);
         /* content_playing set by caller after setup complete */
 
-        ESP_LOGI(TAG, "playing sequence: %s (%d frames @ %d fps, pattern=%s, start=%d)",
-                 path, frames, fps, pattern, start);
+        content_log_line("play seq %s frames=%d fps=%d", path, frames, content_fps);
     } else if (path_exists(full) && is_png(full)) {
         strlcpy(content_current, full, sizeof(content_current));
         content_is_seq = false;
@@ -2124,6 +2932,25 @@ esp_err_t pd_content_play(const char *path)
         return err;
     }
 
+    if (content_is_sprite_scene) {
+        err = pd_sprite_scene_load(full);
+        if (err != ESP_OK) {
+            content_is_sprite_scene = false;
+            return err;
+        }
+        content_total_frames = pd_sprite_scene_max_frames();
+        content_fps = pd_sprite_scene_fps();
+        if (content_play_superseded()) {
+            pd_sprite_scene_unload();
+            content_is_sprite_scene = false;
+            content_playing = false;
+            return ESP_OK;
+        }
+        pd_sprite_scene_start_bump();
+        content_playing = true;
+        return ESP_OK;
+    }
+
     /* preload compositing cache before first frame */
     update_compositing_cache(pd_display_get_width(), pd_display_get_height());
 
@@ -2193,14 +3020,70 @@ esp_err_t pd_content_play_with_transition(const char *path, const char *transiti
         return pd_content_play(path);
     }
 
-    /* capture current display as "from" BEFORE changing anything */
+    bool dest_is_sprite = pd_sprite_scene_detect(full);
+
+    /* sprite-bump on a non-sprite destination → classic slide-left fallback. */
+    if (type == PD_TRANS_SPRITE_BUMP_LEFT && !dest_is_sprite) {
+        type = PD_TRANS_SLIDE_LEFT;
+    }
+
+    /* Capture frozen outgoing canvas before tearing down A.
+     * Sprite scenes never push through content_present_*; rasterize the
+     * live outgoing+slots into content_fb so from is panel-true Graphic A. */
+    if (pd_sprite_scene_active() && content_fb) {
+        if (pd_sprite_scene_capture_to(content_fb->data,
+                                       content_fb->width, content_fb->height)) {
+            content_fb_in_sync = true;
+            content_last_src_rgb = content_fb->data;
+            content_last_src_w = content_fb->width;
+            content_last_src_h = content_fb->height;
+        }
+    } else {
+        content_ensure_fb_current();
+    }
     pd_framebuf_copy(content_transition->from, content_fb);
+    int dw = pd_display_get_width();
+    int dh = pd_display_get_height();
+
+    /* ---- sprite-bump-left: content-side push, not full-FB ---- */
+    if (type == PD_TRANS_SPRITE_BUMP_LEFT) {
+        content_playing = false;
+        content_abort_active_transition();
+        content_invalidate_prefetch();
+        content_seq_cache_deactivate();
+        content_sprite_pending_assembled = false;
+        strlcpy(content_rel_path, path, sizeof(content_rel_path));
+
+        esp_err_t err = content_setup_playback(path, full);
+        if (err != ESP_OK) return err;
+
+        err = pd_sprite_scene_load(full);
+        if (err != ESP_OK) {
+            content_is_sprite_scene = false;
+            return err;
+        }
+        content_total_frames = pd_sprite_scene_max_frames();
+        content_fps = pd_sprite_scene_fps();
+        if (content_play_superseded()) {
+            pd_sprite_scene_unload();
+            content_is_sprite_scene = false;
+            content_playing = false;
+            return ESP_OK;
+        }
+        /* Outgoing = frozen full canvas of A (destination-owned bump). */
+        (void)pd_sprite_scene_set_outgoing(content_transition->from->data, dw, dh, 0, 0);
+        pd_sprite_scene_start_bump();
+        content_playing = true;
+        content_log_line("play sprite-bump-left %s (push outgoing)", path);
+        return ESP_OK;
+    }
 
     /* stop current playback so tick() won't interfere */
     content_playing = false;
     content_abort_active_transition();
     content_invalidate_prefetch();
     content_seq_cache_deactivate();
+    content_sprite_pending_assembled = false;
     strlcpy(content_rel_path, path, sizeof(content_rel_path));
 
     /* set up playback state (applies per-item bg/overlay) */
@@ -2209,8 +3092,35 @@ esp_err_t pd_content_play_with_transition(const char *path, const char *transiti
         return err;
     }
 
+    if (content_is_sprite_scene) {
+        /* Classic FB into a sprite scene: rasterize centered final stack → to. */
+        err = pd_sprite_scene_load(full);
+        if (err != ESP_OK) {
+            content_is_sprite_scene = false;
+            return err;
+        }
+        content_total_frames = pd_sprite_scene_max_frames();
+        content_fps = pd_sprite_scene_fps();
+        if (content_play_superseded()) {
+            pd_sprite_scene_unload();
+            content_is_sprite_scene = false;
+            content_playing = false;
+            return ESP_OK;
+        }
+        if (!pd_sprite_scene_rasterize_stack(content_transition->to->data, dw, dh)) {
+            pd_sprite_scene_unload();
+            content_is_sprite_scene = false;
+            return ESP_ERR_NO_MEM;
+        }
+        content_sprite_pending_assembled = true;
+        pd_transition_start(content_transition, type, duration_ms);
+        content_playing = true;
+        content_log_line("play classic→sprite %s via %s", path, transition);
+        return ESP_OK;
+    }
+
     /* preload compositing cache for new content */
-    update_compositing_cache(pd_display_get_width(), pd_display_get_height());
+    update_compositing_cache(dw, dh);
 
     /* decode new content into "to" on the truecolor path; palette cache
      * builds in the background and tick will switch when ready. */
@@ -2241,11 +3151,20 @@ esp_err_t pd_content_stop(void)
     content_playing = false;
     content_invalidate_prefetch();
     content_seq_cache_deactivate();
+    pd_sprite_scene_unload();
+    content_is_sprite_scene = false;
+    content_sprite_pending_assembled = false;
     content_current[0] = '\0';
     content_rel_path[0] = '\0';
     content_sprite_invalidate();
+    content_reset_achieved_fps();
+    /* Drop play-time compositing overrides so Stop doesn't leave lizard
+     * leaves/bg armed for the next unrelated play or config save. */
+    strlcpy(content_config.background, saved_background, sizeof(content_config.background));
+    strlcpy(content_config.overlay, saved_overlay, sizeof(content_config.overlay));
+    content_reset_compositing_state();
     pd_display_clear();
-    ESP_LOGI(TAG, "playback stopped");
+    content_log_line("stop");
     return ESP_OK;
 }
 
@@ -2254,7 +3173,7 @@ pd_content_status_t pd_content_get_status(void)
     pd_content_status_t s = {0};
     s.playing = content_playing;
     strlcpy(s.cache, "off", sizeof(s.cache));
-    if (content_config.auto_quantize_palette && content_is_seq) {
+    if (content_playing && content_config.auto_quantize_palette && content_is_seq) {
         if (content_seq_cache_active && content_seq_cache_active->live) {
             strlcpy(s.cache, "live", sizeof(s.cache));
         } else if (content_cache_building) {
@@ -2272,12 +3191,32 @@ pd_content_status_t pd_content_get_status(void)
         } else {
             strlcpy(s.current_path, content_current, sizeof(s.current_path));
         }
-        s.is_sequence = content_is_seq;
+        s.is_sequence = content_is_seq || content_is_sprite_scene;
         s.current_frame = content_frame;
-        s.total_frames = content_total_frames;
-        s.fps = content_fps;
+        s.total_frames = content_is_sprite_scene
+            ? pd_sprite_scene_slot_count()
+            : content_total_frames;
+        /* Static images must not advertise leftover sequence fps/achieved. */
+        if (content_is_seq || content_is_sprite_scene) {
+            s.fps = content_fps;
+            s.achieved_fps = content_achieved_fps;
+        } else {
+            s.fps = 0;
+            s.achieved_fps = 0.0f;
+        }
     }
     return s;
+}
+
+/* Achieved-FPS window state — file-scope so play/stop/set_meta can reset it. */
+static int content_fps_frames_since_log = 0;
+static int64_t content_fps_window_start_us = 0;
+
+static void content_reset_achieved_fps(void)
+{
+    content_achieved_fps = 0.0f;
+    content_fps_frames_since_log = 0;
+    content_fps_window_start_us = 0;
 }
 
 /* Lightweight achieved-FPS diagnostic: logs actual rendered frame rate once
@@ -2286,21 +3225,50 @@ pd_content_status_t pd_content_get_status(void)
  * counter increment per frame, one log per second). */
 static void pd_content_note_frame_rendered(int64_t now_us)
 {
-    static int frames_since_log = 0;
-    static int64_t fps_window_start_us = 0;
-
-    if (fps_window_start_us == 0) {
-        fps_window_start_us = now_us;
+    if (content_fps_window_start_us == 0) {
+        content_fps_window_start_us = now_us;
     }
-    frames_since_log++;
+    content_fps_frames_since_log++;
 
-    int64_t elapsed = now_us - fps_window_start_us;
+    int64_t elapsed = now_us - content_fps_window_start_us;
     if (elapsed >= 1000000) {
-        double achieved_fps = frames_since_log * 1000000.0 / (double)elapsed;
-        ESP_LOGI(TAG, "playback: achieved %.1f fps (target %d fps)", achieved_fps, content_fps);
-        frames_since_log = 0;
-        fps_window_start_us = now_us;
+        content_achieved_fps = (float)(content_fps_frames_since_log * 1000000.0 / (double)elapsed);
+        ESP_LOGI(TAG, "playback: achieved %.1f fps (target %d fps)",
+                 (double)content_achieved_fps, content_fps);
+        content_fps_frames_since_log = 0;
+        content_fps_window_start_us = now_us;
     }
+}
+
+int pd_content_ms_until_next_frame(void)
+{
+    if (!content_playing) {
+        return -1;
+    }
+    if (content_is_sprite_scene) {
+        return pd_sprite_scene_ms_until_next();
+    }
+    if (!content_is_seq) {
+        return -1;
+    }
+    /* Transitions drive their own cadence; don't pad the main loop. */
+    if (content_transition && pd_transition_is_active(content_transition)) {
+        return 0;
+    }
+    if (content_last_frame_us == 0) {
+        return 0;
+    }
+    int fps = content_fps > 0 ? content_fps : 24;
+    if (fps < 1) fps = 1;
+    int64_t interval = 1000000 / fps;
+    int64_t now = esp_timer_get_time();
+    int64_t due = content_last_frame_us + interval;
+    if (now >= due) {
+        return 0;
+    }
+    int64_t remain_ms = (due - now + 999) / 1000;
+    if (remain_ms > 10) remain_ms = 10;
+    return (int)remain_ms;
 }
 
 void pd_content_tick(void)
@@ -2334,29 +3302,42 @@ void pd_content_tick(void)
         /* fall through to normal tick (no-op since not playing) */
     }
 
-    /* drive active transition — always full-canvas */
+    /* drive active transition — always full-canvas; frames frozen */
     if (content_transition && pd_transition_is_active(content_transition)) {
         content_sprite_invalidate();
         bool still_going = pd_transition_tick(content_transition);
         pd_display_render_framebuf(content_transition->out->data);
         if (!still_going) {
-            /* transition finished — update content_fb to final state */
             pd_framebuf_copy(content_fb, content_transition->to);
+            if (content_is_sprite_scene && content_sprite_pending_assembled) {
+                content_sprite_pending_assembled = false;
+                pd_sprite_scene_enter_assembled();
+            }
         }
         return;  /* don't advance sequence frames during transition */
     }
 
     if (!content_playing) return;
 
+    if (content_is_sprite_scene) {
+        if (pd_sprite_scene_tick(now)) {
+            pd_content_note_frame_rendered(now);
+        }
+        return;
+    }
+
     /* use content fps for timing, default 24 for static content */
     int effective_fps = content_is_seq ? content_fps : 24;
     int64_t frame_interval = 1000000 / effective_fps;
 
-    /* advance animated overlay at content fps */
+#if PD_CONTENT_COMPOSITING_ENABLED
+    /* advance animated overlay on its own fps (from overlay meta.json) */
     if (overlay_is_seq && overlay_total_frames > 0) {
+        int ov_fps = overlay_fps > 0 ? overlay_fps : effective_fps;
+        int64_t ov_interval = 1000000 / ov_fps;
         if (overlay_last_frame_us == 0) {
             overlay_last_frame_us = now;
-        } else if ((now - overlay_last_frame_us) >= frame_interval) {
+        } else if ((now - overlay_last_frame_us) >= ov_interval) {
             overlay_last_frame_us = now;
             int next_ov = overlay_frame + 1;
             int last_ov = overlay_frame_start + overlay_total_frames - 1;
@@ -2376,10 +3357,14 @@ void pd_content_tick(void)
             }
         }
     }
+#endif /* PD_CONTENT_COMPOSITING_ENABLED */
 
     if (!content_is_seq) return;
 
-    /* sequence frame timing (frame_interval already computed above) */
+    /* sequence frame timing (frame_interval already computed above).
+     * Advance the schedule by one interval (not wall-clock now) so a slow
+     * decode does not permanently stretch subsequent gaps — and so a target
+     * of 4fps cannot collapse toward the decode-limited ~12fps cadence. */
     if (content_last_frame_us == 0) {
         content_last_frame_us = now;
         return;
@@ -2387,7 +3372,11 @@ void pd_content_tick(void)
 
     if ((now - content_last_frame_us) < frame_interval) return;
 
-    content_last_frame_us = now;
+    content_last_frame_us += frame_interval;
+    /* If we fell more than one frame behind, resync to now so we don't burst. */
+    if ((now - content_last_frame_us) > frame_interval) {
+        content_last_frame_us = now;
+    }
     int next = content_frame + 1;
 
     int last_frame = content_frame_start + content_total_frames - 1;
@@ -2402,10 +3391,34 @@ void pd_content_tick(void)
     bool displayed = false;
 
     /* Palette-cache fast path: expand pre-quantized indices from PSRAM.
-     * No PNG decode, no prefetch — this is the whole point of the setting.
-     * Present (bounds or full) happens inside expand. */
-    if (content_seq_cache_active && content_seq_cache_active->live && content_fb) {
-        content_seq_cache_expand_to_fb(next);
+     * Ping-pong: present front while the cache worker expands lookahead
+     * into the back buffer (overlaps with blocking draw_pixels). */
+    if (content_seq_cache_active && content_seq_cache_active->live) {
+        pd_seq_cache_slot_t *slot = content_seq_cache_active;
+        int last_fr = content_frame_start + content_total_frames - 1;
+        int lookahead = next + 1;
+        if (lookahead > last_fr) {
+            lookahead = content_loop ? content_frame_start : -1;
+        }
+
+        if (content_pal_ensure_rgb_bufs(slot->width, slot->height)) {
+            if (s_pal_back_ready && s_pal_ready_frame == next) {
+                s_pal_front = 1 - s_pal_front;
+                s_pal_back_ready = false;
+                s_pal_ready_frame = -1;
+            } else if (!content_pal_expand_frame_to_rgb(slot, next, s_pal_rgb[s_pal_front])) {
+                content_seq_cache_expand_to_fb(next);
+                content_frame = next;
+                pd_content_note_frame_rendered(now);
+                return;
+            }
+            content_present_source_rgb(s_pal_rgb[s_pal_front], slot->width, slot->height);
+            if (lookahead >= 0) {
+                content_request_pal_expand(lookahead);
+            }
+        } else {
+            content_seq_cache_expand_to_fb(next);
+        }
         content_frame = next;
         pd_content_note_frame_rendered(now);
         return;
@@ -2615,51 +3628,107 @@ esp_err_t pd_content_upload_finish(void)
 
 /* Recursively remove all files/subdirectories under `dir_path`, then the
  * directory itself. Used for deleting sequence content (a directory of
- * numbered frames + meta.json) from a single delete call. */
+ * numbered frames + meta.json) from a single delete call.
+ *
+ * Important constraints:
+ *  - LittleFS can skip/fail if we unlink while iterating readdir — so close
+ *    the DIR before each unlink.
+ *  - httpd task stack is only ~8KB; never put large name tables on stack
+ *    (pac-ghost has 100+ frames). Delete one entry per open/close pass.
+ */
 static esp_err_t remove_dir_recursive(const char *dir_path)
 {
-    DIR *d = opendir(dir_path);
-    if (!d) {
-        ESP_LOGW(TAG, "cannot open dir %s: %s", dir_path, strerror(errno));
-        return ESP_FAIL;
-    }
+    for (;;) {
+        DIR *d = opendir(dir_path);
+        if (!d) {
+            ESP_LOGW(TAG, "cannot open dir %s: %s", dir_path, strerror(errno));
+            return ESP_FAIL;
+        }
 
-    struct dirent *ent;
-    esp_err_t result = ESP_OK;
-    while ((ent = readdir(d)) != NULL) {
-        if (ent->d_name[0] == '.') continue;
+        char name[64] = "";
+        struct dirent *ent;
+        while ((ent = readdir(d)) != NULL) {
+            /* Skip only . and .. — keep hidden sidecar files like .pd_palcache
+             * so rmdir can succeed after the directory is emptied. */
+            if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0) {
+                continue;
+            }
+            strlcpy(name, ent->d_name, sizeof(name));
+            break;
+        }
+        closedir(d);
+
+        if (name[0] == '\0') {
+            break; /* empty */
+        }
 
         char child[PD_CONTENT_MAX_PATH];
-        snprintf(child, sizeof(child), "%s/%s", dir_path, ent->d_name);
+        snprintf(child, sizeof(child), "%s/%s", dir_path, name);
 
         if (path_is_dir(child)) {
-            if (remove_dir_recursive(child) != ESP_OK) result = ESP_FAIL;
+            if (remove_dir_recursive(child) != ESP_OK) {
+                return ESP_FAIL;
+            }
         } else if (remove(child) != 0) {
             ESP_LOGW(TAG, "cannot delete %s: %s", child, strerror(errno));
-            result = ESP_FAIL;
+            return ESP_FAIL;
         }
     }
-    closedir(d);
 
     if (rmdir(dir_path) != 0) {
         ESP_LOGW(TAG, "cannot rmdir %s: %s", dir_path, strerror(errno));
-        result = ESP_FAIL;
+        return ESP_FAIL;
     }
-    return result;
+    return ESP_OK;
+}
+
+static bool content_rel_path_ok(const char *rel)
+{
+    if (!rel || !rel[0]) return false;
+    if (rel[0] == '/' || rel[0] == '\\') return false;
+    if (strstr(rel, "..") != NULL) return false;
+    if (strchr(rel, '\\') != NULL) return false;
+    return true;
 }
 
 esp_err_t pd_content_delete_file(const char *rel_path)
 {
+    if (!content_rel_path_ok(rel_path)) return ESP_ERR_INVALID_ARG;
+
     char full[PD_CONTENT_MAX_PATH];
     snprintf(full, sizeof(full), "%s/%s", content_base, rel_path);
 
-    /* if this is the content currently playing, stop first so we don't
-     * leave a dangling reference to a path that's about to disappear */
+    /* Stop if this path is current (full or relative match). Also stop when
+     * deleting a parent directory of the playing path. */
+    bool playing_this = false;
     if (content_current[0] && strcmp(content_current, full) == 0) {
+        playing_this = true;
+    } else if (content_rel_path[0] && strcmp(content_rel_path, rel_path) == 0) {
+        playing_this = true;
+    } else if (content_current[0] && path_is_dir(full)) {
+        size_t n = strlen(full);
+        if (strncmp(content_current, full, n) == 0 &&
+            (content_current[n] == '/' || content_current[n] == '\0')) {
+            playing_this = true;
+        }
+    }
+    if (playing_this) {
         pd_content_stop();
     }
 
     static_rgb_cache_invalidate(rel_path);
+    content_invalidate_prefetch();
+    content_seq_cache_deactivate();
+
+    /* Wait briefly for an in-flight PNG decode to finish so LittleFS unlinks
+     * are not racing an open file on another core. */
+    for (int i = 0; i < 40 && content_decode_busy; i++) {
+        vTaskDelay(pdMS_TO_TICKS(25));
+    }
+
+    if (!path_exists(full) && !path_is_dir(full)) {
+        return ESP_ERR_NOT_FOUND;
+    }
 
     esp_err_t err;
     if (path_is_dir(full)) {
@@ -2675,6 +3744,113 @@ esp_err_t pd_content_delete_file(const char *rel_path)
         ESP_LOGI(TAG, "deleted %s", rel_path);
     }
     return err;
+}
+
+esp_err_t pd_content_rename(const char *from_rel, const char *to_rel)
+{
+    if (!content_rel_path_ok(from_rel) || !content_rel_path_ok(to_rel)) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (strcmp(from_rel, to_rel) == 0) return ESP_OK;
+
+    char from_full[PD_CONTENT_MAX_PATH];
+    char to_full[PD_CONTENT_MAX_PATH];
+    snprintf(from_full, sizeof(from_full), "%s/%s", content_base, from_rel);
+    snprintf(to_full, sizeof(to_full), "%s/%s", content_base, to_rel);
+
+    struct stat st;
+    if (stat(from_full, &st) != 0) {
+        return ESP_ERR_NOT_FOUND;
+    }
+    if (stat(to_full, &st) == 0) {
+        return ESP_ERR_INVALID_STATE; /* destination exists */
+    }
+
+    if (content_current[0] && strcmp(content_current, from_full) == 0) {
+        pd_content_stop();
+    }
+
+    ensure_parent_dirs(to_full);
+    if (rename(from_full, to_full) != 0) {
+        ESP_LOGW(TAG, "rename %s -> %s failed: %s", from_rel, to_rel, strerror(errno));
+        return ESP_FAIL;
+    }
+
+    static_rgb_cache_invalidate(from_rel);
+    static_rgb_cache_invalidate(to_rel);
+    ESP_LOGI(TAG, "renamed %s -> %s", from_rel, to_rel);
+    return ESP_OK;
+}
+
+esp_err_t pd_content_set_sequence_fps(const char *rel_path, int fps)
+{
+    if (!content_rel_path_ok(rel_path)) return ESP_ERR_INVALID_ARG;
+    if (fps < 1 || fps > 120) return ESP_ERR_INVALID_ARG;
+
+    char dir_full[PD_CONTENT_MAX_PATH];
+    snprintf(dir_full, sizeof(dir_full), "%s/%s", content_base, rel_path);
+    if (!path_is_dir(dir_full)) {
+        return ESP_ERR_NOT_FOUND;
+    }
+
+    char meta_path[PD_CONTENT_MAX_PATH];
+    snprintf(meta_path, sizeof(meta_path), "%s/meta.json", dir_full);
+
+    cJSON *root = NULL;
+    FILE *f = fopen(meta_path, "r");
+    if (f) {
+        fseek(f, 0, SEEK_END);
+        long sz = ftell(f);
+        rewind(f);
+        if (sz > 0 && sz <= 4096) {
+            char *buf = calloc(1, (size_t)sz + 1);
+            if (buf) {
+                fread(buf, 1, (size_t)sz, f);
+                root = cJSON_Parse(buf);
+                free(buf);
+            }
+        }
+        fclose(f);
+    }
+    if (!root) {
+        root = cJSON_CreateObject();
+    }
+    if (!root) return ESP_ERR_NO_MEM;
+
+    cJSON_DeleteItemFromObject(root, "fps");
+    cJSON_AddNumberToObject(root, "fps", fps);
+
+    char *json = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
+    if (!json) return ESP_ERR_NO_MEM;
+
+    f = fopen(meta_path, "w");
+    if (!f) {
+        free(json);
+        ESP_LOGW(TAG, "cannot write %s: %s", meta_path, strerror(errno));
+        return ESP_FAIL;
+    }
+    fputs(json, f);
+    fclose(f);
+    free(json);
+
+    /* If this sequence is currently playing, update live fps and reset the
+     * frame timer so the new interval applies on the next tick. */
+    bool playing_this =
+        content_is_seq &&
+        ((content_current[0] && strcmp(content_current, dir_full) == 0) ||
+         (content_rel_path[0] && strcmp(content_rel_path, rel_path) == 0));
+    if (playing_this) {
+        content_fps = fps;
+        content_last_frame_us = 0;
+        overlay_last_frame_us = 0;
+        content_reset_achieved_fps();
+        content_log_line("set_meta live fps=%d path=%s", fps, rel_path);
+    } else {
+        content_log_line("set_meta fps=%d path=%s", fps, rel_path);
+    }
+
+    return ESP_OK;
 }
 
 /* ---- HTTP handlers ---- */
@@ -2941,7 +4117,35 @@ static esp_err_t http_content_status(httpd_req_t *req)
         cJSON_AddBoolToObject(root, "sequence", s.is_sequence);
         cJSON_AddNumberToObject(root, "frame", s.current_frame);
         cJSON_AddNumberToObject(root, "total_frames", s.total_frames);
-        cJSON_AddNumberToObject(root, "fps", s.fps);
+        if (s.is_sequence) {
+            cJSON_AddNumberToObject(root, "fps", s.fps);
+            if (s.achieved_fps > 0.05f) {
+                cJSON_AddNumberToObject(root, "achieved_fps", s.achieved_fps);
+            }
+        }
+        if (s.is_sequence && content_cache_fallback && content_cache_fail_reason[0]) {
+            cJSON_AddStringToObject(root, "cache_reason", content_cache_fail_reason);
+        }
+    }
+    char *json = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, json, HTTPD_RESP_USE_STRLEN);
+    free(json);
+    return ESP_OK;
+}
+
+static esp_err_t http_content_log(httpd_req_t *req)
+{
+    cJSON *root = cJSON_CreateObject();
+    cJSON *arr = cJSON_AddArrayToObject(root, "lines");
+    int start = (content_log_head - content_log_count + PD_CONTENT_LOG_LINES) % PD_CONTENT_LOG_LINES;
+    for (int i = 0; i < content_log_count; i++) {
+        int idx = (start + i) % PD_CONTENT_LOG_LINES;
+        cJSON_AddItemToArray(arr, cJSON_CreateString(content_log_lines[idx]));
+    }
+    if (content_cache_fail_reason[0]) {
+        cJSON_AddStringToObject(root, "cache_reason", content_cache_fail_reason);
     }
     char *json = cJSON_PrintUnformatted(root);
     cJSON_Delete(root);
@@ -2966,9 +4170,11 @@ static esp_err_t http_config_get(httpd_req_t *req)
     cJSON *disp = cJSON_AddObjectToObject(root, "display");
     cJSON_AddNumberToObject(disp, "hold_ms", content_config.hold_ms);
     cJSON_AddBoolToObject(disp, "loop_sequences", content_config.loop_sequences);
-    cJSON_AddStringToObject(disp, "background", content_config.background);
-    cJSON_AddStringToObject(disp, "overlay", content_config.overlay);
+    /* Report persisted globals, not the active play-time composite override. */
+    cJSON_AddStringToObject(disp, "background", saved_background);
+    cJSON_AddStringToObject(disp, "overlay", saved_overlay);
     cJSON_AddBoolToObject(disp, "auto_quantize_palette", content_config.auto_quantize_palette);
+    cJSON_AddBoolToObject(disp, "show_fps_counter", content_config.show_fps_counter);
 
     cJSON *attr = cJSON_AddObjectToObject(root, "attract");
     cJSON_AddBoolToObject(attr, "enabled", content_config.attract_enabled);
@@ -3044,6 +4250,9 @@ static esp_err_t http_config_set(httpd_req_t *req)
         cJSON *aq = cJSON_GetObjectItem(disp, "auto_quantize_palette");
         if (cJSON_IsBool(aq))
             content_config.auto_quantize_palette = cJSON_IsTrue(aq);
+        cJSON *sfc = cJSON_GetObjectItem(disp, "show_fps_counter");
+        if (cJSON_IsBool(sfc))
+            content_config.show_fps_counter = cJSON_IsTrue(sfc);
     }
 
     cJSON *attr = cJSON_GetObjectItem(root, "attract");
@@ -3097,6 +4306,32 @@ static esp_err_t http_config_set(httpd_req_t *req)
     return ESP_OK;
 }
 
+/* Minimal %XX decoder so ?path=images%2Ffoo.png works. ESP's
+ * httpd_query_key_value does not turn %2F back into '/'. */
+static void url_decode_inplace(char *s)
+{
+    char *src = s;
+    char *dst = s;
+    while (*src) {
+        if (src[0] == '%' && src[1] && src[2]) {
+            char hex[3] = { src[1], src[2], 0 };
+            char *end = NULL;
+            long v = strtol(hex, &end, 16);
+            if (end && end != hex) {
+                *dst++ = (char)v;
+                src += 3;
+                continue;
+            }
+        } else if (src[0] == '+') {
+            *dst++ = ' ';
+            src++;
+            continue;
+        }
+        *dst++ = *src++;
+    }
+    *dst = '\0';
+}
+
 static esp_err_t http_content_upload(httpd_req_t *req)
 {
     /* path comes from query string: ?path=images/foo.png */
@@ -3105,6 +4340,7 @@ static esp_err_t http_content_upload(httpd_req_t *req)
 
     if (httpd_req_get_url_query_str(req, query, sizeof(query)) == ESP_OK) {
         httpd_query_key_value(query, "path", rel_path, sizeof(rel_path));
+        url_decode_inplace(rel_path);
     }
 
     if (rel_path[0] == '\0') {
@@ -3276,21 +4512,118 @@ static esp_err_t http_ota_update(httpd_req_t *req)
 
 static esp_err_t http_content_delete(httpd_req_t *req)
 {
-    /* path comes from query string: ?path=images/foo.png or images/some-seq */
-    char query[256] = "";
+    /* Prefer JSON body { "path": "images/foo.png" } (POST /api/content/delete).
+     * Fall back to ?path= for DELETE /api/content (with URL-decode). */
     char rel_path[PD_CONTENT_MAX_PATH] = "";
 
-    if (httpd_req_get_url_query_str(req, query, sizeof(query)) == ESP_OK) {
-        httpd_query_key_value(query, "path", rel_path, sizeof(rel_path));
+    if (req->method == HTTP_POST && req->content_len > 0 && req->content_len < 512) {
+        char buf[512];
+        int len = httpd_req_recv(req, buf, sizeof(buf) - 1);
+        if (len > 0) {
+            buf[len] = '\0';
+            cJSON *root = cJSON_Parse(buf);
+            if (root) {
+                cJSON *p = cJSON_GetObjectItem(root, "path");
+                if (cJSON_IsString(p) && p->valuestring) {
+                    strlcpy(rel_path, p->valuestring, sizeof(rel_path));
+                }
+                cJSON_Delete(root);
+            }
+        }
     }
 
     if (rel_path[0] == '\0') {
-        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "missing ?path=");
+        char query[256] = "";
+        if (httpd_req_get_url_query_str(req, query, sizeof(query)) == ESP_OK) {
+            httpd_query_key_value(query, "path", rel_path, sizeof(rel_path));
+            url_decode_inplace(rel_path);
+        }
+    }
+
+    if (rel_path[0] == '\0') {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "missing path");
         return ESP_FAIL;
     }
 
-    if (pd_content_delete_file(rel_path) != ESP_OK) {
-        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "delete failed");
+    esp_err_t err = pd_content_delete_file(rel_path);
+    if (err != ESP_OK) {
+        httpd_resp_send_err(req,
+            err == ESP_ERR_NOT_FOUND ? HTTPD_404_NOT_FOUND : HTTPD_500_INTERNAL_SERVER_ERROR,
+            "delete failed");
+        return ESP_FAIL;
+    }
+
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, "{\"ok\":true}", HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+}
+
+static esp_err_t http_content_rename(httpd_req_t *req)
+{
+    char buf[512];
+    int len = httpd_req_recv(req, buf, sizeof(buf) - 1);
+    if (len <= 0) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "missing body");
+        return ESP_FAIL;
+    }
+    buf[len] = '\0';
+
+    cJSON *root = cJSON_Parse(buf);
+    if (!root) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "invalid JSON");
+        return ESP_FAIL;
+    }
+    cJSON *from = cJSON_GetObjectItem(root, "from");
+    cJSON *to = cJSON_GetObjectItem(root, "to");
+    if (!cJSON_IsString(from) || !cJSON_IsString(to)) {
+        cJSON_Delete(root);
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "from/to required");
+        return ESP_FAIL;
+    }
+
+    esp_err_t err = pd_content_rename(from->valuestring, to->valuestring);
+    cJSON_Delete(root);
+    if (err != ESP_OK) {
+        httpd_resp_send_err(req,
+            err == ESP_ERR_NOT_FOUND ? HTTPD_404_NOT_FOUND : HTTPD_500_INTERNAL_SERVER_ERROR,
+            "rename failed");
+        return ESP_FAIL;
+    }
+
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, "{\"ok\":true}", HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+}
+
+static esp_err_t http_content_set_meta(httpd_req_t *req)
+{
+    char buf[512];
+    int len = httpd_req_recv(req, buf, sizeof(buf) - 1);
+    if (len <= 0) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "missing body");
+        return ESP_FAIL;
+    }
+    buf[len] = '\0';
+
+    cJSON *root = cJSON_Parse(buf);
+    if (!root) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "invalid JSON");
+        return ESP_FAIL;
+    }
+    cJSON *path = cJSON_GetObjectItem(root, "path");
+    cJSON *fps = cJSON_GetObjectItem(root, "fps");
+    if (!cJSON_IsString(path) || !cJSON_IsNumber(fps)) {
+        cJSON_Delete(root);
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "path and fps required");
+        return ESP_FAIL;
+    }
+
+    esp_err_t err = pd_content_set_sequence_fps(path->valuestring, fps->valueint);
+    cJSON_Delete(root);
+    if (err != ESP_OK) {
+        httpd_resp_send_err(req,
+            err == ESP_ERR_NOT_FOUND ? HTTPD_404_NOT_FOUND : HTTPD_400_BAD_REQUEST,
+            "set meta failed");
         return ESP_FAIL;
     }
 
@@ -3571,6 +4904,11 @@ esp_err_t pd_content_register_http(httpd_handle_t server)
         .method = HTTP_GET,
         .handler = http_content_status
     };
+    httpd_uri_t log_uri = {
+        .uri = "/api/log",
+        .method = HTTP_GET,
+        .handler = http_content_log
+    };
     httpd_uri_t status_show_uri = {
         .uri = "/api/status/show",
         .method = HTTP_POST,
@@ -3590,6 +4928,21 @@ esp_err_t pd_content_register_http(httpd_handle_t server)
         .uri = "/api/content",
         .method = HTTP_DELETE,
         .handler = http_content_delete
+    };
+    httpd_uri_t delete_post_uri = {
+        .uri = "/api/content/delete",
+        .method = HTTP_POST,
+        .handler = http_content_delete
+    };
+    httpd_uri_t rename_uri = {
+        .uri = "/api/content/rename",
+        .method = HTTP_POST,
+        .handler = http_content_rename
+    };
+    httpd_uri_t set_meta_uri = {
+        .uri = "/api/content/meta",
+        .method = HTTP_POST,
+        .handler = http_content_set_meta
     };
     httpd_uri_t config_get_uri = {
         .uri = "/api/config",
@@ -3636,10 +4989,14 @@ esp_err_t pd_content_register_http(httpd_handle_t server)
     httpd_register_uri_handler(server, &play_uri);
     httpd_register_uri_handler(server, &stop_uri);
     httpd_register_uri_handler(server, &status_uri);
+    httpd_register_uri_handler(server, &log_uri);
     httpd_register_uri_handler(server, &status_show_uri);
     httpd_register_uri_handler(server, &upload_uri);
     httpd_register_uri_handler(server, &ota_uri);
     httpd_register_uri_handler(server, &delete_uri);
+    httpd_register_uri_handler(server, &delete_post_uri);
+    httpd_register_uri_handler(server, &rename_uri);
+    httpd_register_uri_handler(server, &set_meta_uri);
     httpd_register_uri_handler(server, &config_get_uri);
     httpd_register_uri_handler(server, &config_set_uri);
     httpd_register_uri_handler(server, &layout_get_uri);

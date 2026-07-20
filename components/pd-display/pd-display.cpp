@@ -66,6 +66,21 @@ static uint8_t *pd_display_get_swap_scratch(size_t needed)
     return pd_display_swap_scratch;
 }
 
+/* Separate from swap scratch — indexed expand + GRB/BRG remaps must not share. */
+static uint8_t *pd_display_index_row = nullptr;
+static size_t pd_display_index_row_len = 0;
+
+static uint8_t *pd_display_get_index_row(size_t needed)
+{
+    if (pd_display_index_row_len < needed) {
+        uint8_t *grown = (uint8_t *)realloc(pd_display_index_row, needed);
+        if (!grown) return nullptr;
+        pd_display_index_row = grown;
+        pd_display_index_row_len = needed;
+    }
+    return pd_display_index_row;
+}
+
 /* Draw a tightly-packed w*h RGB888 buffer in one shot via the driver's bulk
  * draw_pixels() API instead of calling set_pixel() per pixel. set_pixel() is
  * documented by the driver itself as a convenience wrapper *around*
@@ -576,6 +591,52 @@ extern "C" void pd_display_render_rgb(const uint8_t *rgb, int img_w, int img_h)
     int ox = (img_w < dw) ? (dw - img_w) / 2 : 0;
     int oy = (img_h < dh) ? (dh - img_h) / 2 : 0;
     pd_display_render_rgb_at(ox, oy, rgb, img_w, img_h);
+}
+
+extern "C" void pd_display_render_indexed_at(int x, int y,
+                                             const uint8_t *indices, int img_w, int img_h,
+                                             const uint8_t palette[][4], int palette_size)
+{
+    if (!pd_display_driver || !indices || !palette || img_w <= 0 || img_h <= 0) return;
+    if (palette_size <= 0) return;
+
+    int dw = pd_display_current_width;
+    int dh = pd_display_current_height;
+    int src_x = 0;
+    int src_y = 0;
+    int blit_w = img_w;
+    int blit_h = img_h;
+    int dx = x;
+    int dy = y;
+
+    if (dx < 0) {
+        src_x = -dx;
+        blit_w += dx;
+        dx = 0;
+    }
+    if (dy < 0) {
+        src_y = -dy;
+        blit_h += dy;
+        dy = 0;
+    }
+    if (dx + blit_w > dw) blit_w = dw - dx;
+    if (dy + blit_h > dh) blit_h = dh - dy;
+    if (blit_w <= 0 || blit_h <= 0) return;
+
+    uint8_t *row = pd_display_get_index_row((size_t)blit_w * 3);
+    if (!row) return;
+
+    for (int r = 0; r < blit_h; r++) {
+        const uint8_t *src = indices + (size_t)(src_y + r) * (size_t)img_w + (size_t)src_x;
+        for (int c = 0; c < blit_w; c++) {
+            unsigned idx = src[c];
+            if ((int)idx >= palette_size) idx = (unsigned)(palette_size - 1);
+            row[c * 3 + 0] = palette[idx][0];
+            row[c * 3 + 1] = palette[idx][1];
+            row[c * 3 + 2] = palette[idx][2];
+        }
+        pd_display_draw_bulk_rgb888(dx, dy + r, blit_w, 1, row);
+    }
 }
 
 extern "C" void pd_display_render_framebuf(const uint8_t *rgb)

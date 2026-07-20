@@ -1,4 +1,4 @@
-# BLE Secondary Transport
+# BLE Transport
 
 Pixel Dumpster exposes a **Nordic UART Service (NUS)** GATT peripheral that
 carries the same newline-terminated JSON protocol used over USB serial
@@ -9,10 +9,14 @@ carries the same newline-terminated JSON protocol used over USB serial
 | Role | Transport |
 |------|-----------|
 | **Primary** | WiFi HTTP (`:8088`) when the device is on the LAN |
-| **Secondary** | Content upload/sync over BLE NDJSON (`upload_begin` / `upload_chunk` / `upload_end`) |
-| **Tertiary** | Generic HTTP/REST tunnel over BLE (not in this slice) |
+| **Fallback** | BLE NUS NDJSON — list / play / stop / status / upload / set_playback |
+| **Wired** | USB serial NDJSON (wizard session + same content commands) |
 
-SoftAP and automatic WiFi-failover are deferred. Full-frame draw remains first-class on WiFi.
+In `pd-control`, an explicit **Control via** preference wins when that link is
+connected; otherwise the order is **WiFi → BLE → USB**. SoftAP and a generic
+HTTP/REST tunnel over BLE are deferred. Full-frame draw remains first-class on
+WiFi; BLE is for control and content sync when the device is offline or mDNS
+is unavailable.
 
 ## UUIDs
 
@@ -36,46 +40,59 @@ allocations use PSRAM (`CONFIG_BT_NIMBLE_MEM_ALLOC_MODE_EXTERNAL`).
 Streaming content store lives in `pd_content_upload_*` and is driven by
 `pd-serial-cmd` so USB and BLE share one path.
 
-## Content upload (secondary)
+## NDJSON commands
 
-Host → device (one JSON object per line):
+One JSON object per line. Shared with USB via `pd-serial-cmd`.
 
-```json
-{"cmd":"upload_begin","path":"marquees/arcade/pacman.png","size":12345}
-{"cmd":"upload_chunk","data":"<base64>"}
-{"cmd":"upload_end"}
-```
+| Command | Request (host → device) | Typical response |
+|---------|-------------------------|------------------|
+| List | `{"cmd":"list"}` | `{"type":"list","items":[...]}` |
+| Play | `{"cmd":"play","path":"...","transition":"none","duration_ms":0}` | `{"type":"ack","cmd":"play","ok":true}` |
+| Stop | `{"cmd":"stop"}` | `{"type":"ack","cmd":"stop","ok":true}` |
+| Status | `{"cmd":"status"}` | `{"type":"status","playing":…,"path":…,"cache":…}` |
+| Playback opts | `{"cmd":"set_playback"}` (probe) or `{"cmd":"set_playback","auto_quantize_palette":true,"save":true}` | `{"type":"ack","cmd":"set_playback","ok":true,"auto_quantize_palette":…}` |
+| Upload begin | `{"cmd":"upload_begin","path":"images/foo.png","size":N}` | `{"type":"ack","cmd":"upload_begin","ok":true,…}` |
+| Upload chunk | `{"cmd":"upload_chunk","data":"<base64>"}` | `{"type":"ack","cmd":"upload_chunk","ok":true,"received":N}` |
+| Upload end | `{"cmd":"upload_end"}` | `{"type":"ack","cmd":"upload_end","ok":true,"size":N}` |
+| Upload abort | `{"cmd":"upload_abort"}` | `{"type":"ack","cmd":"upload_abort","ok":true}` |
 
-On error or cancel:
+`set_playback` with no fields acks the current `auto_quantize_palette` without
+changing it. With `"save":true`, the value is persisted to content config.
+Auto-quantize applies to **sequences only**; see [api.md](api.md).
 
-```json
-{"cmd":"upload_abort"}
-```
+Keep raw upload chunk size ~150 bytes so each NDJSON line stays under the
+wizard line buffer and typical ATT MTU. Max file size matches HTTP
+`/api/upload` (2 MiB).
 
-Acks:
-
-```json
-{"type":"ack","cmd":"upload_begin","ok":true,"path":"...","size":12345}
-{"type":"ack","cmd":"upload_chunk","ok":true,"received":N}
-{"type":"ack","cmd":"upload_end","ok":true,"size":12345}
-```
-
-Keep raw chunk size ~150 bytes so each NDJSON line stays under the wizard line
-buffer and typical ATT MTU. Max file size matches HTTP `/api/upload` (2 MiB).
+Wizard layout commands (`hello`, `nav`, `key`, …) use the same framing — see
+[wizard-protocol.md](wizard-protocol.md).
 
 ## Hosts
 
 ### pd-control
 
-Device Setup Wizard → **Bluetooth** → Scan → Connect. Uses the same wizard
-commands as USB. Tauri commands: `ble_scan`, `ble_connect`, `ble_send`,
-`ble_play`, `ble_stop`, `ble_status`.
+**Settings** (sidebar) holds connection cards: USB, Bluetooth, WiFi, plus Device
+Info, Layout, Playback, and Brightness (`#pd-card-*` anchors).
 
-Content UI (play / stop / status / list / upload) routes by live link state:
-**WiFi HTTP → BLE NDJSON → USB wizard session**. Dock icons mean an active
-session (BLE GATT connected, or USB wizard connected)—not merely that a serial
-port is present. `upload_content_to_device` accepts an optional `via` of
-`wifi` | `bluetooth` | `usb`.
+- **Bluetooth card** — Scan → Connect (Tauri: `ble_scan`, `ble_connect`,
+  `ble_send`, `ble_play`, `ble_stop`, `ble_status`, upload helpers).
+- **Transport dock** — icons jump to the matching Settings card; clicking a
+  *connected* transport also selects it as **Control via**.
+- **Control via picker** — on Content (and related views) chooses WiFi / BLE /
+  USB when multiple links are up.
+- **Content** — Upload PNG via native file dialog (≤ 2 MiB → `images/<filename>`
+  over the active control transport). Play/list/status/stop follow Control via.
+- **Launch Wizard** — Next/Back tour over Settings cards (not the firmware
+  panel wizard).
+- **Hardware panel wizard** — Panel Layout → “Configure panels over USB/BLE”
+  opens `WizardPanel` (firmware `pd-wizard` over USB or BLE).
+
+Content/control routing lives in `pd-control/src/lib/deviceControl.ts`. When
+BLE or USB is up without mDNS, the app restores a remembered device session so
+Content is usable offline.
+
+BLE status polling is slower (~15s) and gated while play/list/upload are busy,
+to reduce GATT contention.
 
 ### pd-ble-bridge + dumpster-diver
 

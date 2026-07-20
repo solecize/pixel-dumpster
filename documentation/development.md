@@ -8,36 +8,35 @@ The pixel-dumpster system is built around several core components:
 
 ### Core Components
 
-1. **Configuration**
-   - Manages persisted device settings (NVS + JSON config file)
-   - Validates configuration parameters
-   - Stores setup wizard results
+1. **Configuration** (`pd-config`)
+   - Persisted device settings (JSON on LittleFS / NVS)
+   - Setup wizard results, layout, WiFi identity
 
-2. **Display Driver**
-   - Abstracts HUB75 matrix output
-   - Handles rotation, buffering, and effects
+2. **Display Driver** (`pd-display`)
+   - HUB75 matrix output, rotation, buffering
 
-3. **Setup Wizard**
-   - First-run configuration flow
-   - USB keyboard input handling (ESP-IDF USB Host)
-   - Wi-Fi scanning and connection
+3. **Setup Wizard** (`pd-wizard`)
+   - Panel layout + WiFi setup over USB keyboard, USB serial, or BLE NUS
+   - Hosted primarily by `pd-control` WizardPanel
 
-4. **Artifact Storage**
-   - LittleFS-backed asset store
-   - Directory structure validation
-   - now.json state management
+4. **Content Engine** (`pd-content`)
+   - Play/list/upload/status over HTTP and NDJSON
+   - Transitions, still RGB cache, optional sequence palette cache
 
-5. **Notification + API Layer**
-   - UDP doorbell notifications
-   - HTTP API endpoints (esp_http_server)
-   - Polling backstop mechanism
+5. **Transports**
+   - `pd-network` — WiFi HTTP Content API + mDNS
+   - `pd-ble` — Nordic UART Service
+   - `pd-serial-cmd` — shared NDJSON commands on USB/BLE
+
+6. **Desktop / Pi hosts**
+   - `pd-control` — Content, Settings, Flash, Pi installer
+   - `dumpster-diver` — EmulationStation → device bridge
 
 ### Design Principles
 
-- **Artifacts are truth**: Display state derived from stored files
-- **Push is advisory**: Notifications suggest changes, files confirm
+- **Content API drives the display**: `/api/play` (and NDJSON `play`) are authoritative
+- **Multi-transport control**: WiFi preferred; BLE/USB when offline
 - **Controller-agnostic**: Works with any upstream system
-- **Frontend-agnostic**: No specific UI requirements
 - **Deterministic fallback**: Always shows something meaningful
 - **Minimal API surface**: Simple, focused endpoints
 
@@ -84,25 +83,25 @@ idf.py fullclean
 main/
 ├── app-main.c               # ESP-IDF application entry point
 
-partitions.csv               # Custom partition table (LittleFS)
+components/
+├── pd-content/              # Playback, HTTP Content API, caches
+├── pd-ble/                  # NimBLE NUS
+├── pd-serial-cmd/           # NDJSON play/list/upload/set_playback
+├── pd-wizard/               # Setup / panel wizard
+├── pd-network/              # WiFi, mDNS, legacy HTTP
+├── pd-display/              # HUB75 driver
+└── …                        # pd-config, pd-storage, pd-transition, …
 
-data/
-└── pd/                      # Default artifact structure
-    ├── now.json
-    ├── default.png
-    ├── system/
-    ├── game/
-    └── assets/
-
-examples/
-├── python-client.py        # Python client example
-├── node-client.js          # Node.js client example
-└── readme.md               # Client documentation
+pd-control/                  # Tauri desktop app
+tools/
+├── dumpster-diver.c
+└── pd-ble-bridge/
 
 documentation/
-├── pixel-dumpster.md       # Living project document
-├── development.md          # This file
-└── api.md                  # API reference
+├── api.md
+├── ble-transport.md
+├── dumpster-diver.md
+└── …
 ```
 
 ### Coding Standards
@@ -413,20 +412,24 @@ docs(api): update endpoint documentation
 
 ## Future Development
 
-### Planned Features
+### Shipped (no longer “planned”)
 
-- **PNG decoder** for better image support
-- **Animation system** for dynamic content
-- **Multiple display support**
-- **Cloud integration** for remote management
-- **Mobile app** for easy configuration
+- PNG decode + animated PNG sequences (`meta.json`)
+- Multi-transport control (WiFi / BLE / USB) and `pd-control` Settings
+- Content upload over HTTP and NDJSON
+- Optional sequence auto-quantize + static still cache
+
+### Still open / deferred
+
+- SoftAP and HTTP-over-BLE tunnel
+- Attract-mode runtime (`/api/attract/*`)
+- Sequence-folder upload UX in `pd-control`
+- Deeper capability matrix across WiFi vs BLE vs USB
 
 ### Technical Debt
 
-- **Refactor monolithic functions**
 - **Improve error handling**
 - **Add comprehensive tests**
-- **Update documentation**
 - **Optimize memory usage**
 
 ### Research Areas

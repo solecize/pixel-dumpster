@@ -340,7 +340,8 @@ static esp_err_t pd_network_start_http(void)
 
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.server_port = pd_network_config.http_port;
-    config.max_uri_handlers = 28;
+    /* Content API + legacy routes; leave headroom for rename/meta/etc. */
+    config.max_uri_handlers = 36;
     config.max_resp_headers = 8;
     /* OTA flash erase can stall WiFi for >10s; keep the socket alive. */
     config.recv_wait_timeout = 60;

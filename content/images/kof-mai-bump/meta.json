@@ -1,0 +1,12 @@
+{
+  "name": "KOF Mai bump",
+  "transition": "sprite-bump-left",
+  "fps": 24,
+  "slide_ms": 450,
+  "elastic_ms": 180,
+  "gap_ms": 100,
+  "slots": [
+    { "id": "A" },
+    { "id": "B", "fps": 12, "play": "loop" }
+  ]
+}
