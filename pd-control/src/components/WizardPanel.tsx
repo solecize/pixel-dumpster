@@ -1,18 +1,20 @@
 import { useState, useEffect, useCallback, useRef } from "react";
 import {
-  listSerialPorts,
-  wizardConnect,
-  wizardDisconnect,
   wizardSend,
   wizardReboot,
   wizardPoll,
+  wizardIsConnected,
+  bleSend,
+  blePoll,
+  bleIsConnected,
 } from "../lib/api";
-
-interface SerialPort {
-  port_name: string;
-  description: string;
-  is_esp32: boolean;
-}
+import {
+  loadTransportPrefs,
+  saveTransportPrefs,
+  type LinkKind,
+} from "../lib/transportPrefs";
+import { UsbConnectionCard } from "./UsbConnectionCard";
+import { BluetoothConnectionCard } from "./BluetoothConnectionCard";
 
 interface WizardNav {
   back: boolean;
@@ -49,6 +51,12 @@ interface WifiScan {
   ssids: string[];
 }
 
+interface ConfigSaved {
+  type: "config_saved";
+  ok: boolean;
+  config: Record<string, unknown>;
+}
+
 interface WifiTest {
   type: "wifi_test";
   testing: boolean;
@@ -77,15 +85,49 @@ type DeviceMessage =
   | WizardError
   | WifiScan
   | WifiTest
+  | ConfigSaved
   | ReztestStatus
   | PanelLayoutTest
   | { type: string; [key: string]: unknown };
 
-export default function WizardPanel() {
-  const [ports, setPorts] = useState<SerialPort[]>([]);
-  const [selectedPort, setSelectedPort] = useState("");
+const emptySettingsForm = {
+  wifi_ssid: "",
+  wifi_password: "",
+  device_name: "",
+  hostname: "",
+  timezone: "",
+  static_ip: "",
+  static_gateway: "",
+  static_netmask: "",
+};
+
+interface WizardPanelProps {
+  initialLinkKind?: LinkKind;
+  /** localStorage key for remembering serial/BLE choice for this device */
+  prefsKey?: string;
+  /** When embedded under App's wizard chrome, hide the duplicate page title. */
+  hideTitle?: boolean;
+  /** Attempt to reconnect the last BLE device when opening on Bluetooth. */
+  autoReconnectBle?: boolean;
+}
+
+export default function WizardPanel({
+  initialLinkKind = "usb",
+  prefsKey = "default",
+  hideTitle = false,
+  autoReconnectBle = true,
+}: WizardPanelProps) {
+  const [linkKind, setLinkKind] = useState<LinkKind>(() => {
+    const saved = loadTransportPrefs(prefsKey);
+    return initialLinkKind || saved.linkKind || "usb";
+  });
   const [connected, setConnected] = useState(false);
-  const [connecting, setConnecting] = useState(false);
+  const [usbLinked, setUsbLinked] = useState(false);
+  const [bleLinked, setBleLinked] = useState(false);
+  const linkKindRef = useRef<LinkKind>("usb");
+  linkKindRef.current = linkKind;
+  const prefsKeyRef = useRef(prefsKey);
+  prefsKeyRef.current = prefsKey;
   const [wizardState, setWizardState] = useState<WizardState | null>(null);
   const [complete, setComplete] = useState(false);
   const [completeConfig, setCompleteConfig] = useState<Record<string, unknown> | null>(null);
@@ -95,6 +137,11 @@ export default function WizardPanel() {
   const [wifiScanning, setWifiScanning] = useState(false);
   const [wifiTesting, setWifiTesting] = useState(false);
   const [wifiResult, setWifiResult] = useState<{ success: boolean; ip?: string } | null>(null);
+  const [scannedSsids, setScannedSsids] = useState<string[]>([]);
+  const [editingSettings, setEditingSettings] = useState(false);
+  const [settingsForm, setSettingsForm] = useState<typeof emptySettingsForm>(emptySettingsForm);
+  const [settingsSaved, setSettingsSaved] = useState(false);
+  const [openNetwork, setOpenNetwork] = useState(false);
   const [reztest, setReztest] = useState<ReztestStatus | null>(null);
   const [panelLayoutTest, setPanelLayoutTest] = useState<PanelLayoutTest | null>(null);
   const [layoutSelectedPanel, setLayoutSelectedPanel] = useState(0);
@@ -106,26 +153,10 @@ export default function WizardPanel() {
     setLog((prev) => [...prev, msg]);
   }, []);
 
-  // Refresh ports
-  const refreshPorts = useCallback(async () => {
-    try {
-      const p = await listSerialPorts();
-      setPorts(p);
-      if (!selectedPort) {
-        const esp = p.find((port) => port.is_esp32);
-        if (esp) setSelectedPort(esp.port_name);
-        else if (p.length > 0) setSelectedPort(p[0].port_name);
-      }
-    } catch (err) {
-      console.error("Failed to list ports:", err);
-    }
-  }, [selectedPort]);
-
   useEffect(() => {
-    refreshPorts();
-    const interval = setInterval(refreshPorts, 3000);
-    return () => clearInterval(interval);
-  }, [refreshPorts]);
+    setLinkKind(initialLinkKind);
+    saveTransportPrefs(prefsKeyRef.current, { linkKind: initialLinkKind });
+  }, [initialLinkKind]);
 
   // Auto-scroll log
   useEffect(() => {
@@ -160,6 +191,18 @@ export default function WizardPanel() {
             case "wifi_scan": {
               const scan = msg as WifiScan;
               setWifiScanning(scan.scanning);
+              if (!scan.scanning && scan.ssids) setScannedSsids(scan.ssids);
+              break;
+            }
+            case "config_saved": {
+              const saved = msg as ConfigSaved;
+              if (saved.ok) {
+                setCompleteConfig((prev) => ({ ...(prev || {}), ...saved.config }));
+                setSettingsSaved(true);
+                addLog("Settings saved on device. Reboot for changes (especially WiFi) to take effect.");
+              } else {
+                setError("Device failed to save settings");
+              }
               break;
             }
             case "wifi_test": {
@@ -210,7 +253,8 @@ export default function WizardPanel() {
     if (!connected) return;
     pollRef.current = setInterval(async () => {
       try {
-        const lines = await wizardPoll();
+        const lines =
+          linkKindRef.current === "ble" ? await blePoll() : await wizardPoll();
         if (lines.length > 0) processMessages(lines);
       } catch {
         // ignore poll errors
@@ -221,35 +265,65 @@ export default function WizardPanel() {
     };
   }, [connected, processMessages]);
 
-  const handleConnect = async () => {
-    if (!selectedPort) return;
-    setConnecting(true);
-    setError(null);
-    setLog([]);
+  // Resume an existing USB/BLE session opened from Settings cards.
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const [ble, usb] = await Promise.all([
+          bleIsConnected().catch(() => false),
+          wizardIsConnected().catch(() => false),
+        ]);
+        if (cancelled) return;
+        setBleLinked(ble);
+        setUsbLinked(usb);
+        if (ble) {
+          setLinkKind("ble");
+          setConnected(true);
+          addLog("Resumed existing BLE session");
+        } else if (usb) {
+          setLinkKind("usb");
+          setConnected(true);
+          addLog("Resumed existing USB session");
+        }
+      } catch {
+        /* ignore */
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [addLog]);
+
+  const markUsbConnected = () => {
+    setUsbLinked(true);
+    setBleLinked(false);
+    setLinkKind("usb");
+    setConnected(true);
     setComplete(false);
     setCompleteConfig(null);
     setWizardState(null);
     setReztest(null);
-    try {
-      addLog(`Connecting to ${selectedPort}...`);
-      const lines = await wizardConnect(selectedPort);
-      setConnected(true);
-      addLog("Connected!");
-      processMessages(lines);
-    } catch (err) {
-      setError(String(err));
-      addLog(`ERROR: ${err}`);
-    } finally {
-      setConnecting(false);
-    }
+    setError(null);
+    addLog("USB connected");
   };
 
-  const handleDisconnect = async () => {
-    try {
-      await wizardDisconnect();
-    } catch {
-      // ignore
-    }
+  const markBleConnected = () => {
+    setBleLinked(true);
+    setUsbLinked(false);
+    setLinkKind("ble");
+    setConnected(true);
+    setComplete(false);
+    setCompleteConfig(null);
+    setWizardState(null);
+    setReztest(null);
+    setError(null);
+    addLog("BLE connected");
+  };
+
+  const markDisconnected = (kind: LinkKind) => {
+    if (kind === "ble") setBleLinked(false);
+    else setUsbLinked(false);
     setConnected(false);
     setWizardState(null);
     setComplete(false);
@@ -262,7 +336,10 @@ export default function WizardPanel() {
     try {
       const json = JSON.stringify(cmd);
       addLog(`>> ${json}`);
-      const lines = await wizardSend(json);
+      const lines =
+        linkKindRef.current === "ble"
+          ? await bleSend(json)
+          : await wizardSend(json);
       processMessages(lines);
     } catch (err) {
       setError(String(err));
@@ -270,6 +347,51 @@ export default function WizardPanel() {
     } finally {
       setBusy(false);
     }
+  };
+
+  const handleOpenSettings = () => {
+    setSettingsForm({
+      wifi_ssid: String(completeConfig?.wifi_ssid ?? ""),
+      wifi_password: "",
+      device_name: String(completeConfig?.device_name ?? ""),
+      hostname: String(completeConfig?.hostname ?? ""),
+      timezone: String(completeConfig?.timezone ?? ""),
+      static_ip: String(completeConfig?.static_ip ?? ""),
+      static_gateway: String(completeConfig?.static_gateway ?? ""),
+      static_netmask: String(completeConfig?.static_netmask ?? ""),
+    });
+    setSettingsSaved(false);
+    setScannedSsids([]);
+    setOpenNetwork(false);
+    setEditingSettings(true);
+  };
+
+  const handleScanSsids = () => {
+    sendCmd({ cmd: "scan_wifi" });
+  };
+
+  const handleSaveSettings = () => {
+    setSettingsSaved(false);
+    const fields: Record<string, string> = {
+      wifi_ssid: settingsForm.wifi_ssid,
+      device_name: settingsForm.device_name,
+      hostname: settingsForm.hostname,
+      timezone: settingsForm.timezone,
+      static_ip: settingsForm.static_ip,
+      static_gateway: settingsForm.static_gateway,
+      static_netmask: settingsForm.static_netmask,
+    };
+    // An empty password field normally means "leave it alone" (so you don't
+    // accidentally wipe a saved password while editing other fields). The
+    // "Open network" checkbox is the explicit way to actually clear it —
+    // needed for genuinely open SSIDs (e.g. captive-portal WiFi where the
+    // "password" is really a browser login page the device can't use).
+    if (openNetwork) {
+      fields.wifi_password = "";
+    } else if (settingsForm.wifi_password) {
+      fields.wifi_password = settingsForm.wifi_password;
+    }
+    sendCmd({ cmd: "set_config", fields });
   };
 
   const handleMenuSelect = (index: number) => {
@@ -323,60 +445,34 @@ export default function WizardPanel() {
 
   return (
     <div>
-      <div className="flex items-center justify-between mb-6">
-        <div>
-          <h2 className="text-xl font-bold">Device Setup Wizard</h2>
-          <p className="text-sm text-gray-500">
-            Configure your ESP32 device via USB serial
-          </p>
-        </div>
-        <span className="px-2 py-1 text-xs rounded bg-purple-500/20 text-purple-400">
-          Serial Wizard
-        </span>
-      </div>
-
-      {/* Connection */}
-      <div className="bg-pd-panel rounded-lg p-4 border border-pd-border mb-4">
-        <h3 className="font-semibold text-sm mb-3">Serial Connection</h3>
-        <div className="flex items-center gap-2">
-          <select
-            value={selectedPort}
-            onChange={(e) => setSelectedPort(e.target.value)}
-            className="flex-1 bg-pd-bg border border-pd-border rounded px-3 py-1.5 text-sm"
-            disabled={connected}
-          >
-            <option value="">Select port...</option>
-            {ports.map((p) => (
-              <option key={p.port_name} value={p.port_name}>
-                {p.port_name}
-                {p.is_esp32 ? " (ESP32)" : ""}
-                {p.description ? ` — ${p.description}` : ""}
-              </option>
-            ))}
-          </select>
-          {!connected ? (
-            <button
-              onClick={handleConnect}
-              disabled={!selectedPort || connecting}
-              className="px-4 py-1.5 bg-purple-600 text-white text-sm rounded hover:bg-purple-500 disabled:opacity-50 disabled:cursor-not-allowed"
-            >
-              {connecting ? "Connecting..." : "Connect"}
-            </button>
-          ) : (
-            <button
-              onClick={handleDisconnect}
-              className="px-4 py-1.5 bg-red-600 text-white text-sm rounded hover:bg-red-500"
-            >
-              Disconnect
-            </button>
-          )}
-        </div>
-        {connected && (
-          <div className="mt-2 flex items-center gap-2 text-xs text-pd-green">
-            <span className="w-2 h-2 rounded-full bg-pd-green" />
-            Connected to {selectedPort}
+      {!hideTitle && (
+        <div className="flex items-center justify-between mb-6">
+          <div>
+            <h2 className="text-xl font-bold">Hardware layout setup</h2>
+            <p className="text-sm text-gray-500">
+              Firmware wizard for reztest, chain, and matrix steps over USB/BLE
+            </p>
           </div>
-        )}
+          <span className="px-2 py-1 text-xs rounded bg-pd-accent/20 text-pd-accent">
+            Hardware Wizard
+          </span>
+        </div>
+      )}
+
+      <div className="space-y-3 mb-4">
+        <UsbConnectionCard
+          prefsKey={prefsKey}
+          linked={usbLinked}
+          onConnected={markUsbConnected}
+          onDisconnected={() => markDisconnected("usb")}
+        />
+        <BluetoothConnectionCard
+          prefsKey={prefsKey}
+          linked={bleLinked}
+          autoReconnect={autoReconnectBle && initialLinkKind === "ble"}
+          onConnected={markBleConnected}
+          onDisconnected={() => markDisconnected("ble")}
+        />
       </div>
 
       {/* Wizard Step */}
@@ -665,75 +761,275 @@ export default function WizardPanel() {
           <div className="mb-3 px-3 py-2 bg-purple-600/10 border border-purple-500/30 rounded text-sm text-purple-300">
             <strong>Multi-panel setup:</strong> Once discovered on the network, open the device →
             <strong> Diagnostics</strong> tab → <strong>Panel Layout → Edit</strong> to configure rows, cols and panel size.
-            Or use <strong>Re-run Setup</strong> below to reconfigure everything from scratch via USB.
+            Use <strong>Edit Settings</strong> below to change WiFi/name/etc. without touching hardware layout,
+            or <strong>Re-run Full Setup</strong> to reconfigure everything from scratch via USB.
           </div>
-          <div className="bg-pd-bg rounded p-3 text-sm space-y-1.5">
-            <div className="flex justify-between">
-              <span className="text-gray-500">Canvas</span>
-              <span className="text-gray-200">
-                {String(completeConfig.matrix_width)}×{String(completeConfig.matrix_height)}
-              </span>
-            </div>
-            {completeConfig.panel_rows && Number(completeConfig.panel_rows) > 1 || completeConfig.panel_cols && Number(completeConfig.panel_cols) > 1 ? (
-              <div className="flex justify-between">
-                <span className="text-gray-500">Panels</span>
-                <span className="text-gray-200">
-                  {String(completeConfig.panel_cols)}×{String(completeConfig.panel_rows)} ({String(completeConfig.panel_width)}×{String(completeConfig.panel_height)} each)
-                </span>
+
+          {!editingSettings ? (
+            <>
+              <div className="bg-pd-bg rounded p-3 text-sm space-y-1.5">
+                <div className="flex justify-between">
+                  <span className="text-gray-500">Canvas</span>
+                  <span className="text-gray-200">
+                    {String(completeConfig.matrix_width)}×{String(completeConfig.matrix_height)}
+                  </span>
+                </div>
+                {completeConfig.panel_rows && Number(completeConfig.panel_rows) > 1 || completeConfig.panel_cols && Number(completeConfig.panel_cols) > 1 ? (
+                  <div className="flex justify-between">
+                    <span className="text-gray-500">Panels</span>
+                    <span className="text-gray-200">
+                      {String(completeConfig.panel_cols)}×{String(completeConfig.panel_rows)} ({String(completeConfig.panel_width)}×{String(completeConfig.panel_height)} each)
+                    </span>
+                  </div>
+                ) : null}
+                <div className="flex justify-between">
+                  <span className="text-gray-500">WiFi</span>
+                  <span className="text-gray-200">{String(completeConfig.wifi_ssid || "—")}</span>
+                </div>
+                <div className="flex justify-between">
+                  <span className="text-gray-500">Name</span>
+                  <span className="text-gray-200">{String(completeConfig.device_name || "—")}</span>
+                </div>
+                <div className="flex justify-between">
+                  <span className="text-gray-500">Hostname</span>
+                  <span className="text-gray-200">{String(completeConfig.hostname || "—")}</span>
+                </div>
+                <div className="flex justify-between">
+                  <span className="text-gray-500">Timezone</span>
+                  <span className="text-gray-200">{String(completeConfig.timezone || "—")}</span>
+                </div>
+                <div className="flex justify-between">
+                  <span className="text-gray-500">IP</span>
+                  <span className="text-gray-200">
+                    {completeConfig.static_ip ? String(completeConfig.static_ip) : "DHCP (auto)"}
+                  </span>
+                </div>
               </div>
-            ) : null}
-            <div className="flex justify-between">
-              <span className="text-gray-500">WiFi</span>
-              <span className="text-gray-200">{String(completeConfig.wifi_ssid || "—")}</span>
+
+              <div className="mt-4 flex gap-2">
+                <button
+                  onClick={handleOpenSettings}
+                  disabled={busy}
+                  className="flex-1 px-4 py-2 text-sm bg-blue-600 text-white font-medium rounded hover:bg-blue-500 disabled:opacity-50"
+                >
+                  Edit Settings
+                </button>
+                <button
+                  onClick={async () => {
+                    setBusy(true);
+                    addLog(">> Rebooting device via hardware reset...");
+                    try {
+                      await wizardReboot();
+                    } catch {
+                      // device disconnects on reboot, that's expected
+                    }
+                    setBusy(false);
+                    addLog("Device is rebooting. Wait ~10s then click Scan in the sidebar.");
+                    setConnected(false);
+                    setComplete(false);
+                    setCompleteConfig(null);
+                  }}
+                  disabled={busy}
+                  className="flex-1 px-4 py-2 text-sm bg-pd-green text-black font-medium rounded hover:bg-green-400 disabled:opacity-50"
+                >
+                  Reboot Device
+                </button>
+              </div>
+              <div className="mt-2">
+                <button
+                  onClick={() => {
+                    setComplete(false);
+                    setCompleteConfig(null);
+                    sendCmd({ cmd: "hello", force: true });
+                  }}
+                  disabled={busy}
+                  className="w-full px-4 py-2 text-sm bg-purple-600 text-white rounded hover:bg-purple-500 disabled:opacity-50"
+                >
+                  Re-run Full Setup
+                </button>
+              </div>
+            </>
+          ) : (
+            <div className="bg-pd-bg rounded p-3 space-y-3">
+              <h4 className="text-sm font-semibold text-gray-200">Edit Settings</h4>
+
+              <div>
+                <label className="text-xs text-gray-500 block mb-1">WiFi Network</label>
+                <div className="flex gap-2">
+                  <input
+                    type="text"
+                    list="wizard-ssid-list"
+                    value={settingsForm.wifi_ssid}
+                    onChange={(e) => setSettingsForm({ ...settingsForm, wifi_ssid: e.target.value })}
+                    placeholder="Network name (SSID)"
+                    className="flex-1 bg-pd-panel border border-pd-border rounded px-3 py-1.5 text-sm"
+                  />
+                  <datalist id="wizard-ssid-list">
+                    {scannedSsids.map((s) => (
+                      <option key={s} value={s} />
+                    ))}
+                  </datalist>
+                  <button
+                    onClick={handleScanSsids}
+                    disabled={busy || wifiScanning}
+                    className="px-3 py-1.5 text-sm bg-gray-600 text-white rounded hover:bg-gray-500 disabled:opacity-50 whitespace-nowrap"
+                  >
+                    {wifiScanning ? "Scanning…" : "Scan"}
+                  </button>
+                </div>
+                {scannedSsids.length > 0 && (
+                  <p className="text-xs text-gray-500 mt-1">
+                    Found: {scannedSsids.join(", ")}
+                  </p>
+                )}
+              </div>
+
+              <div>
+                <label className="text-xs text-gray-500 block mb-1">
+                  WiFi Password <span className="text-gray-600">(leave blank to keep current)</span>
+                </label>
+                <input
+                  type="password"
+                  value={settingsForm.wifi_password}
+                  onChange={(e) => setSettingsForm({ ...settingsForm, wifi_password: e.target.value })}
+                  placeholder="••••••••"
+                  disabled={openNetwork}
+                  className="w-full bg-pd-panel border border-pd-border rounded px-3 py-1.5 text-sm disabled:opacity-40"
+                />
+                <label className="flex items-center gap-2 mt-2 text-xs text-gray-400">
+                  <input
+                    type="checkbox"
+                    checked={openNetwork}
+                    onChange={(e) => setOpenNetwork(e.target.checked)}
+                  />
+                  This network has no WiFi password (open network)
+                </label>
+                {openNetwork && (
+                  <p className="text-xs text-gray-500 mt-1">
+                    Use this if a browser popup — not a WiFi prompt — asks for a password after
+                    connecting (a captive portal). The device can't fill out that popup, but it
+                    should still be able to join the open network itself and show up locally.
+                  </p>
+                )}
+              </div>
+
+              <div className="grid grid-cols-2 gap-3">
+                <div>
+                  <label className="text-xs text-gray-500 block mb-1">Device Name</label>
+                  <input
+                    type="text"
+                    value={settingsForm.device_name}
+                    onChange={(e) => setSettingsForm({ ...settingsForm, device_name: e.target.value })}
+                    className="w-full bg-pd-panel border border-pd-border rounded px-3 py-1.5 text-sm"
+                  />
+                </div>
+                <div>
+                  <label className="text-xs text-gray-500 block mb-1">Hostname</label>
+                  <input
+                    type="text"
+                    value={settingsForm.hostname}
+                    onChange={(e) => setSettingsForm({ ...settingsForm, hostname: e.target.value })}
+                    className="w-full bg-pd-panel border border-pd-border rounded px-3 py-1.5 text-sm"
+                  />
+                </div>
+              </div>
+
+              <div>
+                <label className="text-xs text-gray-500 block mb-1">Timezone</label>
+                <input
+                  type="text"
+                  value={settingsForm.timezone}
+                  onChange={(e) => setSettingsForm({ ...settingsForm, timezone: e.target.value })}
+                  placeholder="e.g. America/Chicago"
+                  className="w-full bg-pd-panel border border-pd-border rounded px-3 py-1.5 text-sm"
+                />
+              </div>
+
+              <div>
+                <label className="text-xs text-gray-500 block mb-1">
+                  Static IP <span className="text-gray-600">(leave blank for DHCP)</span>
+                </label>
+                <input
+                  type="text"
+                  value={settingsForm.static_ip}
+                  onChange={(e) => setSettingsForm({ ...settingsForm, static_ip: e.target.value })}
+                  placeholder="e.g. 192.168.1.50"
+                  className="w-full bg-pd-panel border border-pd-border rounded px-3 py-1.5 text-sm"
+                />
+              </div>
+
+              {settingsForm.static_ip && (
+                <div className="grid grid-cols-2 gap-3">
+                  <div>
+                    <label className="text-xs text-gray-500 block mb-1">Gateway</label>
+                    <input
+                      type="text"
+                      value={settingsForm.static_gateway}
+                      onChange={(e) => setSettingsForm({ ...settingsForm, static_gateway: e.target.value })}
+                      placeholder="192.168.1.1"
+                      className="w-full bg-pd-panel border border-pd-border rounded px-3 py-1.5 text-sm"
+                    />
+                  </div>
+                  <div>
+                    <label className="text-xs text-gray-500 block mb-1">Netmask</label>
+                    <input
+                      type="text"
+                      value={settingsForm.static_netmask}
+                      onChange={(e) => setSettingsForm({ ...settingsForm, static_netmask: e.target.value })}
+                      placeholder="255.255.255.0"
+                      className="w-full bg-pd-panel border border-pd-border rounded px-3 py-1.5 text-sm"
+                    />
+                  </div>
+                </div>
+              )}
+
+              {settingsSaved && (
+                <div className="px-3 py-2 bg-pd-green/10 border border-pd-green/30 rounded text-sm text-pd-green">
+                  Saved. Reboot the device for WiFi/network changes to take effect.
+                </div>
+              )}
+
+              <div className="flex gap-2 pt-1">
+                <button
+                  onClick={() => setEditingSettings(false)}
+                  disabled={busy}
+                  className="flex-1 px-4 py-2 text-sm bg-gray-600 text-white rounded hover:bg-gray-500 disabled:opacity-50"
+                >
+                  Cancel
+                </button>
+                <button
+                  onClick={handleSaveSettings}
+                  disabled={busy || !settingsForm.wifi_ssid}
+                  className="flex-1 px-4 py-2 text-sm bg-blue-600 text-white font-medium rounded hover:bg-blue-500 disabled:opacity-50"
+                >
+                  Save
+                </button>
+                {settingsSaved && (
+                  <button
+                    onClick={async () => {
+                      setBusy(true);
+                      addLog(">> Rebooting device via hardware reset...");
+                      try {
+                        await wizardReboot();
+                      } catch {
+                        // device disconnects on reboot, that's expected
+                      }
+                      setBusy(false);
+                      setEditingSettings(false);
+                      setConnected(false);
+                      setComplete(false);
+                      setCompleteConfig(null);
+                      addLog("Device is rebooting. Wait ~10s then click Scan in the sidebar.");
+                    }}
+                    disabled={busy}
+                    className="flex-1 px-4 py-2 text-sm bg-pd-green text-black font-medium rounded hover:bg-green-400 disabled:opacity-50"
+                  >
+                    Save & Reboot
+                  </button>
+                )}
+              </div>
             </div>
-            <div className="flex justify-between">
-              <span className="text-gray-500">Name</span>
-              <span className="text-gray-200">{String(completeConfig.device_name || "—")}</span>
-            </div>
-            <div className="flex justify-between">
-              <span className="text-gray-500">Hostname</span>
-              <span className="text-gray-200">{String(completeConfig.hostname || "—")}</span>
-            </div>
-            <div className="flex justify-between">
-              <span className="text-gray-500">IP</span>
-              <span className="text-gray-200">
-                {completeConfig.static_ip ? String(completeConfig.static_ip) : "DHCP (auto)"}
-              </span>
-            </div>
-          </div>
-          <div className="mt-4 flex gap-2">
-            <button
-              onClick={async () => {
-                setBusy(true);
-                addLog(">> Rebooting device via hardware reset...");
-                try {
-                  await wizardReboot();
-                } catch {
-                  // device disconnects on reboot, that's expected
-                }
-                setBusy(false);
-                addLog("Device is rebooting. Wait ~10s then click Scan in the sidebar.");
-                setConnected(false);
-                setComplete(false);
-                setCompleteConfig(null);
-              }}
-              disabled={busy}
-              className="flex-1 px-4 py-2 text-sm bg-pd-green text-black font-medium rounded hover:bg-green-400 disabled:opacity-50"
-            >
-              Reboot Device
-            </button>
-            <button
-              onClick={() => {
-                setComplete(false);
-                setCompleteConfig(null);
-                sendCmd({ cmd: "hello", force: true });
-              }}
-              disabled={busy}
-              className="flex-1 px-4 py-2 text-sm bg-purple-600 text-white rounded hover:bg-purple-500 disabled:opacity-50"
-            >
-              Re-run Setup
-            </button>
-          </div>
+          )}
         </div>
       )}
 

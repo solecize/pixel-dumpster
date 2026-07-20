@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>Pixel Dumpster Control discovers and controls LED panels on your local network.</string>
+	<key>NSBonjourServices</key>
+	<array>
+		<string>_pdumpster._tcp</string>
+		<string>_dumpster-diver._tcp</string>
+	</array>
+	<!-- Required: without this, macOS TCC aborts the process on BLE scan/connect. -->
+	<key>NSBluetoothAlwaysUsageDescription</key>
+	<string>Pixel Dumpster Control uses Bluetooth to set up and control nearby Pixel Dumpster devices when WiFi is unavailable.</string>
+	<key>NSBluetoothPeripheralUsageDescription</key>
+	<string>Pixel Dumpster Control uses Bluetooth to set up and control nearby Pixel Dumpster devices when WiFi is unavailable.</string>
+</dict>
+</plist>

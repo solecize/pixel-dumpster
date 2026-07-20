@@ -15,3 +15,42 @@ CONFIG_PARTITION_TABLE_CUSTOM=y
 CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
 CONFIG_TINYUSB_HOST=y
 CONFIG_TINYUSB_HOST_HID=y
+
+# The main task runs the app's primary loop (display rendering, content
+# playback, network polling, wizard/serial command handling) and makes
+# deep calls into LittleFS/esp_flash (e.g. opendir() when listing content).
+# The IDF default of 3584 bytes is too small for that call depth and was
+# causing a stack-overflow crash whenever content listing was triggered.
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192
+
+# BLE secondary transport (NimBLE + WiFi coexist)
+CONFIG_BT_ENABLED=y
+CONFIG_BT_NIMBLE_ENABLED=y
+CONFIG_BTDM_CTRL_MODE_BLE_ONLY=y
+CONFIG_BT_CTRL_MODE_EFF=1
+CONFIG_ESP_COEX_SW_COEXIST_ENABLE=y
+CONFIG_BT_NIMBLE_MAX_CONNECTIONS=1
+CONFIG_BT_NIMBLE_ROLE_CENTRAL=n
+CONFIG_BT_NIMBLE_ROLE_OBSERVER=n
+CONFIG_BT_NIMBLE_ROLE_BROADCASTER=y
+CONFIG_BT_NIMBLE_ROLE_PERIPHERAL=y
+# Host alloc from PSRAM — internal DRAM is too tight with WiFi+NimBLE;
+# otherwise GATT connect dies with "BLE_INIT: Malloc failed".
+CONFIG_BT_NIMBLE_MEM_ALLOC_MODE_EXTERNAL=y
+CONFIG_BT_NIMBLE_ATT_MAX_PREP_ENTRIES=8
+CONFIG_BT_NIMBLE_MSYS_2_BLOCK_COUNT=16
+CONFIG_BT_NIMBLE_TRANSPORT_EVT_COUNT=20
+
+# mDNS must not take its task stack from scarce internal DRAM once NimBLE is up.
+# Without this, mdns_init() fails ("failed to allocate memory for the mDNS task's
+# stack") and pd-control never discovers the device over WiFi.
+CONFIG_MDNS_TASK_CREATE_FROM_SPIRAM=y
+CONFIG_MDNS_MEMORY_ALLOC_SPIRAM=y
+
+# HUB75 BCM bit depth: 6-bit preferred for low-color sprite headroom (fewer
+# planes → more CPU for multi-rect dirty present). Logos stay readable; full
+# gradient art may show mild banding vs 8-bit. A/B notes in
+# tools/draw-mode-bench/README.md — flip to CONFIG_HUB75_BIT_DEPTH_8=y to compare.
+CONFIG_HUB75_BIT_DEPTH_6=y
+# CONFIG_HUB75_BIT_DEPTH_8 is not set
+CONFIG_HUB75_BIT_DEPTH=6

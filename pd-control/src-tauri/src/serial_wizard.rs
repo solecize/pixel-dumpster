@@ -1,6 +1,12 @@
 use std::io::{BufRead, BufReader, Write};
+use std::path::Path;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+use serde_json::Value;
+
+const UPLOAD_CHUNK_RAW: usize = 150;
 
 /// Managed serial connection state
 pub struct SerialConnection {
@@ -120,6 +126,134 @@ pub fn poll(state: &SharedWizardState) -> Result<Vec<String>, String> {
         .ok_or("Not connected")?;
 
     Ok(read_available_lines(&mut conn.reader))
+}
+
+pub fn is_connected(state: &SharedWizardState) -> bool {
+    state
+        .lock()
+        .map(|g| g.connection.is_some())
+        .unwrap_or(false)
+}
+
+fn wait_ack_locked(
+    conn: &mut SerialConnection,
+    cmd: &str,
+    timeout: Duration,
+) -> Result<(), String> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let lines = read_available_lines(&mut conn.reader);
+        for line in lines {
+            let Ok(v) = serde_json::from_str::<Value>(&line) else {
+                continue;
+            };
+            if v.get("type").and_then(|t| t.as_str()) != Some("ack") {
+                continue;
+            }
+            if v.get("cmd").and_then(|c| c.as_str()) != Some(cmd) {
+                continue;
+            }
+            if v.get("ok").and_then(|o| o.as_bool()) == Some(true) {
+                return Ok(());
+            }
+            let err = v
+                .get("error")
+                .and_then(|e| e.as_str())
+                .unwrap_or("command failed");
+            return Err(format!("USB {cmd}: {err}"));
+        }
+        if Instant::now() >= deadline {
+            return Err(format!("USB {cmd}: timeout waiting for ack"));
+        }
+        std::thread::sleep(Duration::from_millis(40));
+    }
+}
+
+fn send_expect_ack_locked(
+    conn: &mut SerialConnection,
+    json_cmd: &str,
+    ack_cmd: &str,
+    timeout: Duration,
+) -> Result<(), String> {
+    let mut cmd = json_cmd.to_string();
+    if !cmd.ends_with('\n') {
+        cmd.push('\n');
+    }
+    conn.port
+        .write_all(cmd.as_bytes())
+        .map_err(|e| format!("Write error: {e}"))?;
+    conn.port
+        .flush()
+        .map_err(|e| format!("Flush error: {e}"))?;
+    wait_ack_locked(conn, ack_cmd, timeout)
+}
+
+/// Chunked content upload over USB NDJSON (same cmds as BLE).
+pub fn upload_bytes(
+    state: &SharedWizardState,
+    remote_path: &str,
+    data: &[u8],
+) -> Result<(), String> {
+    if data.is_empty() {
+        return Err("empty upload".into());
+    }
+    let mut guard = state.lock().map_err(|e| format!("Lock error: {e}"))?;
+    let conn = guard
+        .connection
+        .as_mut()
+        .ok_or("USB wizard not connected")?;
+
+    let begin = format!(
+        r#"{{"cmd":"upload_begin","path":"{}","size":{}}}"#,
+        remote_path,
+        data.len()
+    );
+    if let Err(e) = send_expect_ack_locked(conn, &begin, "upload_begin", Duration::from_secs(8)) {
+        let _ = send_expect_ack_locked(
+            conn,
+            r#"{"cmd":"upload_abort"}"#,
+            "upload_abort",
+            Duration::from_secs(2),
+        );
+        return Err(e);
+    }
+
+    for chunk in data.chunks(UPLOAD_CHUNK_RAW) {
+        let b64 = B64.encode(chunk);
+        let line = format!(r#"{{"cmd":"upload_chunk","data":"{}"}}"#, b64);
+        if let Err(e) = send_expect_ack_locked(conn, &line, "upload_chunk", Duration::from_secs(8))
+        {
+            let _ = send_expect_ack_locked(
+                conn,
+                r#"{"cmd":"upload_abort"}"#,
+                "upload_abort",
+                Duration::from_secs(2),
+            );
+            return Err(e);
+        }
+    }
+
+    if let Err(e) =
+        send_expect_ack_locked(conn, r#"{"cmd":"upload_end"}"#, "upload_end", Duration::from_secs(8))
+    {
+        let _ = send_expect_ack_locked(
+            conn,
+            r#"{"cmd":"upload_abort"}"#,
+            "upload_abort",
+            Duration::from_secs(2),
+        );
+        return Err(e);
+    }
+    Ok(())
+}
+
+pub fn upload_path(
+    state: &SharedWizardState,
+    local: &Path,
+    remote_path: &str,
+) -> Result<(), String> {
+    let data = std::fs::read(local).map_err(|e| format!("read {}: {e}", local.display()))?;
+    upload_bytes(state, remote_path, &data)
 }
 
 /// Reboot the ESP32 by toggling RTS+DTR (hardware reset via USB serial)

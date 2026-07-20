@@ -1,0 +1,8 @@
+{
+  "name": "Falling Leaves Medium",
+  "fps": 24,
+  "loop": true,
+  "frames": 192,
+  "pattern": "leaves-medium%04d.png",
+  "start": 0
+}

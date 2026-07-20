@@ -1,0 +1,8 @@
+{
+  "name": "Pac logo bump",
+  "transition": "sprite-bump-left",
+  "fps": 24,
+  "slide_ms": 400,
+  "elastic_ms": 160,
+  "gap_ms": 80
+}

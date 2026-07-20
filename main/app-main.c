@@ -18,6 +18,7 @@
 #include "pd-serial-cmd.h"
 #include "pd-wizard.h"
 #include "pd-discovery.h"
+#include "pd-ble.h"
 
 static const char *TAG = "pixel-dumpster";
 
@@ -129,6 +130,15 @@ static void initialize_system(void)
     pd_discovery_init();
     pd_wizard_start(&pd_app_config);
     pd_serial_cmd_init();
+    /* BLE NUS advertises even when WiFi is down so setup/control can bypass LAN. */
+    {
+        const char *ble_name = pd_app_config.device_name[0] ? pd_app_config.device_name
+                              : (pd_app_config.hostname[0] ? pd_app_config.hostname
+                                 : "pixel-dumpster");
+        if (pd_ble_start(ble_name) != ESP_OK) {
+            ESP_LOGW(TAG, "BLE start failed — USB serial / WiFi only");
+        }
+    }
     if (pd_app_config.setup_complete) {
         pd_display_render_idle(
             pd_app_config.device_name,
@@ -215,6 +225,18 @@ void app_main(void)
             );
         }
 
-        vTaskDelay(pdMS_TO_TICKS(10));
+        /* While a sequence is playing, sleep only the leftover frame budget
+         * (0..10 ms) so a ~40 ms present is not padded with a flat 10 ms
+         * delay (~19–21 fps). Idle / non-sequence keeps the 10 ms yield. */
+        int delay_ms = 10;
+        int until = pd_content_ms_until_next_frame();
+        if (until >= 0) {
+            delay_ms = until;
+        }
+        if (delay_ms > 0) {
+            vTaskDelay(pdMS_TO_TICKS(delay_ms));
+        } else {
+            taskYIELD();
+        }
     }
 }

@@ -6,19 +6,21 @@
 
 **Software Products**
 - Pixel Dumpster Firmware (ESP-IDF)
-- HTTP API Server (port 8088)
+- HTTP Content API (port 8088)
 - mDNS Service (`_pdumpster._tcp`)
-- Setup Wizard (USB keyboard driven)
+- Setup Wizard (USB keyboard, USB serial host, or BLE host)
+- BLE Nordic UART (NUS) control / upload
 
 **Included Packages / Components**
 - FreeRTOS (ESP-IDF)
 - pd-config — device configuration (JSON on LittleFS)
-- pd-content — content playback engine
+- pd-content — content playback engine (still cache, optional sequence palette cache)
 - pd-display — HUB75 LED matrix driver (FM6126A)
 - pd-network — WiFi + HTTP + mDNS
-- pd-wizard — first-run setup flow
+- pd-ble — NimBLE NUS peripheral (PSRAM host alloc)
+- pd-wizard — first-run / panel-layout setup flow
 - pd-discovery — mDNS service browser
-- pd-serial-cmd — serial command interface
+- pd-serial-cmd — NDJSON command interface (USB + BLE)
 - pd-storage — LittleFS / SPIFFS filesystem
 - 24 transition effects (wipe, slide, zoom, fade, flip, etc.)
 - Background + overlay compositing
@@ -46,6 +48,7 @@
 - HTTP Control API (port 7070): status, config, reload, event, log
 - WiFi transport to ESP32
 - Serial transport (USB fallback)
+- BLE transport via `pd-ble-bridge`
 - Auto-start via `autostart.sh`
 
 **Codebase / Build**
@@ -65,14 +68,13 @@
 **Included Packages / Components**
 - **Frontend:** React 18 + TypeScript + Vite + Tailwind CSS + Lucide icons
 - **Desktop Shell:** Tauri v2 (Rust backend)
-- **Rust Crates:** tauri, reqwest, tokio, mdns-sd, serialport, ssh2, image, serde
+- **Rust Crates:** tauri, reqwest, tokio, mdns-sd, serialport, btleplug, ssh2, image, serde
 - **Firmware Tooling:** ESP-IDF toolchain
-- **AI Assistants:** GPT-4 (brainstorming), Claude 3.5 Sonnet/Opus (specs + code)
 - **Version Control:** Git → GitHub
 
 **Codebase / Build**
-- TypeScript / React (`pd-control/src/`)
-- Rust (`pd-control/src-tauri/src/`)
+- TypeScript / React (`pd-control/src/`) — Content, Settings cards, Control via, BLE/USB routing
+- Rust (`pd-control/src-tauri/src/`) — `device_api`, `ble_link`, wizard, flash, SSH
 - C / ESP-IDF (`main/`, `components/`)
 - `npm install` + `npm run tauri dev` (control app)
 - `idf.py build flash monitor` (firmware)

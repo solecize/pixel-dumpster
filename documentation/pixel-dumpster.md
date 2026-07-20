@@ -4,11 +4,17 @@
 
 ------------------------------------------------------------------------
 
+> **Status:** Historical living-spec notes. For current behavior use
+> [readme.md](../readme.md), [api.md](api.md), [ble-transport.md](ble-transport.md),
+> [wizard-protocol.md](wizard-protocol.md), and [pd-control/README.md](../pd-control/README.md).
+> Sections below (USB-keyboard MVP, `/pd/now.json` push model) describe early
+> goals; the shipping path is the Content API (`/api/*`) plus BLE/USB NDJSON.
+
 > Please update this living document as requirements change or when additional features and documents are added. Please include Related Documentation in the following list:
 
 #### Related Documentation:
 
-[readme.md](../readme.md) | [development.md](development.md) | [api.md](api.md) | [kebab-style-naming.md](kebab-style-naming.md) | [wizard-protocol.md](wizard-protocol.md)
+[readme.md](../readme.md) | [development.md](development.md) | [api.md](api.md) | [ble-transport.md](ble-transport.md) | [kebab-style-naming.md](kebab-style-naming.md) | [wizard-protocol.md](wizard-protocol.md) | [pd-control/README.md](../pd-control/README.md)
 
 # 1. Project Overview
 
@@ -16,11 +22,11 @@
 
 -   Runs on ESP32 (Matrix Portal or similar) using the ESP-IDF native workflow
 -   Drives an arbitrary LED matrix (HUB75, or similar)
--   Maintains a local pixel art library
--   Accepts push notifications over Wi-Fi
--   Displays art based on upstream context (system/game/custom)
+-   Maintains a local pixel art library under `/pd/content/`
+-   Accepts control over Wi-Fi HTTP, BLE NUS, and USB serial
+-   Displays art based on upstream context (system/game/custom) via dumpster-diver / pd-control
 -   Is controller-agnostic and frontend-agnostic
--   Uses an artifact + push notification software model
+-   Uses the Content API as the primary display path (legacy `now.json` / UDP doorbell remain compatibility-only)
 
 The software is designed to be:
 

@@ -5,40 +5,101 @@ import {
   setDeviceLayout,
   previewDeviceLayout,
   addManualDevice,
-  setDeviceConfig,
+  getDeviceWizardConfig,
+  setDeviceWizardConfig,
   startTestPattern,
   stopTestPattern,
 } from "../lib/api";
-
-import WizardPanel from "./WizardPanel";
+import {
+  controlGetAutoQuantize,
+  controlSetAutoQuantize,
+} from "../lib/deviceControl";
+import {
+  loadAutoQuantizePref,
+  saveAutoQuantizePref,
+} from "../lib/deviceSession";
+import { prefsKeyForDevice } from "../lib/transportPrefs";
+import {
+  SETTINGS_CARDS,
+  scrollToSettingsCard,
+  type SettingsCardId,
+} from "../lib/settingsCards";
 import { PanelLayoutSVG } from "./PanelLayoutSVG";
+import { DeviceCard } from "./DeviceCard";
+import { TransportDock } from "./TransportDock";
+import { UsbConnectionCard } from "./UsbConnectionCard";
+import { BluetoothConnectionCard } from "./BluetoothConnectionCard";
+import { WifiConnectionCard } from "./WifiConnectionCard";
+import type { TransportKind, TransportLinks } from "../lib/transport";
+import { EMPTY_TRANSPORT } from "../lib/transport";
 
 const SETUP_TEST_PATTERNS = [
-  { id: "color_test",      label: "Color Test",      desc: "R/G/B bands" },
-  { id: "numbered_panels", label: "Numbered Panels",  desc: "Panel number on each module" },
-  { id: "checkerboard",   label: "Checkerboard",    desc: "Checker across all panels" },
-  { id: "rgb_sweep",      label: "RGB Sweep",       desc: "Full-canvas colour sweep" },
-  { id: "bouncing_ball",  label: "Bouncing Ball",   desc: "Ball crossing panel boundaries" },
+  { id: "color_test", label: "Color Test", desc: "R/G/B bands" },
+  {
+    id: "numbered_panels",
+    label: "Numbered Panels",
+    desc: "Panel number on each module",
+  },
+  { id: "checkerboard", label: "Checkerboard", desc: "Checker across all panels" },
+  { id: "rgb_sweep", label: "RGB Sweep", desc: "Full-canvas colour sweep" },
+  {
+    id: "bouncing_ball",
+    label: "Bouncing Ball",
+    desc: "Ball crossing panel boundaries",
+  },
 ];
 
 interface DeviceSetupPanelProps {
   selected: DiscoveredDevice | null;
   onSelect: (device: DiscoveredDevice) => void;
   devices: DiscoveredDevice[];
+  links?: TransportLinks;
   onScan: () => void;
   scanning: boolean;
   onDevicesChange: (devices: DiscoveredDevice[]) => void;
+  onConfigureTransport: (
+    device: DiscoveredDevice | null,
+    kind: TransportKind
+  ) => void;
+  /** Guided tour over Settings cards (not the firmware WizardPanel). */
+  wizardMode?: boolean;
+  onWizardModeChange?: (active: boolean) => void;
+  /** Focus / highlight a card (from TransportDock). */
+  focusCard?: SettingsCardId | null;
+  onFocusCardHandled?: () => void;
+  /** Open firmware-driven panel layout wizard over USB/BLE. */
+  onOpenHardwareWizard?: (kind?: "usb" | "ble") => void;
+  /** Refresh TransportLinks after connect/disconnect. */
+  onLinksChanged?: (kind?: "usb" | "bluetooth") => void;
+}
+
+function cardClass(
+  id: SettingsCardId,
+  highlight: SettingsCardId | null
+): string {
+  const base =
+    "bg-pd-panel rounded-lg p-4 border transition scroll-mt-4 border-pd-border";
+  return highlight === id
+    ? `${base} border-pd-accent ring-2 ring-pd-accent/40`
+    : base;
 }
 
 export function DeviceSetupPanel({
   selected,
   onSelect,
   devices,
+  links = EMPTY_TRANSPORT,
   onScan,
   scanning,
   onDevicesChange,
+  onConfigureTransport,
+  wizardMode = false,
+  onWizardModeChange,
+  focusCard = null,
+  onFocusCardHandled,
+  onOpenHardwareWizard,
+  onLinksChanged,
 }: DeviceSetupPanelProps) {
-  const [showWizard, setShowWizard] = useState(false);
   const [layout, setLayout] = useState<Record<string, unknown> | null>(null);
   const [editLayout, setEditLayout] = useState(false);
   const [layoutForm, setLayoutForm] = useState({
@@ -57,18 +118,28 @@ export function DeviceSetupPanel({
   const [testBusy, setTestBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [showManual, setShowManual] = useState(false);
+  const [wizardConfig, setWizardConfig] = useState<Record<string, unknown> | null>(
+    null
+  );
   const [editDeviceInfo, setEditDeviceInfo] = useState(false);
   const [deviceInfoForm, setDeviceInfoForm] = useState({
     device_name: "",
-    wifi_ssid: "",
-    wifi_password: "",
+    hostname: "",
+    timezone: "",
   });
   const [deviceInfoSaving, setDeviceInfoSaving] = useState(false);
   const [deviceInfoSaved, setDeviceInfoSaved] = useState<string | null>(null);
   const [manualIp, setManualIp] = useState("");
   const [manualPort, setManualPort] = useState("8088");
+  const [autoQuantizePalette, setAutoQuantizePalette] = useState(false);
+  const [autoQuantizeSaving, setAutoQuantizeSaving] = useState(false);
+  const [autoQuantizeSaved, setAutoQuantizeSaved] = useState<string | null>(null);
+  const [wizardStep, setWizardStep] = useState(0);
+  const [wifiStartEditing, setWifiStartEditing] = useState(false);
+  const [highlight, setHighlight] = useState<SettingsCardId | null>(null);
 
   const device = selected;
+  const prefsKey = prefsKeyForDevice(device);
 
   const handleTestStart = async (patternId: string) => {
     if (!device) return;
@@ -76,7 +147,9 @@ export function DeviceSetupPanel({
     try {
       await startTestPattern(device.ip, device.port, patternId, brightness);
       setTestPattern(patternId);
-    } catch { /* non-fatal */ } finally {
+    } catch {
+      /* non-fatal */
+    } finally {
       setTestBusy(false);
     }
   };
@@ -87,7 +160,9 @@ export function DeviceSetupPanel({
     try {
       await stopTestPattern(device.ip, device.port);
       setTestPattern(null);
-    } catch { /* non-fatal */ } finally {
+    } catch {
+      /* non-fatal */
+    } finally {
       setTestBusy(false);
     }
   };
@@ -95,7 +170,10 @@ export function DeviceSetupPanel({
   const refreshLayout = useCallback(async () => {
     if (!device) return;
     try {
-      const l = (await getDeviceLayout(device.ip, device.port)) as Record<string, unknown>;
+      const l = (await getDeviceLayout(device.ip, device.port)) as Record<
+        string,
+        unknown
+      >;
       setLayout(l);
       setLayoutForm({
         panel_width: Number(l.panel_width) || 64,
@@ -111,9 +189,65 @@ export function DeviceSetupPanel({
     }
   }, [device]);
 
+  const refreshWizardConfig = useCallback(async () => {
+    if (!device) return;
+    try {
+      const w = (await getDeviceWizardConfig(device.ip, device.port)) as Record<
+        string,
+        unknown
+      >;
+      setWizardConfig(w);
+    } catch (err) {
+      setError(`Device settings load error: ${String(err)}`);
+    }
+  }, [device]);
+
+  const refreshContentConfig = useCallback(async () => {
+    if (!device) return;
+    const remembered = loadAutoQuantizePref(device);
+    if (remembered !== null) setAutoQuantizePalette(remembered);
+    try {
+      const aq = await controlGetAutoQuantize(device, links);
+      if (aq !== null) {
+        setAutoQuantizePalette(aq);
+        saveAutoQuantizePref(device, aq);
+        setAutoQuantizeSaved(null);
+      }
+    } catch (err) {
+      console.warn("Content config load error:", err);
+    }
+  }, [device, links]);
+
   useEffect(() => {
+    if (!device) {
+      setLayout(null);
+      setWizardConfig(null);
+      return;
+    }
     refreshLayout();
-  }, [refreshLayout]);
+    refreshWizardConfig();
+    refreshContentConfig();
+  }, [device, refreshLayout, refreshWizardConfig, refreshContentConfig]);
+
+  useEffect(() => {
+    if (!focusCard) return;
+    setHighlight(focusCard);
+    scrollToSettingsCard(focusCard);
+    if (focusCard === "wifi") setWifiStartEditing(true);
+    const step = SETTINGS_CARDS.indexOf(focusCard);
+    if (step >= 0 && wizardMode) setWizardStep(step);
+    onFocusCardHandled?.();
+  }, [focusCard, wizardMode, onFocusCardHandled]);
+
+  useEffect(() => {
+    if (!wizardMode) {
+      setWizardStep(0);
+      return;
+    }
+    const id = SETTINGS_CARDS[wizardStep];
+    setHighlight(id);
+    scrollToSettingsCard(id);
+  }, [wizardMode, wizardStep]);
 
   const handleAddManual = async () => {
     if (!manualIp) return;
@@ -128,87 +262,162 @@ export function DeviceSetupPanel({
     }
   };
 
-  if (showWizard) {
-    return (
-      <div className="space-y-4">
-        <div className="flex items-center justify-between">
-          <h2 className="text-xl font-bold">Device Setup Wizard</h2>
+  const connectionCards = (
+    <>
+      <UsbConnectionCard
+        prefsKey={prefsKey}
+        linked={links.usb}
+        highlighted={highlight === "usb"}
+        onConnected={() => onLinksChanged?.("usb")}
+        onDisconnected={() => onLinksChanged?.()}
+      />
+      <BluetoothConnectionCard
+        prefsKey={prefsKey}
+        linked={links.bluetooth}
+        highlighted={highlight === "bluetooth"}
+        autoReconnect
+        onConnected={() => onLinksChanged?.("bluetooth")}
+        onDisconnected={() => onLinksChanged?.()}
+      />
+      <WifiConnectionCard
+        device={device}
+        links={links}
+        highlighted={highlight === "wifi"}
+        startEditing={wifiStartEditing}
+        onStartEditingHandled={() => setWifiStartEditing(false)}
+      />
+    </>
+  );
+
+  const wizardBar = wizardMode ? (
+    <div className="sticky top-0 z-10 -mx-1 px-1 py-3 mb-2 bg-pd-dark/95 backdrop-blur border-b border-pd-border">
+      <div className="flex items-center justify-between gap-3 flex-wrap">
+        <div>
+          <div className="text-sm font-semibold">Setup Wizard</div>
+          <div className="text-xs text-gray-500">
+            Step {wizardStep + 1} of {SETTINGS_CARDS.length} —{" "}
+            {SETTINGS_CARDS[wizardStep]}
+          </div>
+        </div>
+        <div className="flex items-center gap-2">
           <button
-            onClick={() => setShowWizard(false)}
-            className="px-3 py-1.5 text-sm bg-pd-border hover:bg-gray-600 rounded transition"
+            type="button"
+            disabled={wizardStep <= 0}
+            onClick={() => setWizardStep((s) => Math.max(0, s - 1))}
+            className="px-3 py-1.5 text-sm bg-pd-border hover:bg-gray-600 rounded transition disabled:opacity-40"
           >
-            Close Wizard
+            Back
+          </button>
+          {wizardStep < SETTINGS_CARDS.length - 1 ? (
+            <button
+              type="button"
+              onClick={() =>
+                setWizardStep((s) =>
+                  Math.min(SETTINGS_CARDS.length - 1, s + 1)
+                )
+              }
+              className="px-3 py-1.5 text-sm bg-pd-accent hover:bg-indigo-600 text-white rounded transition"
+            >
+              Next
+            </button>
+          ) : (
+            <button
+              type="button"
+              onClick={() => {
+                onWizardModeChange?.(false);
+                setHighlight(null);
+              }}
+              className="px-3 py-1.5 text-sm bg-pd-green hover:bg-green-600 text-black font-medium rounded transition"
+            >
+              Done
+            </button>
+          )}
+          <button
+            type="button"
+            onClick={() => {
+              onWizardModeChange?.(false);
+              setHighlight(null);
+            }}
+            className="px-3 py-1.5 text-sm text-gray-400 hover:text-white"
+          >
+            Exit
           </button>
         </div>
-        <WizardPanel />
       </div>
-    );
-  }
+    </div>
+  ) : null;
 
   if (!device) {
     return (
       <div className="space-y-6">
-        <div className="flex items-center justify-between">
-          <h2 className="text-xl font-bold">Device Setup</h2>
-          <button
-            onClick={onScan}
-            disabled={scanning}
-            className="px-4 py-1.5 text-sm bg-pd-accent hover:bg-indigo-600 text-white rounded transition disabled:opacity-50"
-          >
-            {scanning ? "Scanning..." : "Scan Network"}
-          </button>
+        {wizardBar}
+        <div className="flex items-center justify-between flex-wrap gap-2">
+          <h2 className="text-xl font-bold">Settings</h2>
+          <div className="flex items-center gap-2">
+            {!wizardMode && (
+              <button
+                type="button"
+                onClick={() => onWizardModeChange?.(true)}
+                className="px-3 py-1.5 text-sm bg-pd-accent hover:bg-indigo-600 text-white rounded transition"
+              >
+                Launch Wizard
+              </button>
+            )}
+            <button
+              onClick={onScan}
+              disabled={scanning}
+              className="px-4 py-1.5 text-sm bg-pd-border hover:bg-gray-600 text-white rounded transition disabled:opacity-50"
+            >
+              {scanning ? "Scanning..." : "Scan Network"}
+            </button>
+          </div>
         </div>
 
+        <p className="text-sm text-gray-500">
+          Connect USB or Bluetooth below without a network device, or pick a
+          device when WiFi discovery finds one.
+        </p>
+
+        {connectionCards}
+
+        {error && (
+          <div className="p-3 bg-pd-red/10 border border-pd-red/30 rounded text-sm text-pd-red">
+            {error}
+          </div>
+        )}
+
         {scanning ? (
-          <div className="flex items-center justify-center h-64">
+          <div className="flex items-center justify-center h-40">
             <div className="text-center">
-              <div className="inline-block w-8 h-8 border-2 border-gray-600 border-t-purple-500 rounded-full animate-spin mb-4" />
+              <div className="inline-block w-8 h-8 border-2 border-gray-600 border-t-pd-accent rounded-full animate-spin mb-4" />
               <p className="text-gray-400">Scanning for devices...</p>
             </div>
           </div>
         ) : devices.length > 0 ? (
           <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
-            {devices.map((d, i) => (
-              <button
-                key={i}
-                onClick={() => onSelect(d)}
-                className="bg-pd-panel border border-pd-border rounded-lg p-4 text-left hover:border-pd-accent/50 transition"
-              >
-                <div className="flex items-center gap-2 mb-2">
-                  <span className="w-2 h-2 rounded-full bg-pd-green" />
-                  <span className="font-medium">{d.name}</span>
-                </div>
-                <div className="text-sm text-gray-500">
-                  {d.ip}:{d.port}
-                  {d.txt.width && (
-                    <span className="ml-2">
-                      {d.txt.width}x{d.txt.height}
-                    </span>
-                  )}
-                </div>
-              </button>
+            {devices.map((d) => (
+              <DeviceCard
+                key={`${d.ip}:${d.port}`}
+                device={d}
+                links={{
+                  bluetooth: links.bluetooth,
+                  usb: links.usb,
+                  wifi: true,
+                }}
+                onSelect={onSelect}
+                onConfigureTransport={onConfigureTransport}
+              />
             ))}
           </div>
         ) : (
-          <div className="bg-pd-panel rounded-lg p-8 border border-pd-border text-center">
-            <p className="text-gray-400 mb-4">No devices found.</p>
-            <p className="text-sm text-gray-600 mb-6">
-              Connect a device via USB and launch the setup wizard, or add a device manually.
-            </p>
-            <div className="flex gap-2 justify-center">
-              <button
-                onClick={() => setShowWizard(true)}
-                className="px-4 py-2 text-sm bg-purple-600 hover:bg-purple-500 text-white rounded transition"
-              >
-                Launch Wizard
-              </button>
-              <button
-                onClick={() => setShowManual(!showManual)}
-                className="px-4 py-2 text-sm bg-pd-border hover:bg-gray-600 text-white rounded transition"
-              >
-                Add Manually
-              </button>
-            </div>
+          <div className="bg-pd-panel rounded-lg p-6 border border-pd-border text-center">
+            <p className="text-gray-400 mb-4">No WiFi devices found.</p>
+            <button
+              onClick={() => setShowManual(!showManual)}
+              className="px-4 py-2 text-sm bg-pd-border hover:bg-gray-600 text-white rounded transition"
+            >
+              Add Manually
+            </button>
             {showManual && (
               <div className="mt-4 max-w-sm mx-auto space-y-2">
                 <input
@@ -243,23 +452,32 @@ export function DeviceSetupPanel({
 
   return (
     <div className="space-y-6">
-      {/* Header */}
-      <div className="flex items-center justify-between">
+      {wizardBar}
+
+      <div className="flex items-center justify-between gap-3 flex-wrap">
         <div>
-          <h2 className="text-xl font-bold">{device.name}</h2>
+          <h2 className="text-xl font-bold">Settings</h2>
           <p className="text-sm text-gray-500">
-            {device.ip}:{device.port}
+            {device.name} · {device.ip}:{device.port}
             {device.txt.width && (
-              <span className="ml-2">{device.txt.width}x{device.txt.height}</span>
+              <span className="ml-2">
+                {device.txt.width}x{device.txt.height}
+              </span>
             )}
           </p>
         </div>
-        <div className="flex items-center gap-2">
+        <div className="flex items-center gap-2 flex-wrap">
+          <TransportDock
+            links={links}
+            onConfigure={(kind) => onConfigureTransport(device, kind)}
+          />
           <select
             value={`${device.ip}:${device.port}`}
             onChange={(e) => {
               const [ip, port] = e.target.value.split(":");
-              const d = devices.find((x) => x.ip === ip && x.port === parseInt(port));
+              const d = devices.find(
+                (x) => x.ip === ip && x.port === parseInt(port)
+              );
               if (d) onSelect(d);
             }}
             className="bg-pd-bg border border-pd-border rounded px-3 py-1.5 text-sm"
@@ -270,12 +488,15 @@ export function DeviceSetupPanel({
               </option>
             ))}
           </select>
-          <button
-            onClick={() => setShowWizard(true)}
-            className="px-3 py-1.5 text-sm bg-purple-600 hover:bg-purple-500 text-white rounded transition"
-          >
-            Launch Wizard
-          </button>
+          {!wizardMode && (
+            <button
+              type="button"
+              onClick={() => onWizardModeChange?.(true)}
+              className="px-3 py-1.5 text-sm bg-pd-accent hover:bg-indigo-600 text-white rounded transition"
+            >
+              Launch Wizard
+            </button>
+          )}
         </div>
       </div>
 
@@ -285,19 +506,22 @@ export function DeviceSetupPanel({
         </div>
       )}
 
+      {connectionCards}
+
       {/* Device Info */}
-      <div className="bg-pd-panel rounded-lg p-4 border border-pd-border">
+      <div id="pd-card-device" className={cardClass("device", highlight)}>
         <div className="flex items-center justify-between mb-3">
           <h3 className="font-semibold">Device Info</h3>
           <button
             onClick={() => {
               setEditDeviceInfo(!editDeviceInfo);
               setDeviceInfoSaved(null);
-              if (!editDeviceInfo && layout) {
+              if (!editDeviceInfo) {
+                const w = (wizardConfig || {}) as Record<string, string>;
                 setDeviceInfoForm({
-                  device_name: String((layout as Record<string, string>).device_name || device.name),
-                  wifi_ssid: String((layout as Record<string, string>).wifi_ssid || ""),
-                  wifi_password: "",
+                  device_name: String(w.device_name || device.name),
+                  hostname: String(w.hostname || ""),
+                  timezone: String(w.timezone || ""),
                 });
               }
             }}
@@ -312,19 +536,36 @@ export function DeviceSetupPanel({
             <div className="text-gray-500">Name</div>
             <div>{device.name}</div>
             <div className="text-gray-500">Address</div>
-            <div>{device.ip}:{device.port}</div>
+            <div>
+              {device.ip}:{device.port}
+            </div>
             {layout && (
               <>
                 <div className="text-gray-500">Canvas</div>
-                <div>{String(layout.matrix_width)}x{String(layout.matrix_height)}</div>
+                <div>
+                  {String(layout.matrix_width)}x{String(layout.matrix_height)}
+                </div>
                 <div className="text-gray-500">Panels</div>
                 <div>
-                  {String(layout.panel_cols)}x{String(layout.panel_rows)} ({String(layout.panel_width)}x{String(layout.panel_height)} each)
+                  {String(layout.panel_cols)}x{String(layout.panel_rows)} (
+                  {String(layout.panel_width)}x{String(layout.panel_height)} each)
                 </div>
-                <div className="text-gray-500">WiFi</div>
-                <div>{String((layout as Record<string, string>).wifi_ssid || "—")}</div>
+              </>
+            )}
+            {wizardConfig && (
+              <>
                 <div className="text-gray-500">Hostname</div>
-                <div>{String((layout as Record<string, string>).hostname || "—")}</div>
+                <div>
+                  {String(
+                    (wizardConfig as Record<string, string>).hostname || "—"
+                  )}
+                </div>
+                <div className="text-gray-500">Timezone</div>
+                <div>
+                  {String(
+                    (wizardConfig as Record<string, string>).timezone || "—"
+                  )}
+                </div>
               </>
             )}
           </div>
@@ -333,92 +574,146 @@ export function DeviceSetupPanel({
         {editDeviceInfo && (
           <div className="space-y-3">
             <div>
-              <label className="text-xs text-gray-500 block mb-1">Device name</label>
+              <label className="text-xs text-gray-500 block mb-1">
+                Device name
+              </label>
               <input
                 type="text"
                 value={deviceInfoForm.device_name}
-                onChange={(e) => setDeviceInfoForm((f) => ({ ...f, device_name: e.target.value }))}
-                className="w-full bg-pd-bg border border-pd-border rounded px-2 py-1.5 text-sm text-white focus:border-purple-500 focus:outline-none"
+                onChange={(e) =>
+                  setDeviceInfoForm((f) => ({
+                    ...f,
+                    device_name: e.target.value,
+                  }))
+                }
+                className="w-full bg-pd-bg border border-pd-border rounded px-2 py-1.5 text-sm text-white focus:border-pd-accent focus:outline-none"
               />
             </div>
-            <div>
-              <label className="text-xs text-gray-500 block mb-1">WiFi SSID</label>
-              <input
-                type="text"
-                value={deviceInfoForm.wifi_ssid}
-                onChange={(e) => setDeviceInfoForm((f) => ({ ...f, wifi_ssid: e.target.value }))}
-                className="w-full bg-pd-bg border border-pd-border rounded px-2 py-1.5 text-sm text-white focus:border-purple-500 focus:outline-none"
-              />
-            </div>
-            <div>
-              <label className="text-xs text-gray-500 block mb-1">WiFi password</label>
-              <input
-                type="password"
-                value={deviceInfoForm.wifi_password}
-                onChange={(e) => setDeviceInfoForm((f) => ({ ...f, wifi_password: e.target.value }))}
-                className="w-full bg-pd-bg border border-pd-border rounded px-2 py-1.5 text-sm text-white focus:border-purple-500 focus:outline-none"
-                placeholder="Leave blank for open network"
-              />
+            <div className="grid grid-cols-2 gap-3">
+              <div>
+                <label className="text-xs text-gray-500 block mb-1">
+                  Hostname
+                </label>
+                <input
+                  type="text"
+                  value={deviceInfoForm.hostname}
+                  onChange={(e) =>
+                    setDeviceInfoForm((f) => ({
+                      ...f,
+                      hostname: e.target.value,
+                    }))
+                  }
+                  className="w-full bg-pd-bg border border-pd-border rounded px-2 py-1.5 text-sm text-white focus:border-pd-accent focus:outline-none"
+                />
+              </div>
+              <div>
+                <label className="text-xs text-gray-500 block mb-1">
+                  Timezone
+                </label>
+                <input
+                  type="text"
+                  value={deviceInfoForm.timezone}
+                  onChange={(e) =>
+                    setDeviceInfoForm((f) => ({
+                      ...f,
+                      timezone: e.target.value,
+                    }))
+                  }
+                  placeholder="e.g. CST6CDT"
+                  className="w-full bg-pd-bg border border-pd-border rounded px-2 py-1.5 text-sm text-white focus:border-pd-accent focus:outline-none"
+                />
+              </div>
             </div>
             {deviceInfoSaved && (
               <div className="text-xs text-pd-green">{deviceInfoSaved}</div>
             )}
-            <div className="flex gap-2">
-              <button
-                onClick={async () => {
-                  setDeviceInfoSaved(null);
-                  if (!device) return;
-                  setDeviceInfoSaving(true);
-                  try {
-                    await setDeviceConfig(device.ip, device.port, {
-                      device_name: deviceInfoForm.device_name,
-                      wifi_ssid: deviceInfoForm.wifi_ssid,
-                      wifi_password: deviceInfoForm.wifi_password,
-                    });
-                    setDeviceInfoSaved("Saved. Reboot to apply WiFi changes.");
-                    setEditDeviceInfo(false);
-                    setTimeout(refreshLayout, 2000);
-                  } catch (err) {
-                    setDeviceInfoSaved(`Error: ${String(err)}`);
-                  } finally {
-                    setDeviceInfoSaving(false);
-                  }
-                }}
-                disabled={deviceInfoSaving}
-                className="flex-1 px-4 py-2 bg-purple-600 text-white text-sm rounded hover:bg-purple-500 disabled:opacity-50"
-              >
-                {deviceInfoSaving ? "Saving..." : "Save"}
-              </button>
-            </div>
+            <button
+              onClick={async () => {
+                setDeviceInfoSaved(null);
+                if (!device) return;
+                setDeviceInfoSaving(true);
+                try {
+                  await setDeviceWizardConfig(device.ip, device.port, {
+                    device_name: deviceInfoForm.device_name,
+                    hostname: deviceInfoForm.hostname,
+                    timezone: deviceInfoForm.timezone,
+                  });
+                  setDeviceInfoSaved("Saved.");
+                  setEditDeviceInfo(false);
+                  setTimeout(refreshWizardConfig, 500);
+                } catch (err) {
+                  setDeviceInfoSaved(`Error: ${String(err)}`);
+                } finally {
+                  setDeviceInfoSaving(false);
+                }
+              }}
+              disabled={deviceInfoSaving}
+              className="w-full px-4 py-2 bg-pd-accent hover:bg-indigo-600 text-white text-sm rounded transition disabled:opacity-50"
+            >
+              {deviceInfoSaving ? "Saving..." : "Save"}
+            </button>
           </div>
         )}
       </div>
 
       {/* Panel Layout */}
-      <div className="bg-pd-panel rounded-lg p-4 border border-pd-border">
-        <div className="flex items-center justify-between mb-3">
+      <div id="pd-card-layout" className={cardClass("layout", highlight)}>
+        <div className="flex items-center justify-between mb-3 gap-2 flex-wrap">
           <h3 className="font-semibold">Panel Layout</h3>
-          <button
-            onClick={() => { setEditLayout(!editLayout); setLayoutSaved(null); }}
-            className="text-xs px-2 py-1 rounded bg-pd-bg border border-pd-border hover:border-gray-500"
-          >
-            {editLayout ? "Cancel" : "Edit"}
-          </button>
+          <div className="flex items-center gap-2">
+            <button
+              type="button"
+              onClick={() =>
+                onOpenHardwareWizard?.(links.bluetooth ? "ble" : "usb")
+              }
+              className="text-xs px-2 py-1 rounded bg-pd-bg border border-pd-border hover:border-pd-accent"
+            >
+              Configure panels over USB/BLE
+            </button>
+            <button
+              onClick={() => {
+                setEditLayout(!editLayout);
+                setLayoutSaved(null);
+              }}
+              className="text-xs px-2 py-1 rounded bg-pd-bg border border-pd-border hover:border-gray-500"
+            >
+              {editLayout ? "Cancel" : "Edit"}
+            </button>
+          </div>
         </div>
 
         {!editLayout && layout && (
           <>
             <div className="grid grid-cols-2 gap-x-6 gap-y-1.5 text-sm mb-4">
               <div className="text-gray-500">Panel size</div>
-              <div>{String(layout.panel_width)}x{String(layout.panel_height)}</div>
+              <div>
+                {String(layout.panel_width)}x{String(layout.panel_height)}
+              </div>
               <div className="text-gray-500">Grid</div>
-              <div>{String(layout.panel_rows)} row x {String(layout.panel_cols)} col</div>
+              <div>
+                {String(layout.panel_rows)} row x {String(layout.panel_cols)} col
+              </div>
               <div className="text-gray-500">Chain pattern</div>
-              <div>{["Linear","Serpentine TL","Serpentine TR","Serpentine BL","Serpentine BR","Zigzag TL","Zigzag TR","Zigzag BL","Zigzag BR"][Number(layout.chain_pattern)] ?? String(layout.chain_pattern)}</div>
+              <div>
+                {[
+                  "Linear",
+                  "Serpentine TL",
+                  "Serpentine TR",
+                  "Serpentine BL",
+                  "Serpentine BR",
+                  "Zigzag TL",
+                  "Zigzag TR",
+                  "Zigzag BL",
+                  "Zigzag BR",
+                ][Number(layout.chain_pattern)] ?? String(layout.chain_pattern)}
+              </div>
               <div className="text-gray-500">Mount rotation</div>
               <div>{String(layout.panel_rotation_deg)}</div>
               <div className="text-gray-500">Color order</div>
-              <div>{["RGB","BGR","GRB","BRG"][Number(layout.color_order)] ?? String(layout.color_order)}</div>
+              <div>
+                {["RGB", "BGR", "GRB", "BRG"][Number(layout.color_order)] ??
+                  String(layout.color_order)}
+              </div>
             </div>
             <PanelLayoutSVG
               panelWidth={Number(layout.panel_width) || 64}
@@ -431,14 +726,20 @@ export function DeviceSetupPanel({
             />
             <div className="mt-2 flex items-center gap-2">
               <select
-                value={testPattern ?? ''}
-                onChange={e => e.target.value ? handleTestStart(e.target.value) : handleTestStop()}
+                value={testPattern ?? ""}
+                onChange={(e) =>
+                  e.target.value
+                    ? handleTestStart(e.target.value)
+                    : handleTestStop()
+                }
                 disabled={testBusy || !device}
-                className="flex-1 bg-pd-bg border border-pd-border rounded px-2 py-1.5 text-sm text-white focus:border-purple-500 focus:outline-none disabled:opacity-40"
+                className="flex-1 bg-pd-bg border border-pd-border rounded px-2 py-1.5 text-sm text-white focus:border-pd-accent focus:outline-none disabled:opacity-40"
               >
                 <option value="">— No test pattern —</option>
-                {SETUP_TEST_PATTERNS.map(p => (
-                  <option key={p.id} value={p.id}>{p.label} — {p.desc}</option>
+                {SETUP_TEST_PATTERNS.map((p) => (
+                  <option key={p.id} value={p.id}>
+                    {p.label} — {p.desc}
+                  </option>
                 ))}
               </select>
               {testPattern && (
@@ -453,7 +754,13 @@ export function DeviceSetupPanel({
             </div>
           </>
         )}
-        {!editLayout && !layout && <p className="text-gray-500 text-sm">Loading...</p>}
+        {!editLayout && !layout && (
+          <p className="text-gray-500 text-sm">
+            {links.wifi
+              ? "Loading…"
+              : "Connect WiFi HTTP to load layout, or configure panels over USB/BLE."}
+          </p>
+        )}
 
         {editLayout && (
           <div className="space-y-3">
@@ -468,14 +775,20 @@ export function DeviceSetupPanel({
             />
             <div className="mb-1 flex items-center gap-2">
               <select
-                value={testPattern ?? ''}
-                onChange={e => e.target.value ? handleTestStart(e.target.value) : handleTestStop()}
+                value={testPattern ?? ""}
+                onChange={(e) =>
+                  e.target.value
+                    ? handleTestStart(e.target.value)
+                    : handleTestStop()
+                }
                 disabled={testBusy || !device}
-                className="flex-1 bg-pd-bg border border-pd-border rounded px-2 py-1.5 text-sm text-white focus:border-purple-500 focus:outline-none disabled:opacity-40"
+                className="flex-1 bg-pd-bg border border-pd-border rounded px-2 py-1.5 text-sm text-white focus:border-pd-accent focus:outline-none disabled:opacity-40"
               >
                 <option value="">— No test pattern —</option>
-                {SETUP_TEST_PATTERNS.map(p => (
-                  <option key={p.id} value={p.id}>{p.label} — {p.desc}</option>
+                {SETUP_TEST_PATTERNS.map((p) => (
+                  <option key={p.id} value={p.id}>
+                    {p.label} — {p.desc}
+                  </option>
                 ))}
               </select>
               {testPattern && (
@@ -490,35 +803,88 @@ export function DeviceSetupPanel({
             </div>
             <div className="grid grid-cols-2 gap-3">
               <div>
-                <label className="text-xs text-gray-500 block mb-1">Panel width (px)</label>
-                <input type="number" min={8} max={512} value={layoutForm.panel_width}
-                  onChange={e => setLayoutForm(f => ({...f, panel_width: Number(e.target.value)}))}
-                  className="w-full bg-pd-bg border border-pd-border rounded px-2 py-1.5 text-sm text-white focus:border-purple-500 focus:outline-none" />
+                <label className="text-xs text-gray-500 block mb-1">
+                  Panel width (px)
+                </label>
+                <input
+                  type="number"
+                  min={8}
+                  max={512}
+                  value={layoutForm.panel_width}
+                  onChange={(e) =>
+                    setLayoutForm((f) => ({
+                      ...f,
+                      panel_width: Number(e.target.value),
+                    }))
+                  }
+                  className="w-full bg-pd-bg border border-pd-border rounded px-2 py-1.5 text-sm text-white focus:border-pd-accent focus:outline-none"
+                />
               </div>
               <div>
-                <label className="text-xs text-gray-500 block mb-1">Panel height (px)</label>
-                <input type="number" min={8} max={512} value={layoutForm.panel_height}
-                  onChange={e => setLayoutForm(f => ({...f, panel_height: Number(e.target.value)}))}
-                  className="w-full bg-pd-bg border border-pd-border rounded px-2 py-1.5 text-sm text-white focus:border-purple-500 focus:outline-none" />
+                <label className="text-xs text-gray-500 block mb-1">
+                  Panel height (px)
+                </label>
+                <input
+                  type="number"
+                  min={8}
+                  max={512}
+                  value={layoutForm.panel_height}
+                  onChange={(e) =>
+                    setLayoutForm((f) => ({
+                      ...f,
+                      panel_height: Number(e.target.value),
+                    }))
+                  }
+                  className="w-full bg-pd-bg border border-pd-border rounded px-2 py-1.5 text-sm text-white focus:border-pd-accent focus:outline-none"
+                />
               </div>
               <div>
                 <label className="text-xs text-gray-500 block mb-1">Rows</label>
-                <input type="number" min={1} max={8} value={layoutForm.panel_rows}
-                  onChange={e => setLayoutForm(f => ({...f, panel_rows: Number(e.target.value)}))}
-                  className="w-full bg-pd-bg border border-pd-border rounded px-2 py-1.5 text-sm text-white focus:border-purple-500 focus:outline-none" />
+                <input
+                  type="number"
+                  min={1}
+                  max={8}
+                  value={layoutForm.panel_rows}
+                  onChange={(e) =>
+                    setLayoutForm((f) => ({
+                      ...f,
+                      panel_rows: Number(e.target.value),
+                    }))
+                  }
+                  className="w-full bg-pd-bg border border-pd-border rounded px-2 py-1.5 text-sm text-white focus:border-pd-accent focus:outline-none"
+                />
               </div>
               <div>
                 <label className="text-xs text-gray-500 block mb-1">Cols</label>
-                <input type="number" min={1} max={8} value={layoutForm.panel_cols}
-                  onChange={e => setLayoutForm(f => ({...f, panel_cols: Number(e.target.value)}))}
-                  className="w-full bg-pd-bg border border-pd-border rounded px-2 py-1.5 text-sm text-white focus:border-purple-500 focus:outline-none" />
+                <input
+                  type="number"
+                  min={1}
+                  max={8}
+                  value={layoutForm.panel_cols}
+                  onChange={(e) =>
+                    setLayoutForm((f) => ({
+                      ...f,
+                      panel_cols: Number(e.target.value),
+                    }))
+                  }
+                  className="w-full bg-pd-bg border border-pd-border rounded px-2 py-1.5 text-sm text-white focus:border-pd-accent focus:outline-none"
+                />
               </div>
             </div>
             <div>
-              <label className="text-xs text-gray-500 block mb-1">Chain pattern</label>
-              <select value={layoutForm.chain_pattern}
-                onChange={e => setLayoutForm(f => ({...f, chain_pattern: Number(e.target.value)}))}
-                className="w-full bg-pd-bg border border-pd-border rounded px-2 py-1.5 text-sm text-white focus:border-purple-500 focus:outline-none">
+              <label className="text-xs text-gray-500 block mb-1">
+                Chain pattern
+              </label>
+              <select
+                value={layoutForm.chain_pattern}
+                onChange={(e) =>
+                  setLayoutForm((f) => ({
+                    ...f,
+                    chain_pattern: Number(e.target.value),
+                  }))
+                }
+                className="w-full bg-pd-bg border border-pd-border rounded px-2 py-1.5 text-sm text-white focus:border-pd-accent focus:outline-none"
+              >
                 <option value={0}>Linear (row-by-row sequential)</option>
                 <option value={1}>Serpentine top-left, snake down</option>
                 <option value={2}>Serpentine top-right, snake down</option>
@@ -531,10 +897,19 @@ export function DeviceSetupPanel({
               </select>
             </div>
             <div>
-              <label className="text-xs text-gray-500 block mb-1">Panel mount rotation (per physical module)</label>
-              <select value={layoutForm.panel_rotation_deg}
-                onChange={e => setLayoutForm(f => ({...f, panel_rotation_deg: Number(e.target.value)}))}
-                className="w-full bg-pd-bg border border-pd-border rounded px-2 py-1.5 text-sm text-white focus:border-purple-500 focus:outline-none">
+              <label className="text-xs text-gray-500 block mb-1">
+                Panel mount rotation (per physical module)
+              </label>
+              <select
+                value={layoutForm.panel_rotation_deg}
+                onChange={(e) =>
+                  setLayoutForm((f) => ({
+                    ...f,
+                    panel_rotation_deg: Number(e.target.value),
+                  }))
+                }
+                className="w-full bg-pd-bg border border-pd-border rounded px-2 py-1.5 text-sm text-white focus:border-pd-accent focus:outline-none"
+              >
                 <option value={0}>0 (normal)</option>
                 <option value={90}>90 CW</option>
                 <option value={180}>180</option>
@@ -542,10 +917,19 @@ export function DeviceSetupPanel({
               </select>
             </div>
             <div>
-              <label className="text-xs text-gray-500 block mb-1">Color order</label>
-              <select value={layoutForm.color_order}
-                onChange={e => setLayoutForm(f => ({...f, color_order: Number(e.target.value)}))}
-                className="w-full bg-pd-bg border border-pd-border rounded px-2 py-1.5 text-sm text-white focus:border-purple-500 focus:outline-none">
+              <label className="text-xs text-gray-500 block mb-1">
+                Color order
+              </label>
+              <select
+                value={layoutForm.color_order}
+                onChange={(e) =>
+                  setLayoutForm((f) => ({
+                    ...f,
+                    color_order: Number(e.target.value),
+                  }))
+                }
+                className="w-full bg-pd-bg border border-pd-border rounded px-2 py-1.5 text-sm text-white focus:border-pd-accent focus:outline-none"
+              >
                 <option value={0}>RGB</option>
                 <option value={1}>BGR</option>
                 <option value={2}>GRB</option>
@@ -555,23 +939,31 @@ export function DeviceSetupPanel({
             <div className="text-xs text-gray-500 pt-1">
               {(() => {
                 const rot = layoutForm.panel_rotation_deg;
-                const cw = (rot === 90 || rot === 270)
-                  ? layoutForm.panel_height * layoutForm.panel_rows
-                  : layoutForm.panel_width * layoutForm.panel_cols;
-                const ch = (rot === 90 || rot === 270)
-                  ? layoutForm.panel_width * layoutForm.panel_cols
-                  : layoutForm.panel_height * layoutForm.panel_rows;
+                const cw =
+                  rot === 90 || rot === 270
+                    ? layoutForm.panel_height * layoutForm.panel_rows
+                    : layoutForm.panel_width * layoutForm.panel_cols;
+                const ch =
+                  rot === 90 || rot === 270
+                    ? layoutForm.panel_width * layoutForm.panel_cols
+                    : layoutForm.panel_height * layoutForm.panel_rows;
                 return `Canvas will be ${cw}x${ch} px`;
               })()}
             </div>
-            {layoutSaved && <div className="text-xs text-pd-green">{layoutSaved}</div>}
+            {layoutSaved && (
+              <div className="text-xs text-pd-green">{layoutSaved}</div>
+            )}
             <div className="flex gap-2">
               <button
                 onClick={async () => {
                   setLayoutSaved(null);
                   if (!device) return;
                   try {
-                    const res = (await previewDeviceLayout(device.ip, device.port, layoutForm)) as { ok?: boolean; error?: string };
+                    const res = (await previewDeviceLayout(
+                      device.ip,
+                      device.port,
+                      layoutForm
+                    )) as { ok?: boolean; error?: string };
                     if (res && res.ok === false && res.error) {
                       setLayoutSaved(res.error);
                     } else {
@@ -599,15 +991,20 @@ export function DeviceSetupPanel({
                     color_order: Number(layout.color_order) || 0,
                   });
                   try {
-                    const res = (await previewDeviceLayout(device.ip, device.port, {
-                      panel_width: Number(layout.panel_width) || 64,
-                      panel_height: Number(layout.panel_height) || 32,
-                      panel_rows: Number(layout.panel_rows) || 1,
-                      panel_cols: Number(layout.panel_cols) || 1,
-                      chain_pattern: Number(layout.chain_pattern) || 0,
-                      panel_rotation_deg: Number(layout.panel_rotation_deg) || 0,
-                      color_order: Number(layout.color_order) || 0,
-                    })) as { ok?: boolean; error?: string };
+                    const res = (await previewDeviceLayout(
+                      device.ip,
+                      device.port,
+                      {
+                        panel_width: Number(layout.panel_width) || 64,
+                        panel_height: Number(layout.panel_height) || 32,
+                        panel_rows: Number(layout.panel_rows) || 1,
+                        panel_cols: Number(layout.panel_cols) || 1,
+                        chain_pattern: Number(layout.chain_pattern) || 0,
+                        panel_rotation_deg:
+                          Number(layout.panel_rotation_deg) || 0,
+                        color_order: Number(layout.color_order) || 0,
+                      }
+                    )) as { ok?: boolean; error?: string };
                     if (res && res.ok === false && res.error) {
                       setLayoutSaved(res.error);
                     } else {
@@ -639,7 +1036,7 @@ export function DeviceSetupPanel({
                 }
               }}
               disabled={layoutSaving}
-              className="w-full px-4 py-2 bg-purple-600 text-white text-sm rounded hover:bg-purple-500 disabled:opacity-50"
+              className="w-full px-4 py-2 bg-pd-accent hover:bg-indigo-600 text-white text-sm rounded transition disabled:opacity-50"
             >
               {layoutSaving ? "Saving..." : "Save & Reboot"}
             </button>
@@ -647,8 +1044,59 @@ export function DeviceSetupPanel({
         )}
       </div>
 
+      {/* Playback */}
+      <div id="pd-card-playback" className={cardClass("playback", highlight)}>
+        <h3 className="font-semibold mb-3">Playback</h3>
+        <label className="flex items-start gap-3 cursor-pointer">
+          <input
+            type="checkbox"
+            className="mt-1"
+            checked={autoQuantizePalette}
+            disabled={autoQuantizeSaving}
+            onChange={async (e) => {
+              if (!device) return;
+              const next = e.target.checked;
+              setAutoQuantizePalette(next);
+              saveAutoQuantizePref(device, next);
+              setAutoQuantizeSaving(true);
+              setAutoQuantizeSaved(null);
+              try {
+                await controlSetAutoQuantize(device, links, next);
+                setAutoQuantizeSaved(
+                  next
+                    ? "On — sequences will use a 64-color PSRAM cache on next play."
+                    : "Off — full-color decoding (slower)."
+                );
+              } catch (err) {
+                setAutoQuantizePalette(!next);
+                saveAutoQuantizePref(device, !next);
+                setAutoQuantizeSaved(`Error: ${String(err)}`);
+              } finally {
+                setAutoQuantizeSaving(false);
+              }
+            }}
+          />
+          <span>
+            <span className="text-sm text-gray-200">
+              Auto-quantize animations to 64 colors (faster playback)
+            </span>
+            <span className="block text-xs text-gray-500 mt-1">
+              When on, each sequence is converted to a shared 64-color palette and
+              cached in PSRAM for smoother playback. When off, full-color decoding
+              is used (slower) with no palette overhead.
+            </span>
+          </span>
+        </label>
+        {autoQuantizeSaved && (
+          <div className="text-xs text-pd-green mt-2">{autoQuantizeSaved}</div>
+        )}
+      </div>
+
       {/* Brightness */}
-      <div className="bg-pd-panel rounded-lg p-4 border border-pd-border">
+      <div
+        id="pd-card-brightness"
+        className={cardClass("brightness", highlight)}
+      >
         <h3 className="font-semibold mb-3">Brightness</h3>
         <div className="flex items-center gap-3">
           <input
@@ -658,7 +1106,7 @@ export function DeviceSetupPanel({
             step={5}
             value={brightness}
             onChange={(e) => setBrightness(Number(e.target.value))}
-            className="flex-1 accent-purple-500"
+            className="flex-1 accent-pd-accent"
           />
           <span className="text-sm w-10 text-right">{brightness}%</span>
         </div>

@@ -29,7 +29,11 @@ typedef struct {
     bool is_sequence;
     int  current_frame;
     int  total_frames;
-    int  fps;
+    int  fps;              /* target fps from meta.json / set_meta */
+    float achieved_fps;    /* measured present rate (0 if unknown) */
+    /* Palette-cache state for the current sequence when auto_quantize is on:
+     * "off" | "building" | "live" | "fallback" */
+    char cache[16];
 } pd_content_status_t;
 
 /* transition mode */
@@ -57,6 +61,15 @@ typedef struct {
     char attract_path[PD_CONTENT_MAX_PATH];
     bool attract_shuffle;
     int  attract_idle_timeout_ms;
+
+    /* When true, sequences are quantized to a shared 64-color palette and
+     * cached in PSRAM for smoother playback. When false (default), the
+     * existing truecolor decode path is used with no palette overhead. */
+    bool auto_quantize_palette;
+
+    /* When true, draw a tiny target→achieved FPS HUD on the LED panel while
+     * content is presenting. Off by default (diagnostic). */
+    bool show_fps_counter;
 } pd_content_config_t;
 
 const pd_content_config_t *pd_content_get_config(void);
@@ -70,15 +83,38 @@ int pd_content_list_images(pd_content_entry_t *entries, int max_entries);
 esp_err_t pd_content_play(const char *path);
 esp_err_t pd_content_play_with_transition(const char *path, const char *transition,
                                           int duration_ms);
+/* Cheap path check + enqueue onto the pd_play worker (same as HTTP /api/play).
+ * Safe to call from NimBLE / USB wizard context. Returns ESP_ERR_NOT_FOUND if
+ * the path is missing; decode/play errors are logged on the worker. */
+esp_err_t pd_content_play_async(const char *path, const char *transition, int duration_ms);
 esp_err_t pd_content_stop(void);
 pd_content_status_t pd_content_get_status(void);
 
 void pd_content_tick(void);
 
+/* Milliseconds until the next sequence frame is due while playing.
+ * Returns -1 when the main loop should keep its default idle delay
+ * (not playing a sequence). Returns 0..10 when playing (already-due
+ * frames return 0). */
+int pd_content_ms_until_next_frame(void);
+
 esp_err_t pd_content_register_http(httpd_handle_t server);
 
 esp_err_t pd_content_store_file(const char *rel_path, const uint8_t *data, size_t len);
 esp_err_t pd_content_delete_file(const char *rel_path);
+/* Rename a file or sequence directory under the content root. */
+esp_err_t pd_content_rename(const char *from_rel, const char *to_rel);
+/* Update (or create) meta.json fps for a sequence directory. */
+esp_err_t pd_content_set_sequence_fps(const char *rel_path, int fps);
+
+/* Streaming upload (BLE / serial NDJSON). Max size matches HTTP /api/upload. */
+#define PD_CONTENT_UPLOAD_MAX_BYTES (2 * 1024 * 1024)
+esp_err_t pd_content_upload_begin(const char *rel_path, size_t total_size);
+esp_err_t pd_content_upload_write(const uint8_t *data, size_t len);
+esp_err_t pd_content_upload_finish(void);
+void pd_content_upload_abort(void);
+bool pd_content_upload_active(void);
+size_t pd_content_upload_received(void);
 
 /* Render discovery/source status screen (immediate, no auto-revert) */
 void pd_content_render_source_status(void);

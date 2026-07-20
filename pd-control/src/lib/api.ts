@@ -19,6 +19,33 @@ export async function stopDiscovery(): Promise<void> {
   return invoke("stop_discovery");
 }
 
+export async function setHttpTraceEnabled(enabled: boolean): Promise<void> {
+  return invoke("set_http_trace_enabled", { enabled });
+}
+
+export async function getHttpTraceEnabled(): Promise<boolean> {
+  return invoke("get_http_trace_enabled");
+}
+
+export async function appendTraceEvent(event: Record<string, unknown>): Promise<void> {
+  return invoke("append_trace_event", { event });
+}
+
+export async function revealControlEventLog(): Promise<string> {
+  return invoke("reveal_control_event_log");
+}
+
+export async function controlEventLogPath(): Promise<string> {
+  return invoke("control_event_log_path");
+}
+
+export async function getDeviceLog(
+  ip: string,
+  port: number
+): Promise<{ lines?: string[]; cache_reason?: string }> {
+  return invoke("device_log", { ip, port });
+}
+
 export async function addManualDevice(
   ip: string,
   port: number,
@@ -60,6 +87,32 @@ export async function getDeviceContent(
   return invoke("device_list_content", { ip, port });
 }
 
+export async function deviceDeleteContent(
+  ip: string,
+  port: number,
+  path: string
+): Promise<unknown> {
+  return invoke("device_delete_content", { ip, port, path });
+}
+
+export async function deviceRenameContent(
+  ip: string,
+  port: number,
+  from: string,
+  to: string
+): Promise<unknown> {
+  return invoke("device_rename_content", { ip, port, from, to });
+}
+
+export async function deviceSetContentMeta(
+  ip: string,
+  port: number,
+  path: string,
+  fps: number
+): Promise<unknown> {
+  return invoke("device_set_content_meta", { ip, port, path, fps });
+}
+
 export async function getDeviceConfig(
   ip: string,
   port: number
@@ -73,6 +126,21 @@ export async function setDeviceConfig(
   config: Record<string, unknown>
 ): Promise<unknown> {
   return invoke("device_set_config", { ip, port, config });
+}
+
+export async function getDeviceWizardConfig(
+  ip: string,
+  port: number
+): Promise<unknown> {
+  return invoke("device_wizard_config", { ip, port });
+}
+
+export async function setDeviceWizardConfig(
+  ip: string,
+  port: number,
+  config: Record<string, unknown>
+): Promise<unknown> {
+  return invoke("device_set_wizard_config", { ip, port, config });
 }
 
 export async function getDeviceLayout(
@@ -296,16 +364,110 @@ export async function wizardPoll(): Promise<string[]> {
   return invoke("wizard_poll");
 }
 
+export async function wizardIsConnected(): Promise<boolean> {
+  return invoke("wizard_is_connected");
+}
+
+// --- BLE secondary transport ---
+
+export interface BleDeviceInfo {
+  id: string;
+  name: string;
+  rssi: number | null;
+}
+
+export async function bleScan(nameFilter?: string): Promise<BleDeviceInfo[]> {
+  return invoke("ble_scan", { nameFilter: nameFilter ?? null });
+}
+
+export async function bleConnect(id: string): Promise<string[]> {
+  return invoke("ble_connect", { id });
+}
+
+export async function bleDisconnect(): Promise<void> {
+  return invoke("ble_disconnect");
+}
+
+export async function bleSend(command: string): Promise<string[]> {
+  return invoke("ble_send", { command });
+}
+
+export async function blePoll(): Promise<string[]> {
+  return invoke("ble_poll");
+}
+
+export async function blePlay(
+  path: string,
+  transition?: string,
+  durationMs?: number
+): Promise<string[]> {
+  return invoke("ble_play", {
+    path,
+    transition: transition ?? null,
+    durationMs: durationMs ?? null,
+  });
+}
+
+export async function bleStop(): Promise<string[]> {
+  return invoke("ble_stop");
+}
+
+export async function bleStatus(): Promise<string[]> {
+  return invoke("ble_status");
+}
+
+export async function bleIsConnected(): Promise<boolean> {
+  return invoke("ble_is_connected");
+}
+
 // --- Content Upload ---
 
 export async function uploadContentToDevice(
   deviceIp: string,
   devicePort: number,
-  contentPath: string
+  contentPath: string,
+  via?: "wifi" | "bluetooth" | "usb"
 ): Promise<void> {
   return invoke("upload_content_to_device", {
     deviceIp,
     devicePort,
     contentPath,
+    via: via ?? null,
+  });
+}
+
+/** Upload a local PNG; returns the remote path written on the device. */
+export async function uploadLocalFileToDevice(
+  deviceIp: string,
+  devicePort: number,
+  localPath: string,
+  remotePath?: string,
+  via?: "wifi" | "bluetooth" | "usb"
+): Promise<string> {
+  return invoke("upload_local_file_to_device", {
+    deviceIp,
+    devicePort,
+    localPath,
+    remotePath: remotePath ?? null,
+    via: via ?? null,
+  });
+}
+
+/** Upload a local folder of numbered PNGs as an image sequence. */
+export async function uploadLocalSequenceToDevice(
+  deviceIp: string,
+  devicePort: number,
+  localDir: string,
+  fps: number,
+  remoteName?: string,
+  via?: "wifi" | "bluetooth" | "usb"
+): Promise<string> {
+  return invoke("upload_local_sequence_to_device", {
+    deviceIp,
+    devicePort,
+    localDir,
+    fps,
+    remoteName: remoteName ?? null,
+    via: via ?? null,
   });
 }

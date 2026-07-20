@@ -56,6 +56,8 @@ typedef enum {
     PD_TRANS_ZOOM_OUT,
     PD_TRANS_FLIP_H,
     PD_TRANS_FLIP_V,
+    /* Content-side multi-sprite motion (not a full-framebuffer render). */
+    PD_TRANS_SPRITE_BUMP_LEFT,
     PD_TRANS_COUNT
 } pd_transition_type_t;
 

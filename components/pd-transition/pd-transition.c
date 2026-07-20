@@ -120,6 +120,7 @@ static const char *transition_names[PD_TRANS_COUNT] = {
     [PD_TRANS_ZOOM_OUT]     = "zoom-out",
     [PD_TRANS_FLIP_H]       = "flip-h",
     [PD_TRANS_FLIP_V]       = "flip-v",
+    [PD_TRANS_SPRITE_BUMP_LEFT] = "sprite-bump-left",
 };
 
 const char *pd_transition_type_name(pd_transition_type_t type)
@@ -139,8 +140,10 @@ pd_transition_type_t pd_transition_type_from_name(const char *name)
 
 pd_transition_type_t pd_transition_random(void)
 {
-    /* pick a random transition, excluding NONE */
-    int idx = 1 + (esp_random() % (PD_TRANS_COUNT - 1));
+    /* Pick a random full-framebuffer transition; skip NONE and content-side
+     * sprite-bump-left (needs a lettered sprite scene). */
+    const int last_fb = (int)PD_TRANS_FLIP_V;
+    int idx = 1 + (esp_random() % last_fb);
     return (pd_transition_type_t)idx;
 }
 
@@ -870,6 +873,8 @@ static const transition_render_fn render_fns[PD_TRANS_COUNT] = {
     [PD_TRANS_ZOOM_OUT]     = render_zoom_out,
     [PD_TRANS_FLIP_H]       = render_flip_h,
     [PD_TRANS_FLIP_V]       = render_flip_v,
+    /* Implemented in pd-content / pd-sprite-scene (dirty-rect), not FB. */
+    [PD_TRANS_SPRITE_BUMP_LEFT] = render_none,
 };
 
 bool pd_transition_tick(pd_transition_t *t)

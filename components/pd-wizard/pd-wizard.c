@@ -32,7 +32,8 @@
 static const char *TAG = "pd-wizard";
 
 #define PD_WIZARD_MAX_SSIDS 32
-#define PD_WIZARD_LINE_BUF 1024
+/* Large enough for upload_chunk NDJSON (base64 payload + framing). */
+#define PD_WIZARD_LINE_BUF 2048
 #define PD_WIZARD_VALUE_LEN 128
 
 /* ---------- step definitions ---------- */
@@ -209,16 +210,72 @@ static bool wiz_usb_warned = false;
 
 /* ---------- serial output ---------- */
 
+static void wiz_feed_byte(char ch);
+
+static pd_wizard_tx_hook_t wiz_tx_hook = NULL;
+
+void pd_wizard_set_tx_hook(pd_wizard_tx_hook_t hook)
+{
+    wiz_tx_hook = hook;
+}
+
 static void wiz_serial_write(const char *data, size_t len)
 {
+    if (wiz_tx_hook && data && len > 0) {
+        wiz_tx_hook(data, len);
+    }
 #if SOC_USB_SERIAL_JTAG_SUPPORTED
     if (wiz_usb_serial_started) {
-        usb_serial_jtag_write_bytes(data, len, pdMS_TO_TICKS(50));
+        /* usb_serial_jtag_write_bytes() silently fails (returns 0, no
+         * partial write) whenever the requested length doesn't fit in the
+         * driver's internal TX ring buffer in one call — it does not chunk
+         * large requests itself. Wizard payloads like the "already
+         * configured" status or a multi-SSID WiFi scan result routinely
+         * exceed that buffer, so the entire response was being dropped
+         * before ever reaching the CLI/app (confirmed via a return-value
+         * debug build: 0/327 bytes written, every attempt, for 1s straight,
+         * while a 1-byte write right after succeeded instantly). Chunk into
+         * pieces small enough to always fit, and retry each chunk until it
+         * flushes or ~1s elapses. */
+        #define WIZ_USB_CHUNK 32
+        size_t sent = 0;
+        while (sent < len) {
+            size_t remaining = len - sent;
+            size_t chunk_len = remaining < WIZ_USB_CHUNK ? remaining : WIZ_USB_CHUNK;
+            size_t chunk_sent = 0;
+            int stalls = 0;
+            while (chunk_sent < chunk_len && stalls < 20) {
+                int n = usb_serial_jtag_write_bytes(data + sent + chunk_sent,
+                                                     chunk_len - chunk_sent,
+                                                     pdMS_TO_TICKS(50));
+                if (n > 0) {
+                    chunk_sent += (size_t)n;
+                    stalls = 0;
+                } else {
+                    stalls++;
+                }
+            }
+            if (chunk_sent == 0) break;  /* truly stuck — give up rather than loop forever */
+            sent += chunk_sent;
+        }
         return;
     }
 #endif
     if (wiz_uart_started) {
         uart_write_bytes(UART_NUM_0, data, len);
+    }
+}
+
+void pd_wizard_write_raw(const char *data, size_t len)
+{
+    wiz_serial_write(data, len);
+}
+
+void pd_wizard_feed_bytes(const uint8_t *data, size_t len)
+{
+    if (!data) return;
+    for (size_t i = 0; i < len; i++) {
+        wiz_feed_byte((char)data[i]);
     }
 }
 
@@ -1259,7 +1316,14 @@ static void wiz_process_command(const char *json_str)
             wiz_send_json(rt);
             ESP_LOGI(TAG, "CLI connected (hello) — sent reztest_status %d/%d", idx + 1, REZTEST_COMBO_COUNT);
         } else if (wiz_config->setup_complete && !force) {
-            /* already configured — tell CLI we're done */
+            /* already configured — tell CLI we're done.
+             * Suspend pd_network's auto-reconnect for the duration of this
+             * serial session (resumed on "goodbye"): while WiFi creds are
+             * stale/wrong it retries every couple seconds and the resulting
+             * "wifi disconnected, retrying" log line floods the shared
+             * USB-Serial-JTAG TX buffer, silently dropping this very
+             * response before the CLI/app ever sees it. */
+            pd_network_suspend();
             ESP_LOGI(TAG, "CLI connected (hello) — setup already complete");
             cJSON *done = cJSON_CreateObject();
             cJSON_AddStringToObject(done, "type", "complete");
@@ -1279,9 +1343,17 @@ static void wiz_process_command(const char *json_str)
             cJSON_AddStringToObject(cfg, "hostname", wiz_config->hostname);
             cJSON_AddStringToObject(cfg, "timezone", wiz_config->timezone);
             cJSON_AddStringToObject(cfg, "static_ip", wiz_config->static_ip);
+            cJSON_AddStringToObject(cfg, "static_gateway", wiz_config->static_gateway);
+            cJSON_AddStringToObject(cfg, "static_netmask", wiz_config->static_netmask);
             wiz_send_json(done);
         } else {
             ESP_LOGI(TAG, "CLI connected (hello) — resetting wizard");
+            /* Stop pd_network's auto-reconnect immediately: while it's
+             * retrying stale/wrong WiFi creds it logs "wifi disconnected,
+             * retrying" every couple seconds, which floods the shared
+             * USB-Serial-JTAG TX buffer and silently drops the wizard's
+             * JSON state messages before the CLI/app ever sees them. */
+            pd_network_suspend();
             wiz_public_state = PD_WIZARD_STATE_MATRIX_SIZE;
             wiz_step = PD_STEP_MULTI_PANEL;
             wiz_multi_panel = false;
@@ -1289,6 +1361,54 @@ static void wiz_process_command(const char *json_str)
             wiz_text_value[0] = '\0';
             wiz_wifi_scanned = false;
             wiz_enter_step();
+        }
+    } else if (strcmp(cmd_str, "set_config") == 0) {
+        /* Direct, non-wizard settings update: merge whatever fields are
+         * provided straight into the active config and save. This is the
+         * serial-transport equivalent of POST /wizard — used by the app's
+         * flat "Settings" form so the user can change just WiFi (or any
+         * other field) without walking through the step-by-step wizard at
+         * all. Works regardless of current wiz_step/session state. */
+        cJSON *fields = cJSON_GetObjectItem(root, "fields");
+        if (cJSON_IsObject(fields) && wiz_config) {
+            cJSON *f;
+            f = cJSON_GetObjectItem(fields, "wifi_ssid");
+            if (cJSON_IsString(f)) strlcpy(wiz_config->wifi_ssid, f->valuestring, sizeof(wiz_config->wifi_ssid));
+            f = cJSON_GetObjectItem(fields, "wifi_password");
+            if (cJSON_IsString(f)) strlcpy(wiz_config->wifi_password, f->valuestring, sizeof(wiz_config->wifi_password));
+            f = cJSON_GetObjectItem(fields, "device_name");
+            if (cJSON_IsString(f)) strlcpy(wiz_config->device_name, f->valuestring, sizeof(wiz_config->device_name));
+            f = cJSON_GetObjectItem(fields, "hostname");
+            if (cJSON_IsString(f)) strlcpy(wiz_config->hostname, f->valuestring, sizeof(wiz_config->hostname));
+            f = cJSON_GetObjectItem(fields, "timezone");
+            if (cJSON_IsString(f)) strlcpy(wiz_config->timezone, f->valuestring, sizeof(wiz_config->timezone));
+            f = cJSON_GetObjectItem(fields, "static_ip");
+            if (cJSON_IsString(f)) strlcpy(wiz_config->static_ip, f->valuestring, sizeof(wiz_config->static_ip));
+            f = cJSON_GetObjectItem(fields, "static_gateway");
+            if (cJSON_IsString(f)) strlcpy(wiz_config->static_gateway, f->valuestring, sizeof(wiz_config->static_gateway));
+            f = cJSON_GetObjectItem(fields, "static_netmask");
+            if (cJSON_IsString(f)) strlcpy(wiz_config->static_netmask, f->valuestring, sizeof(wiz_config->static_netmask));
+
+            esp_err_t save_err = pd_config_save(wiz_config);
+
+            cJSON *saved = cJSON_CreateObject();
+            cJSON_AddStringToObject(saved, "type", "config_saved");
+            cJSON_AddBoolToObject(saved, "ok", save_err == ESP_OK);
+            cJSON *cfg = cJSON_AddObjectToObject(saved, "config");
+            cJSON_AddStringToObject(cfg, "wifi_ssid", wiz_config->wifi_ssid);
+            cJSON_AddStringToObject(cfg, "device_name", wiz_config->device_name);
+            cJSON_AddStringToObject(cfg, "hostname", wiz_config->hostname);
+            cJSON_AddStringToObject(cfg, "timezone", wiz_config->timezone);
+            cJSON_AddStringToObject(cfg, "static_ip", wiz_config->static_ip);
+            cJSON_AddStringToObject(cfg, "static_gateway", wiz_config->static_gateway);
+            cJSON_AddStringToObject(cfg, "static_netmask", wiz_config->static_netmask);
+            wiz_send_json(saved);
+            ESP_LOGI(TAG, "set_config: settings saved via serial (%s)", save_err == ESP_OK ? "ok" : "FAILED");
+        } else {
+            cJSON *err = cJSON_CreateObject();
+            cJSON_AddStringToObject(err, "type", "error");
+            cJSON_AddStringToObject(err, "message", "set_config requires a 'fields' object");
+            wiz_send_json(err);
         }
     } else if (strcmp(cmd_str, "reztest_keep") == 0) {
         if (wiz_reztest_active) {
@@ -1367,27 +1487,45 @@ static void wiz_process_command(const char *json_str)
             }
         }
     } else if (strcmp(cmd_str, "select") == 0) {
-        cJSON *index = cJSON_GetObjectItem(root, "index");
-        if (cJSON_IsNumber(index)) {
-            wiz_menu_selected = index->valueint;
-            wiz_apply_menu_select(wiz_menu_selected);
+        /* select/input/key all operate on pd_step_defs[wiz_step], which is
+         * only valid while an actual wizard step is active. On an
+         * already-configured device wiz_step is the PD_STEP_COUNT sentinel
+         * (see pd_wizard_start()), so ignore these commands there instead of
+         * indexing out of bounds. */
+        if (wiz_step < PD_STEP_COUNT) {
+            cJSON *index = cJSON_GetObjectItem(root, "index");
+            if (cJSON_IsNumber(index)) {
+                wiz_menu_selected = index->valueint;
+                wiz_apply_menu_select(wiz_menu_selected);
+            }
         }
     } else if (strcmp(cmd_str, "input") == 0) {
-        cJSON *value = cJSON_GetObjectItem(root, "value");
-        if (cJSON_IsString(value)) {
-            strlcpy(wiz_text_value, value->valuestring, sizeof(wiz_text_value));
-            wiz_apply_text_input(wiz_text_value);
+        if (wiz_step < PD_STEP_COUNT) {
+            cJSON *value = cJSON_GetObjectItem(root, "value");
+            if (cJSON_IsString(value)) {
+                strlcpy(wiz_text_value, value->valuestring, sizeof(wiz_text_value));
+                wiz_apply_text_input(wiz_text_value);
+            }
         }
     } else if (strcmp(cmd_str, "key") == 0) {
-        cJSON *code = cJSON_GetObjectItem(root, "code");
-        if (cJSON_IsString(code)) {
-            wiz_handle_key(code->valuestring);
+        if (wiz_step < PD_STEP_COUNT) {
+            cJSON *code = cJSON_GetObjectItem(root, "code");
+            if (cJSON_IsString(code)) {
+                wiz_handle_key(code->valuestring);
+            }
         }
     } else if (strcmp(cmd_str, "scan_wifi") == 0) {
         wiz_wifi_scanned = false;
         wiz_do_wifi_scan();
-        wiz_send_state();
-        wiz_render_display();
+        /* scan_wifi is also used by the flat Settings panel on an
+         * already-configured device, where wiz_step is the PD_STEP_COUNT
+         * sentinel (no active step). wiz_send_state()/wiz_render_display()
+         * index pd_step_defs[wiz_step] and would read out of bounds — only
+         * refresh the on-device wizard UI when a step is actually active. */
+        if (wiz_step < PD_STEP_COUNT) {
+            wiz_send_state();
+            wiz_render_display();
+        }
     } else if (strcmp(cmd_str, "panel_layout_confirm") == 0) {
         /* user confirmed the panel layout looks correct */
         pd_display_test_stop();
@@ -1425,6 +1563,9 @@ static void wiz_process_command(const char *json_str)
         }
     } else if (strcmp(cmd_str, "goodbye") == 0) {
         ESP_LOGI(TAG, "CLI disconnected (goodbye)");
+        /* re-enable auto-reconnect in case a "hello" (force) reset suspended
+         * it and the user backed out without finishing the wizard */
+        pd_network_resume();
         if (wiz_config && wiz_config->setup_complete) {
             /* restore idle screen */
             const char *ip = pd_network_get_ip();

@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleDevelopmentRegion</key>
+	<string>English</string>
+	<key>CFBundleDisplayName</key>
+	<string>Pixel Dumpster Control</string>
+	<key>CFBundleExecutable</key>
+	<string>pd-control</string>
+	<key>CFBundleIconFile</key>
+	<string>icon.icns</string>
+	<key>CFBundleIdentifier</key>
+	<string>com.pixeldumpster.control</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleName</key>
+	<string>Pixel Dumpster Control</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleShortVersionString</key>
+	<string>0.1.0</string>
+	<key>CFBundleVersion</key>
+	<string>0.1.0</string>
+	<key>CSResourcesFileMapped</key>
+	<true/>
+	<key>LSMinimumSystemVersion</key>
+	<string>10.13</string>
+	<key>LSRequiresCarbon</key>
+	<true/>
+	<key>NSHighResolutionCapable</key>
+	<true/>
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>Pixel Dumpster Control discovers and controls LED panels on your local network.</string>
+	<key>NSBonjourServices</key>
+	<array>
+		<string>_pdumpster._tcp</string>
+		<string>_dumpster-diver._tcp</string>
+	</array>
+	<key>NSBluetoothAlwaysUsageDescription</key>
+	<string>Pixel Dumpster Control uses Bluetooth to set up and control nearby Pixel Dumpster devices when WiFi is unavailable.</string>
+	<key>NSBluetoothPeripheralUsageDescription</key>
+	<string>Pixel Dumpster Control uses Bluetooth to set up and control nearby Pixel Dumpster devices when WiFi is unavailable.</string>
+</dict>
+</plist>

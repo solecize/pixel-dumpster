@@ -14,7 +14,8 @@
  *   --log FILE       Fallback: ES log file (default: ~/.emulationstation/es_log.txt)
  *   --host IP        Device IP address (overrides config)
  *   --port PORT      Device port (default: 8088)
- *   --serial DEVICE  Use serial transport (e.g. /dev/ttyACM0)
+ *   --serial DEVICE  Use serial transport (e.g. /dev/ttyACM0 or tcp://127.0.0.1:9877)
+ *   --ble-bridge H:P Use BLE via pd-ble-bridge TCP (e.g. 127.0.0.1:9877)
  *   --baud RATE      Serial baud rate (default: 115200)
  *   --roms PATH      Path to ROMs directory (default: ~/RetroPie/roms)
  *   --gamelists PATH Path to gamelists directory
@@ -26,6 +27,7 @@
  *   "device": { "host": "192.168.1.154", "port": 8088 },
  *   "transport": "wifi",
  *   "serial": { "device": "/dev/ttyACM0", "baud": 115200 },
+ *   "ble": { "bridge": "127.0.0.1:9877" },
  *   "es": {
  *     "gamelists_path": "~/.emulationstation/gamelists",
  *     "roms_path": "~/RetroPie/roms"
@@ -60,6 +62,7 @@
 #include <signal.h>
 #include <stdarg.h>
 #include <stdbool.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -69,9 +72,11 @@
 #include <termios.h>
 #include <dirent.h>
 #include <pthread.h>
+#include <sys/select.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
+#include <netdb.h>
 
 #ifdef __APPLE__
 #include <sys/event.h>
@@ -120,15 +125,17 @@ static cJSON *g_games = NULL;
 /* transport mode */
 typedef enum {
     TRANSPORT_WIFI,
-    TRANSPORT_SERIAL
+    TRANSPORT_SERIAL,
+    TRANSPORT_BLE   /* NDJSON over pd-ble-bridge TCP (same framing as serial) */
 } transport_mode_t;
 
 static transport_mode_t g_transport = TRANSPORT_WIFI;
 
-/* serial config */
+/* serial / BLE-bridge config */
 static char g_serial_device[MAX_PATH] = "";
 static int  g_serial_baud = 115200;
 static int  g_serial_fd = -1;
+static char g_ble_bridge[128] = "127.0.0.1:9877";
 
 /* ES paths */
 static char g_es_gamelists_path[MAX_PATH] = "";
@@ -560,6 +567,8 @@ static bool http_post_play(const char *content_path, const char *transition, int
     return true;
 }
 
+static bool transport_upload_file(const char *local_path, const char *device_path);
+
 /* Upload local file to device storage */
 static bool http_upload_file(const char *local_path, const char *device_path)
 {
@@ -703,7 +712,7 @@ static bool upload_seq_folder(const char *local_dir, const char *device_dir)
         snprintf(local_path, sizeof(local_path), "%s/%s", local_dir, ent->d_name);
         snprintf(device_path, sizeof(device_path), "%s/%s", device_dir, ent->d_name);
 
-        if (!http_upload_file(local_path, device_path)) {
+        if (!transport_upload_file(local_path, device_path)) {
             log_error("upload_seq: failed to upload %s", ent->d_name);
             had_error = true;
             /* Continue uploading remaining files */
@@ -725,12 +734,69 @@ static bool upload_seq_folder(const char *local_dir, const char *device_dir)
     return !had_error;
 }
 
-/* ---- serial transport ---- */
+/* ---- serial / TCP bridge transport ---- */
+
+static bool serial_open_tcp(const char *hostport)
+{
+    char host[128];
+    int port = 9877;
+    const char *colon = strrchr(hostport, ':');
+    if (colon && colon > hostport) {
+        size_t hlen = (size_t)(colon - hostport);
+        if (hlen >= sizeof(host)) hlen = sizeof(host) - 1;
+        memcpy(host, hostport, hlen);
+        host[hlen] = '\0';
+        port = atoi(colon + 1);
+        if (port <= 0) port = 9877;
+    } else {
+        strncpy(host, hostport, sizeof(host) - 1);
+        host[sizeof(host) - 1] = '\0';
+    }
+
+    char portstr[16];
+    snprintf(portstr, sizeof(portstr), "%d", port);
+
+    struct addrinfo hints, *res = NULL, *rp;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    int gai = getaddrinfo(host, portstr, &hints, &res);
+    if (gai != 0) {
+        log_error("bridge: getaddrinfo(%s): %s", host, gai_strerror(gai));
+        return false;
+    }
+
+    int fd = -1;
+    for (rp = res; rp; rp = rp->ai_next) {
+        fd = socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
+        if (fd < 0) continue;
+        if (connect(fd, rp->ai_addr, rp->ai_addrlen) == 0) break;
+        close(fd);
+        fd = -1;
+    }
+    freeaddrinfo(res);
+    if (fd < 0) {
+        log_error("bridge: cannot connect to %s:%d: %s", host, port, strerror(errno));
+        return false;
+    }
+
+    int flags = fcntl(fd, F_GETFL, 0);
+    if (flags >= 0) fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+
+    g_serial_fd = fd;
+    log_info("bridge: connected to %s:%d (NDJSON)", host, port);
+    return true;
+}
 
 static bool serial_open(void)
 {
     if (g_serial_fd >= 0) return true;
     if (!g_serial_device[0]) return false;
+
+    /* tcp://host:port — used by --ble-bridge / BLE transport */
+    if (strncmp(g_serial_device, "tcp://", 6) == 0) {
+        return serial_open_tcp(g_serial_device + 6);
+    }
 
     g_serial_fd = open(g_serial_device, O_RDWR | O_NOCTTY | O_NONBLOCK);
     if (g_serial_fd < 0) {
@@ -795,6 +861,226 @@ static void serial_close(void)
     }
 }
 
+static bool serial_write_all(const char *buf, size_t len)
+{
+    size_t off = 0;
+    while (off < len) {
+        ssize_t n = write(g_serial_fd, buf + off, len - off);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                fd_set wfds;
+                FD_ZERO(&wfds);
+                FD_SET(g_serial_fd, &wfds);
+                struct timeval tv = { .tv_sec = 2, .tv_usec = 0 };
+                if (select(g_serial_fd + 1, NULL, &wfds, NULL, &tv) <= 0) {
+                    log_error("serial: write timeout");
+                    return false;
+                }
+                continue;
+            }
+            log_error("serial: write failed: %s", strerror(errno));
+            return false;
+        }
+        off += (size_t)n;
+    }
+    return true;
+}
+
+/* Wait for {"type":"ack","cmd":"<cmd>","ok":true} (ignores other NDJSON lines). */
+static bool serial_wait_ack(const char *cmd, int timeout_ms)
+{
+    char line[2048];
+    size_t pos = 0;
+    int elapsed = 0;
+    const int slice_ms = 50;
+
+    while (elapsed < timeout_ms) {
+        fd_set rfds;
+        FD_ZERO(&rfds);
+        FD_SET(g_serial_fd, &rfds);
+        struct timeval tv = {
+            .tv_sec = slice_ms / 1000,
+            .tv_usec = (slice_ms % 1000) * 1000
+        };
+        int ready = select(g_serial_fd + 1, &rfds, NULL, NULL, &tv);
+        if (ready < 0) {
+            if (errno == EINTR) continue;
+            log_error("serial: select failed: %s", strerror(errno));
+            return false;
+        }
+        if (ready == 0) {
+            elapsed += slice_ms;
+            continue;
+        }
+
+        char tmp[256];
+        ssize_t n = read(g_serial_fd, tmp, sizeof(tmp));
+        if (n < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) continue;
+            log_error("serial: read failed: %s", strerror(errno));
+            return false;
+        }
+        if (n == 0) {
+            log_error("serial: connection closed while waiting for ack");
+            return false;
+        }
+
+        for (ssize_t i = 0; i < n; i++) {
+            char c = tmp[i];
+            if (c == '\r') continue;
+            if (c == '\n') {
+                line[pos] = '\0';
+                if (pos > 0 && line[0] == '{') {
+                    cJSON *root = cJSON_Parse(line);
+                    if (root) {
+                        cJSON *type = cJSON_GetObjectItem(root, "type");
+                        cJSON *ack_cmd = cJSON_GetObjectItem(root, "cmd");
+                        cJSON *ok = cJSON_GetObjectItem(root, "ok");
+                        bool match = cJSON_IsString(type) && strcmp(type->valuestring, "ack") == 0
+                                  && cJSON_IsString(ack_cmd) && strcmp(ack_cmd->valuestring, cmd) == 0;
+                        if (match) {
+                            bool success = cJSON_IsTrue(ok);
+                            if (!success) {
+                                cJSON *err = cJSON_GetObjectItem(root, "error");
+                                log_error("serial: %s ack failed: %s",
+                                          cmd,
+                                          cJSON_IsString(err) ? err->valuestring : "unknown");
+                            }
+                            cJSON_Delete(root);
+                            return success;
+                        }
+                        cJSON_Delete(root);
+                    }
+                }
+                pos = 0;
+                continue;
+            }
+            if (pos + 1 < sizeof(line)) {
+                line[pos++] = c;
+            } else {
+                pos = 0; /* overflow: resync on next newline */
+            }
+        }
+    }
+
+    log_error("serial: timeout waiting for %s ack", cmd);
+    return false;
+}
+
+static bool serial_send_expect_ack(const char *json_line, const char *ack_cmd, int timeout_ms)
+{
+    size_t len = strlen(json_line);
+    if (!serial_write_all(json_line, len)) {
+        serial_close();
+        return false;
+    }
+    if (json_line[len - 1] != '\n') {
+        if (!serial_write_all("\n", 1)) {
+            serial_close();
+            return false;
+        }
+    }
+    return serial_wait_ack(ack_cmd, timeout_ms);
+}
+
+static void b64_encode(const uint8_t *in, size_t in_len, char *out, size_t out_cap)
+{
+    static const char tbl[] =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    size_t o = 0;
+    for (size_t i = 0; i < in_len && o + 4 < out_cap; i += 3) {
+        uint32_t n = ((uint32_t)in[i]) << 16;
+        if (i + 1 < in_len) n |= ((uint32_t)in[i + 1]) << 8;
+        if (i + 2 < in_len) n |= (uint32_t)in[i + 2];
+        out[o++] = tbl[(n >> 18) & 63];
+        out[o++] = tbl[(n >> 12) & 63];
+        out[o++] = (i + 1 < in_len) ? tbl[(n >> 6) & 63] : '=';
+        out[o++] = (i + 2 < in_len) ? tbl[n & 63] : '=';
+    }
+    out[o] = '\0';
+}
+
+#define SERIAL_UPLOAD_CHUNK 150
+
+static bool serial_upload_file(const char *local_path, const char *device_path)
+{
+    if (g_dry_run) {
+        log_info("[DRY-RUN] SERIAL upload local=%s device=%s", local_path, device_path);
+        return true;
+    }
+
+    if (g_serial_fd < 0 && !serial_open()) {
+        return false;
+    }
+
+    FILE *f = fopen(local_path, "rb");
+    if (!f) {
+        log_error("serial upload: cannot open %s", local_path);
+        return false;
+    }
+    fseek(f, 0, SEEK_END);
+    long file_size = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    if (file_size <= 0 || file_size > 2 * 1024 * 1024) {
+        log_error("serial upload: invalid size %ld", file_size);
+        fclose(f);
+        return false;
+    }
+
+    char begin[640];
+    snprintf(begin, sizeof(begin),
+             "{\"cmd\":\"upload_begin\",\"path\":\"%s\",\"size\":%ld}\n",
+             device_path, file_size);
+    if (!serial_send_expect_ack(begin, "upload_begin", 5000)) {
+        fclose(f);
+        serial_send_expect_ack("{\"cmd\":\"upload_abort\"}\n", "upload_abort", 2000);
+        return false;
+    }
+
+    uint8_t chunk[SERIAL_UPLOAD_CHUNK];
+    char b64[((SERIAL_UPLOAD_CHUNK + 2) / 3) * 4 + 4];
+    char line[512];
+    size_t sent = 0;
+    while (sent < (size_t)file_size) {
+        size_t want = (size_t)file_size - sent;
+        if (want > SERIAL_UPLOAD_CHUNK) want = SERIAL_UPLOAD_CHUNK;
+        size_t n = fread(chunk, 1, want, f);
+        if (n != want) {
+            log_error("serial upload: short read");
+            fclose(f);
+            serial_send_expect_ack("{\"cmd\":\"upload_abort\"}\n", "upload_abort", 2000);
+            return false;
+        }
+        b64_encode(chunk, n, b64, sizeof(b64));
+        snprintf(line, sizeof(line), "{\"cmd\":\"upload_chunk\",\"data\":\"%s\"}\n", b64);
+        if (!serial_send_expect_ack(line, "upload_chunk", 5000)) {
+            fclose(f);
+            serial_send_expect_ack("{\"cmd\":\"upload_abort\"}\n", "upload_abort", 2000);
+            return false;
+        }
+        sent += n;
+    }
+    fclose(f);
+
+    if (!serial_send_expect_ack("{\"cmd\":\"upload_end\"}\n", "upload_end", 8000)) {
+        serial_send_expect_ack("{\"cmd\":\"upload_abort\"}\n", "upload_abort", 2000);
+        return false;
+    }
+
+    log_verbose("serial upload: %s -> %s (%ld bytes)", local_path, device_path, file_size);
+    return true;
+}
+
+/* Prefer WiFi HTTP when transport is wifi; serial/BLE use NDJSON upload. */
+static bool transport_upload_file(const char *local_path, const char *device_path)
+{
+    if (g_transport == TRANSPORT_SERIAL || g_transport == TRANSPORT_BLE) {
+        return serial_upload_file(local_path, device_path);
+    }
+    return http_upload_file(local_path, device_path);
+}
+
 static bool serial_send_play(const char *content_path, const char *transition, int duration_ms)
 {
     if (g_dry_run) {
@@ -817,15 +1103,12 @@ static bool serial_send_play(const char *content_path, const char *transition, i
                  "{\"cmd\":\"play\",\"path\":\"%s\"}\n", content_path);
     }
 
-    ssize_t len = (ssize_t)strlen(cmd);
-    ssize_t written = write(g_serial_fd, cmd, len);
-    if (written != len) {
-        log_error("serial: write failed (%zd/%zd): %s", written, len, strerror(errno));
+    if (!serial_write_all(cmd, strlen(cmd))) {
         serial_close();
         return false;
     }
 
-    log_verbose("serial: sent %zd bytes", len);
+    log_verbose("serial: sent play (%zu bytes)", strlen(cmd));
     return true;
 }
 
@@ -893,7 +1176,7 @@ static bool send_play(const char *content_path, const char *transition, int dura
                 }
             } else if (is_regular_file(content_path)) {
                 /* Upload single file */
-                if (!http_upload_file(content_path, device_path_buf)) {
+                if (!transport_upload_file(content_path, device_path_buf)) {
                     log_error("failed to upload marquee, playing anyway");
                     /* Continue anyway - device might already have it */
                 }
@@ -905,7 +1188,7 @@ static bool send_play(const char *content_path, const char *transition, int dura
         }
     }
     
-    if (g_transport == TRANSPORT_SERIAL) {
+    if (g_transport == TRANSPORT_SERIAL || g_transport == TRANSPORT_BLE) {
         return serial_send_play(play_path, transition, duration_ms);
     }
     return http_post_play(play_path, transition, duration_ms);
@@ -993,6 +1276,8 @@ static bool load_config(const char *path)
     if (cJSON_IsString(transport)) {
         if (strcmp(transport->valuestring, "serial") == 0)
             g_transport = TRANSPORT_SERIAL;
+        else if (strcmp(transport->valuestring, "ble") == 0)
+            g_transport = TRANSPORT_BLE;
         else
             g_transport = TRANSPORT_WIFI;
     }
@@ -1006,6 +1291,18 @@ static bool load_config(const char *path)
             strncpy(g_serial_device, dev->valuestring, MAX_PATH - 1);
         if (cJSON_IsNumber(baud))
             g_serial_baud = baud->valueint;
+    }
+
+    /* BLE bridge (pd-ble-bridge TCP) */
+    cJSON *ble = cJSON_GetObjectItem(g_config_root, "ble");
+    if (ble) {
+        cJSON *bridge = cJSON_GetObjectItem(ble, "bridge");
+        if (cJSON_IsString(bridge) && bridge->valuestring[0]) {
+            strncpy(g_ble_bridge, bridge->valuestring, sizeof(g_ble_bridge) - 1);
+        }
+    }
+    if (g_transport == TRANSPORT_BLE) {
+        snprintf(g_serial_device, sizeof(g_serial_device), "tcp://%s", g_ble_bridge);
     }
 
     /* ES paths */
@@ -1076,7 +1373,8 @@ static bool load_config(const char *path)
 
     log_info("config loaded: device=%s:%d transport=%s",
              g_device_host, g_device_port,
-             g_transport == TRANSPORT_SERIAL ? "serial" : "wifi");
+             g_transport == TRANSPORT_SERIAL ? "serial" :
+             g_transport == TRANSPORT_BLE ? "ble" : "wifi");
     return true;
 }
 
@@ -1838,8 +2136,9 @@ static void api_handle_status(int fd)
     pthread_mutex_unlock(&g_state_mutex);
 
     cJSON_AddStringToObject(root, "transport",
-                            g_transport == TRANSPORT_SERIAL ? "serial" : "wifi");
-    if (g_transport == TRANSPORT_SERIAL) {
+                            g_transport == TRANSPORT_SERIAL ? "serial" :
+             g_transport == TRANSPORT_BLE ? "ble" : "wifi");
+    if (g_transport == TRANSPORT_SERIAL || g_transport == TRANSPORT_BLE) {
         cJSON_AddStringToObject(root, "serial_device", g_serial_device);
     } else {
         cJSON_AddStringToObject(root, "device_host", g_device_host);
@@ -2112,7 +2411,8 @@ static void print_usage(const char *prog)
     fprintf(stderr, "  --log FILE       Fallback: watch ES log file instead of FIFO\n");
     fprintf(stderr, "  --host IP        Device IP address\n");
     fprintf(stderr, "  --port PORT      Device port (default: 8088)\n");
-    fprintf(stderr, "  --serial DEVICE  Use serial transport (e.g. /dev/ttyACM0)\n");
+    fprintf(stderr, "  --serial DEVICE  Use serial transport (e.g. /dev/ttyACM0 or tcp://127.0.0.1:9877)\n");
+    fprintf(stderr, "  --ble-bridge H:P Use BLE via pd-ble-bridge (default 127.0.0.1:9877)\n");
     fprintf(stderr, "  --baud RATE      Serial baud rate (default: 115200)\n");
     fprintf(stderr, "  --roms PATH      Path to ROMs directory\n");
     fprintf(stderr, "  --gamelists PATH Path to gamelists directory\n");
@@ -2256,6 +2556,13 @@ int main(int argc, char **argv)
             strncpy(g_serial_device, argv[++i], MAX_PATH - 1);
             g_transport = TRANSPORT_SERIAL;
             serial_override = true;
+        } else if (strcmp(argv[i], "--ble-bridge") == 0) {
+            if (i + 1 < argc && argv[i + 1][0] != '-') {
+                strncpy(g_ble_bridge, argv[++i], sizeof(g_ble_bridge) - 1);
+            }
+            g_transport = TRANSPORT_BLE;
+            snprintf(g_serial_device, sizeof(g_serial_device), "tcp://%s", g_ble_bridge);
+            serial_override = true;
         } else if (strcmp(argv[i], "--baud") == 0 && i + 1 < argc) {
             g_serial_baud = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--roms") == 0 && i + 1 < argc) {
@@ -2373,10 +2680,10 @@ int main(int argc, char **argv)
         discovery_start();
     }
 
-    /* open serial port if serial transport */
-    if (g_transport == TRANSPORT_SERIAL && g_serial_device[0]) {
+    /* open serial / BLE-bridge if non-WiFi transport */
+    if ((g_transport == TRANSPORT_SERIAL || g_transport == TRANSPORT_BLE) && g_serial_device[0]) {
         if (!serial_open()) {
-            log_error("serial: failed to open %s (will retry on first send)", g_serial_device);
+            log_error("link: failed to open %s (will retry on first send)", g_serial_device);
         }
     }
 
@@ -2397,9 +2704,12 @@ int main(int argc, char **argv)
 
     log_info("dumpster-diver starting");
     log_info("input: %s", input_mode == INPUT_MODE_FIFO ? "fifo" : "log");
-    log_info("transport: %s", g_transport == TRANSPORT_SERIAL ? "serial" : "wifi");
-    if (g_transport == TRANSPORT_SERIAL) {
-        log_info("serial: %s @ %d baud", g_serial_device, g_serial_baud);
+    log_info("transport: %s",
+             g_transport == TRANSPORT_SERIAL ? "serial" :
+             g_transport == TRANSPORT_BLE ? "ble" : "wifi");
+    if (g_transport == TRANSPORT_SERIAL || g_transport == TRANSPORT_BLE) {
+        log_info("link: %s%s", g_serial_device,
+                 g_transport == TRANSPORT_BLE ? " (pd-ble-bridge)" : "");
     } else {
         log_info("device: %s:%d", g_device_host, g_device_port);
     }

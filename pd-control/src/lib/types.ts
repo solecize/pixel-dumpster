@@ -13,7 +13,11 @@ export interface DeviceStatus {
   is_sequence?: boolean;
   current_frame?: number;
   total_frames?: number;
+  /** Target fps from meta.json / set_meta */
   fps?: number;
+  /** Measured present rate when the device reports it */
+  achieved_fps?: number;
+  cache?: string;
 }
 
 export interface ContentEntry {
